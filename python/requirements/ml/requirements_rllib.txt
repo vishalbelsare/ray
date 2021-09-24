@@ -23,12 +23,12 @@ recsim==0.2.4
 # For MAML on PyTorch.
 higher==0.2.1
 # For auto-generating an env-rendering Window.
-pyglet==1.5.0
+pyglet==1.5.15
 # For JSON reader/writer.
 smart_open==5.0.0
 # Ray Serve example
 starlette==0.14.2
 # ONNX
 onnx==1.9.0
-onnxruntime==1.8.0
+onnxruntime==1.9.0
 tf2onnx==1.8.5
