@@ -1,11 +1,13 @@
-import sys
 import os
+import sys
+
 import pytest
 
 import ray
 from ray._private.test_utils import (
     run_string_as_driver_nonblocking,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 
 def test_simple(shutdown_only):
@@ -96,11 +98,36 @@ print("DONE")
         if "local Ray instance" not in line and "The object store" not in line:
             out.append(line)
     valid = "".join(out)
-    assert valid.strip() == "DONE", out_str
+    assert "DONE" in valid, out_str
+
+
+def test_get_or_create_actor_with_placement_group_validation(shutdown_only):
+    """
+    Test that get_or_create with placement group properly validates
+    resource requirements and provides clear error messages.
+    """
+    ray.init(num_cpus=1)
+
+    # Create a placement group with limited resources
+    pg = ray.util.placement_group([{"CPU": 1}])
+    ray.get(pg.ready())
+
+    @ray.remote(num_cpus=1, num_gpus=8)
+    class Actor:
+        def __init__(self):
+            pass
+
+    # This should raise a ValueError with a clear message about resource mismatch
+    with pytest.raises(
+        ValueError,
+        match=r"Cannot schedule test_get_or_create_actor_with_placement_group_validation\.<locals>\.Actor with the placement group because the resource request \{'CPU': 1, 'GPU': 8\} cannot fit into any bundles for the placement group, \[\{'CPU': 1\.0\}\]\.",
+    ):
+        Actor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg),
+            name="actor",
+            get_if_exists=True,
+        ).remote()
 
 
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

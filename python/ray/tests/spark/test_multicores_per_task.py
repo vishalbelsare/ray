@@ -1,13 +1,24 @@
-import sys
-import pytest
 import os
+import sys
+
+import pytest
 from pyspark.sql import SparkSession
+
+from ray.tests.spark.test_basic import _setup_ray_on_spark_envs
 from ray.tests.spark.test_GPU import RayOnSparkGPUClusterTestBase
 
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="Ray on spark only supports running on Linux.",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.name != "posix",
+        reason="Ray on spark only supports running on POSIX system.",
+    ),
+    pytest.mark.timeout(1500),
+    pytest.mark.usefixtures("create_auth_token"),
+]
+
+
+def setup_module():
+    _setup_ray_on_spark_envs()
 
 
 class TestMultiCoresPerTaskCluster(RayOnSparkGPUClusterTestBase):
@@ -40,7 +51,4 @@ class TestMultiCoresPerTaskCluster(RayOnSparkGPUClusterTestBase):
 
 
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

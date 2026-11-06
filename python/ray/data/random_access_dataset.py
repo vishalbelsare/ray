@@ -3,28 +3,30 @@ import logging
 import random
 import time
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any, List, Optional
+
 import numpy as np
-from typing import List, Any, Optional, TYPE_CHECKING
+import pyarrow as pa
 
 import ray
-from ray.types import ObjectRef
-from ray.data.block import BlockAccessor
-from ray.data.context import DataContext, DEFAULT_SCHEDULING_STRATEGY
+from ray.data._internal.execution.interfaces.ref_bundle import (
+    _ref_bundles_iterator_to_block_refs_list,
+)
 from ray.data._internal.remote_fn import cached_remote_fn
-from ray.util.annotations import PublicAPI
-
-try:
-    import pyarrow as pa
-except ImportError:
-    pa = None
+from ray.data.block import BlockAccessor
+from ray.data.context import DataContext
+from ray.util.annotations import Deprecated
 
 if TYPE_CHECKING:
-    from ray.data import Dataset
+    from ray.data.dataset import Dataset
 
 logger = logging.getLogger(__name__)
 
 
-@PublicAPI(stability="alpha")
+@Deprecated(
+    message="`RandomAccessDataset` is unmaintained and will be removed in a future release.",
+    warning=False,
+)
 class RandomAccessDataset:
     """A class that provides distributed, random access to a Dataset.
 
@@ -49,8 +51,12 @@ class RandomAccessDataset:
         start = time.perf_counter()
         logger.info("[setup] Indexing dataset by sort key.")
         sorted_ds = ds.sort(key)
+        ctx_label_selector = DataContext.get_current().execution_options.label_selector
         get_bounds = cached_remote_fn(_get_bounds)
-        blocks = sorted_ds.get_internal_block_refs()
+        if ctx_label_selector:
+            get_bounds = get_bounds.options(label_selector=ctx_label_selector)
+        bundles = sorted_ds.iter_internal_ref_bundles()
+        blocks = _ref_bundles_iterator_to_block_refs_list(bundles)
 
         logger.info("[setup] Computing block range bounds.")
         bounds = ray.get([get_bounds.remote(b, key) for b in blocks])
@@ -66,14 +72,11 @@ class RandomAccessDataset:
 
         logger.info("[setup] Creating {} random access workers.".format(num_workers))
         ctx = DataContext.get_current()
-        if ctx.scheduling_strategy != DEFAULT_SCHEDULING_STRATEGY:
-            scheduling_strategy = ctx.scheduling_strategy
-        else:
-            scheduling_strategy = "SPREAD"
+        worker_options = {"scheduling_strategy": ctx.scheduling_strategy}
+        if ctx_label_selector:
+            worker_options["label_selector"] = ctx_label_selector
         self._workers = [
-            _RandomAccessWorker.options(scheduling_strategy=scheduling_strategy).remote(
-                key
-            )
+            _RandomAccessWorker.options(**worker_options).remote(key)
             for _ in range(num_workers)
         ]
         (
@@ -130,7 +133,7 @@ class RandomAccessDataset:
 
         return block_to_workers, worker_to_blocks
 
-    def get_async(self, key: Any) -> ObjectRef[Any]:
+    def get_async(self, key: Any) -> "ray.ObjectRef[Any]":
         """Asynchronously finds the record for a single key.
 
         Args:
@@ -232,8 +235,10 @@ class _RandomAccessWorker:
             col = block[self.key_field]
             indices = np.searchsorted(col, keys)
             acc = BlockAccessor.for_block(block)
-            result = [acc._get_row(i) for i in indices]
-            # assert result == [self._get(i, k) for i, k in zip(block_indices, keys)]
+            result = [
+                acc._get_row(i) if k1.as_py() == k2 else None
+                for i, k1, k2 in zip(indices, col.take(indices), keys)
+            ]
         else:
             result = [self._get(i, k) for i, k in zip(block_indices, keys)]
         self.total_time += time.perf_counter() - start

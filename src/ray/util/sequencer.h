@@ -22,7 +22,7 @@
 
 namespace ray {
 
-/// This callback is used to notify when a operation completes.
+/// This callback is used to notify when an operation completes.
 using SequencerDoneCallback = std::function<void()>;
 
 /// \class Sequencer
@@ -49,7 +49,7 @@ class Sequencer {
   }
 
  private:
-  /// This function is used when a operation completes.
+  /// This function is used when an operation completes.
   /// If the sequencer has operations with the same key, we will execute next operation.
   ///
   /// \param key The key of operation.
@@ -74,7 +74,7 @@ class Sequencer {
   absl::flat_hash_map<
       KEY,
       std::deque<std::function<void(SequencerDoneCallback done_callback)>>>
-      pending_operations_ GUARDED_BY(mutex_);
+      pending_operations_ ABSL_GUARDED_BY(mutex_);
 };
 
 }  // namespace ray

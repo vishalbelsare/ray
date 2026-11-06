@@ -1,10 +1,9 @@
 import abc
 import json
 from copy import deepcopy
+from dataclasses import dataclass
 from inspect import signature
 from typing import Dict, List, Union
-
-from dataclasses import dataclass
 
 import ray
 from ray.util import placement_group
@@ -19,7 +18,8 @@ def _sum_bundles(bundles: List[Dict[str, float]]) -> Dict[str, float]:
     Args:
         bundles: List of resource bundles.
 
-    Returns: Dict containing all resources summed up.
+    Returns:
+        Dict containing all resources summed up.
     """
     resources = {}
     for bundle in bundles:
@@ -219,6 +219,9 @@ class AcquiredResources(abc.ABC):
 
         Args:
             entities: Remote Ray entities to annotate with the acquired resources.
+
+        Returns:
+            The list of annotated remote Ray entities.
         """
         bundles = self.resource_request.bundles
 

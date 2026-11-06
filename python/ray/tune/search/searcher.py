@@ -2,8 +2,9 @@ import copy
 import glob
 import logging
 import os
+import uuid
 import warnings
-from typing import Dict, Optional, List, Union, Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from ray.air._internal.usage import tag_searcher
 from ray.tune.search.util import _set_search_properties_backwards_compatible
@@ -11,8 +12,8 @@ from ray.util.annotations import DeveloperAPI, PublicAPI
 from ray.util.debug import log_once
 
 if TYPE_CHECKING:
-    from ray.tune.experiment import Trial
     from ray.tune.analysis import ExperimentAnalysis
+    from ray.tune.experiment import Trial
 
 logger = logging.getLogger(__name__)
 
@@ -116,8 +117,11 @@ class Searcher:
             metric: Metric to optimize
             mode: One of ["min", "max"]. Direction to optimize.
             config: Tune config dict.
-            **spec: Any kwargs for forward compatiblity.
+            **spec: Any kwargs for forward compatibility.
                 Info like Experiment.PUBLIC_KEYS is provided through here.
+
+        Returns:
+            True if the search properties were set successfully, False otherwise.
         """
         return False
 
@@ -227,14 +231,21 @@ class Searcher:
             raise NotImplementedError
 
         # lazy imports to avoid circular dependencies
-        from ray.tune.experiment import Trial
         from ray.tune.analysis import ExperimentAnalysis
+        from ray.tune.experiment import Trial
         from ray.tune.result import DONE
 
-        if isinstance(trials_or_analysis, Trial):
-            trials_or_analysis = [trials_or_analysis]
+        if isinstance(trials_or_analysis, (list, tuple)):
+            trials = trials_or_analysis
+        elif isinstance(trials_or_analysis, Trial):
+            trials = [trials_or_analysis]
         elif isinstance(trials_or_analysis, ExperimentAnalysis):
-            trials_or_analysis = trials_or_analysis.trials
+            trials = trials_or_analysis.trials
+        else:
+            raise NotImplementedError(
+                "Expected input to be a `Trial`, a list of `Trial`s, or "
+                f"`ExperimentAnalysis`, got: {trials_or_analysis}"
+            )
 
         any_trial_had_metric = False
 
@@ -261,7 +272,7 @@ class Searcher:
                 intermediate_values=None,  # we do not save those
             )
 
-        for trial in trials_or_analysis:
+        for trial in trials:
             kwargs = trial_to_points(trial)
             if kwargs:
                 self.add_evaluated_point(**kwargs)
@@ -349,13 +360,30 @@ class Searcher:
 
         Args:
             max_concurrent: Number of maximum concurrent trials.
+
+        Returns:
+            True if the searcher handles max concurrency internally,
+            False otherwise.
         """
         return False
 
     def get_state(self) -> Dict:
+        """Returns the searcher's state, for checkpointing.
+
+        When a searcher wraps another one, such as ``ConcurrencyLimiter``, the
+        search algorithm saves each wrapper's state from this method.
+
+        Returns:
+            The searcher's state, in a form ``set_state`` accepts.
+        """
         raise NotImplementedError
 
     def set_state(self, state: Dict):
+        """Restores the searcher's state from a checkpoint.
+
+        Args:
+            state: A state that ``get_state`` returned.
+        """
         raise NotImplementedError
 
     def save_to_dir(self, checkpoint_dir: str, session_str: str = "default"):
@@ -368,7 +396,9 @@ class Searcher:
             session_str: Unique identifier of the current run
                 session.
         """
-        tmp_search_ckpt_path = os.path.join(checkpoint_dir, ".tmp_searcher_ckpt")
+        file_name = self.CKPT_FILE_TMPL.format(session_str)
+        tmp_file_name = f".{str(uuid.uuid4())}-tmp-{file_name}"
+        tmp_search_ckpt_path = os.path.join(checkpoint_dir, tmp_file_name)
         success = True
         try:
             self.save(tmp_search_ckpt_path)
@@ -380,7 +410,7 @@ class Searcher:
         if success and os.path.exists(tmp_search_ckpt_path):
             os.replace(
                 tmp_search_ckpt_path,
-                os.path.join(checkpoint_dir, self.CKPT_FILE_TMPL.format(session_str)),
+                os.path.join(checkpoint_dir, file_name),
             )
 
     def restore_from_dir(self, checkpoint_dir: str):
@@ -393,9 +423,9 @@ class Searcher:
 
             tuner = tune.Tuner(
                 cost,
-                run_config=air.RunConfig(
+                run_config=tune.RunConfig(
                     name=self.experiment_name,
-                    local_dir="~/my_results",
+                    storage_path="~/my_results",
                 ),
                 tune_config=tune.TuneConfig(
                     search_alg=search_alg,
@@ -467,7 +497,7 @@ class ConcurrencyLimiter(Searcher):
     """
 
     def __init__(self, searcher: Searcher, max_concurrent: int, batch: bool = False):
-        assert type(max_concurrent) is int and max_concurrent > 0
+        assert isinstance(max_concurrent, int) and max_concurrent > 0
         self.searcher = searcher
         self.max_concurrent = max_concurrent
         self.batch = batch

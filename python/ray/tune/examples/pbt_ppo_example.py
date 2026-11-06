@@ -11,13 +11,11 @@ computationally demanding example.
 
 import random
 
-from ray import air, tune
+from ray import tune
 from ray.rllib.algorithms.ppo import PPO
 from ray.tune.schedulers import PopulationBasedTraining
 
-
 if __name__ == "__main__":
-
     # Postprocess the perturbed config to ensure it's still valid
     def explore(config):
         # ensure we collect enough timesteps to do sgd
@@ -46,7 +44,7 @@ if __name__ == "__main__":
 
     tuner = tune.Tuner(
         PPO,
-        run_config=air.RunConfig(
+        run_config=tune.RunConfig(
             name="pbt_humanoid_test",
         ),
         tune_config=tune.TuneConfig(
@@ -54,9 +52,10 @@ if __name__ == "__main__":
             num_samples=8,
             metric="episode_reward_mean",
             mode="max",
+            reuse_actors=True,
         ),
         param_space={
-            "env": "Humanoid-v1",
+            "env": "Humanoid-v5",
             "kl_coeff": 1.0,
             "num_workers": 8,
             "num_gpus": 1,

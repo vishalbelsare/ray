@@ -1,14 +1,20 @@
-from typing import Any, Dict, List, Optional
-
-import numpy as np
 import copy
 import logging
 from functools import partial
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 # Use cloudpickle instead of pickle to make lambda funcs in HyperOpt pickleable
 from ray import cloudpickle
-
+from ray.tune.error import TuneError
 from ray.tune.result import DEFAULT_METRIC
+from ray.tune.search import (
+    UNDEFINED_METRIC_MODE,
+    UNDEFINED_SEARCH_SPACE,
+    UNRESOLVED_SEARCH_SPACE,
+    Searcher,
+)
 from ray.tune.search.sample import (
     Categorical,
     Domain,
@@ -18,12 +24,6 @@ from ray.tune.search.sample import (
     Normal,
     Quantized,
     Uniform,
-)
-from ray.tune.search import (
-    UNRESOLVED_SEARCH_SPACE,
-    UNDEFINED_METRIC_MODE,
-    UNDEFINED_SEARCH_SPACE,
-    Searcher,
 )
 from ray.tune.search.variant_generator import assign_value, parse_spec_vars
 from ray.tune.utils import flatten_dict
@@ -37,7 +37,6 @@ except ImportError:
     hpo = None
     Apply = None
 
-from ray.tune.error import TuneError
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +82,7 @@ class HyperOptSearch(Searcher):
             for future parameters. Needs to be a list of dicts containing the
             configurations.
         n_initial_points: number of random evaluations of the
-            objective function before starting to aproximate it with
+            objective function before starting to approximate it with
             tree parzen estimators. Defaults to 20.
         random_state_seed: seed for reproducible
             results. Defaults to None.
@@ -519,23 +518,34 @@ class HyperOptSearch(Searcher):
                     return hpo.hp.uniformint(par, domain.lower, high=domain.upper - 1)
             elif isinstance(domain, Categorical):
                 if isinstance(sampler, Uniform):
-                    return hpo.hp.choice(
-                        par,
-                        [
-                            HyperOptSearch.convert_search_space(category, prefix=par)
-                            if isinstance(category, dict)
-                            else HyperOptSearch.convert_search_space(
-                                dict(enumerate(category)), prefix=f"{par}/{i}"
+                    seq = []
+                    for i, category in enumerate(domain.categories):
+                        if isinstance(category, dict):
+                            # A dict of plain constants converts to {}, but
+                            # hyperopt accepts constant dicts as choice
+                            # categories, so pass the original through.
+                            choice = HyperOptSearch.convert_search_space(
+                                category, prefix=par
                             )
-                            if isinstance(category, list)
+                            if choice:
+                                seq.append(choice)
+                            else:
+                                seq.append(category)
+                        elif (
+                            isinstance(category, list)
                             and len(category) > 0
                             and isinstance(category[0], Domain)
-                            else resolve_value(f"{par}/{i}", category)
-                            if isinstance(category, Domain)
-                            else category
-                            for i, category in enumerate(domain.categories)
-                        ],
-                    )
+                        ):
+                            seq.append(
+                                HyperOptSearch.convert_search_space(
+                                    dict(enumerate(category)), prefix=f"{par}/{i}"
+                                )
+                            )
+                        elif isinstance(category, Domain):
+                            seq.append(resolve_value(f"{par}/{i}", category))
+                        else:
+                            seq.append(category)
+                    return hpo.hp.choice(par, seq)
 
             raise ValueError(
                 "HyperOpt does not support parameters of type "

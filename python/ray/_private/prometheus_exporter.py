@@ -3,42 +3,51 @@
 # and the latest version has a compatibility issue with the latest OpenCensus
 # library.
 
+import logging
 import re
+import threading
+from typing import Any
+from wsgiref.simple_server import make_server
 
-from prometheus_client import start_http_server
+from opencensus.common.transports import sync
+from opencensus.stats import aggregation_data as aggregation_data_module, base_exporter
+from prometheus_client import make_wsgi_app
 from prometheus_client.core import (
     REGISTRY,
+    CollectorRegistry,
     CounterMetricFamily,
     GaugeMetricFamily,
     HistogramMetricFamily,
     UnknownMetricFamily,
 )
 
-from opencensus.common.transports import sync
-from opencensus.stats import aggregation_data as aggregation_data_module
-from opencensus.stats import base_exporter
-import logging
+from ray._private.authentication.http_token_authentication import (
+    get_token_auth_wsgi_app,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class Options(object):
     """Options contains options for configuring the exporter.
+
     The address can be empty as the prometheus client will
-    assume it's localhost
-    :type namespace: str
-    :param namespace: The prometheus namespace to be used. Defaults to ''.
-    :type port: int
-    :param port: The Prometheus port to be used. Defaults to 8000.
-    :type address: str
-    :param address: The Prometheus address to be used. Defaults to ''.
-    :type registry: registry
-    :param registry: The Prometheus address to be used. Defaults to ''.
-    :type registry: :class:`~prometheus_client.core.CollectorRegistry`
-    :param registry: A Prometheus collector registry instance.
+    assume it's localhost.
+
+    Args:
+        namespace: The prometheus namespace to be used. Defaults to ''.
+        port: The Prometheus port to be used. Defaults to 8000.
+        address: The Prometheus address to be used. Defaults to ''.
+        registry: A Prometheus collector registry instance.
     """
 
-    def __init__(self, namespace="", port=8000, address="", registry=REGISTRY):
+    def __init__(
+        self,
+        namespace: str = "",
+        port: int = 8000,
+        address: str = "",
+        registry: CollectorRegistry = REGISTRY,
+    ):
         self._namespace = namespace
         self._registry = registry
         self._port = int(port)
@@ -120,24 +129,21 @@ class Collector(object):
         self.view_name_to_data_map[v_name] = view_data
 
     # TODO: add start and end timestamp
-    def to_metric(self, desc, tag_values, agg_data, metrics_map):
-        """to_metric translate the data that OpenCensus create
-        to Prometheus format, using Prometheus Metric object
-        :type desc: dict
-        :param desc: The map that describes view definition
-        :type tag_values: tuple of :class:
-            `~opencensus.tags.tag_value.TagValue`
-        :param object of opencensus.tags.tag_value.TagValue:
-            TagValue object used as label values
-        :type agg_data: object of :class:
-            `~opencensus.stats.aggregation_data.AggregationData`
-        :param object of opencensus.stats.aggregation_data.AggregationData:
-            Aggregated data that needs to be converted as Prometheus samples
-        :rtype: :class:`~prometheus_client.core.CounterMetricFamily` or
-                :class:`~prometheus_client.core.HistogramMetricFamily` or
-                :class:`~prometheus_client.core.UnknownMetricFamily` or
-                :class:`~prometheus_client.core.GaugeMetricFamily`
-        :returns: A Prometheus metric object
+    def to_metric(
+        self,
+        desc: dict,
+        tag_values: tuple,
+        agg_data: Any,
+        metrics_map: dict,
+    ) -> None:
+        """Translate the data that OpenCensus creates to Prometheus format.
+
+        Args:
+            desc: The map that describes view definition.
+            tag_values: TagValue object used as label values.
+            agg_data: Aggregated data that needs to be converted as Prometheus samples.
+            metrics_map: A map of metric name to Prometheus Metric object that is
+                populated by this method.
         """
         metric_name = desc["name"]
         metric_description = desc["documentation"]
@@ -160,7 +166,7 @@ class Collector(object):
                 )
                 metrics_map[metric_name] = metric
             metric.add_metric(labels=tag_values, value=agg_data.count_data)
-            return metric
+            return
 
         elif isinstance(agg_data, aggregation_data_module.DistributionAggregationData):
 
@@ -191,7 +197,7 @@ class Collector(object):
                 buckets=buckets,
                 sum_value=agg_data.sum,
             )
-            return metric
+            return
 
         elif isinstance(agg_data, aggregation_data_module.SumAggregationData):
             metric = metrics_map.get(metric_name)
@@ -203,7 +209,7 @@ class Collector(object):
                 )
                 metrics_map[metric_name] = metric
             metric.add_metric(labels=tag_values, value=agg_data.sum_data)
-            return metric
+            return
 
         elif isinstance(agg_data, aggregation_data_module.LastValueAggregationData):
             metric = metrics_map.get(metric_name)
@@ -215,7 +221,7 @@ class Collector(object):
                 )
                 metrics_map[metric_name] = metric
             metric.add_metric(labels=tag_values, value=agg_data.value)
-            return metric
+            return
 
         else:
             raise ValueError(f"unsupported aggregation type {type(agg_data)}")
@@ -235,39 +241,37 @@ class Collector(object):
             desc = self.registered_views[v_name]
             for tag_values in view_data.tag_value_aggregation_data_map:
                 agg_data = view_data.tag_value_aggregation_data_map[tag_values]
-                metric = self.to_metric(desc, tag_values, agg_data, metrics_map)
+                self.to_metric(desc, tag_values, agg_data, metrics_map)
 
         for metric in metrics_map.values():
             yield metric
 
 
 class PrometheusStatsExporter(base_exporter.StatsExporter):
-    """Exporter exports stats to Prometheus, users need
-        to register the exporter as an HTTP Handler to be
-        able to export.
-    :type options:
-        :class:`~opencensus.ext.prometheus.stats_exporter.Options`
-    :param options: An options object with the parameters to instantiate the
-                         prometheus exporter.
-    :type gatherer: :class:`~prometheus_client.core.CollectorRegistry`
-    :param gatherer: A Prometheus collector registry instance.
-    :type transport:
-        :class:`opencensus.common.transports.sync.SyncTransport` or
-        :class:`opencensus.common.transports.async_.AsyncTransport`
-    :param transport: An instance of a Transpor to send data with.
-    :type collector:
-        :class:`~opencensus.ext.prometheus.stats_exporter.Collector`
-    :param collector: An instance of the Prometheus Collector object.
+    """Exporter exports stats to Prometheus.
+
+    Users need to register the exporter as an HTTP Handler to be able to export.
+
+    Args:
+        options: An options object with the parameters to instantiate the
+            prometheus exporter.
+        gatherer: A Prometheus collector registry instance.
+        transport: An instance of a Transport to send data with.
+        collector: An instance of the Prometheus Collector object.
     """
 
     def __init__(
-        self, options, gatherer, transport=sync.SyncTransport, collector=Collector()
+        self,
+        options: Options,
+        gatherer: CollectorRegistry,
+        transport: Any = sync.SyncTransport,
+        collector: "Collector" = Collector(),
     ):
         self._options = options
         self._gatherer = gatherer
         self._collector = collector
         self._transport = transport(self)
-        self.serve_http()
+        self._port = self.serve_http()
         REGISTRY.register(self._collector)
 
     @property
@@ -293,6 +297,11 @@ class PrometheusStatsExporter(base_exporter.StatsExporter):
     def options(self):
         """Options to be used to configure the exporter"""
         return self._options
+
+    @property
+    def port(self):
+        """The port the HTTP server is listening on."""
+        return self._port
 
     def export(self, view_data):
         """export send the data to the transport class
@@ -320,9 +329,15 @@ class PrometheusStatsExporter(base_exporter.StatsExporter):
 
     def serve_http(self):
         """serve_http serves the Prometheus endpoint."""
-        address = str(self.options.address)
-        kwargs = {"addr": address} if address else {}
-        start_http_server(port=self.options.port, **kwargs)
+        address = self.options.address or ""
+        httpd = make_server(
+            address, self.options.port, get_token_auth_wsgi_app(make_wsgi_app())
+        )
+        t = threading.Thread(target=httpd.serve_forever)
+        t.daemon = True
+        t.start()
+        # Return the actual port (in case port=0 was specified)
+        return httpd.server_address[1]
 
 
 def new_stats_exporter(option):

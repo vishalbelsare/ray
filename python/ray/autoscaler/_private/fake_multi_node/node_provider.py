@@ -12,7 +12,9 @@ from typing import Any, Dict, Optional
 import yaml
 
 import ray
-from ray._private.ray_constants import DEFAULT_PORT
+import ray._private.ray_constants as ray_constants
+from ray._common.network_utils import build_address
+from ray.autoscaler._private.auth_token import load_local_token
 from ray.autoscaler._private.fake_multi_node.command_runner import (
     FakeDockerCommandRunner,
 )
@@ -41,7 +43,6 @@ FAKE_DOCKER_DEFAULT_OBJECT_MANAGER_PORT = 18076
 FAKE_DOCKER_DEFAULT_CLIENT_PORT = 10002
 
 DOCKER_COMPOSE_SKELETON = {
-    "version": "3.9",
     "services": {},
     "networks": {"ray_local": {}},
 }
@@ -136,6 +137,7 @@ def create_node_spec(
     bootstrap_config_path: Optional[str] = None,
     private_key_path: Optional[str] = None,
     public_key_path: Optional[str] = None,
+    auth_token_path: Optional[str] = None,
 ):
     node_spec = copy.deepcopy(DOCKER_NODE_SKELETON)
     node_spec["image"] = docker_image
@@ -194,7 +196,7 @@ def create_node_spec(
         node_spec["command"] = DOCKER_HEAD_CMD.format(**cmd_kwargs)
         # Expose ports so we can connect to the cluster from outside
         node_spec["ports"] = [
-            f"{host_gcs_port}:{DEFAULT_PORT}",
+            f"{host_gcs_port}:{ray_constants.DEFAULT_PORT}",
             f"{host_object_manager_port}:8076",
             f"{host_client_port}:10001",
         ]
@@ -222,6 +224,13 @@ def create_node_spec(
         f"{host_dir(mounted_node_dir)}:/cluster/node",
         f"{host_dir(public_key_path)}:/home/ray/.ssh/authorized_keys",
     ]
+    # `ray up`'s token file mount can't deliver the token here: worker updaters
+    # are disabled, and the head's `ray start` runs when its container starts,
+    # before `ray up` syncs files.
+    if auth_token_path:
+        node_spec["volumes"].append(
+            f"{host_dir(auth_token_path)}:/home/ray/.ray/auth_token:ro"
+        )
 
     # Pass these environment variables (to the head node)
     # These variables are propagated by the `docker compose` command.
@@ -234,12 +243,43 @@ def create_node_spec(
     return node_spec
 
 
+def _write_cluster_auth_token(path: str) -> None:
+    """Write the local token for the nodes to mount. Never creates one: every
+    CLI command that builds this provider, such as `ray down`, gets here."""
+    token = load_local_token()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        try:
+            os.write(fd, token.encode())
+        finally:
+            os.close(fd)
+        if hasattr(os, "getuid") and os.getuid() == 0:
+            # Nodes run as the image's `ray` user (uid 1000) and the mount is
+            # read-only, so a root-owned 0600 token would be unreadable to them.
+            os.chown(path, 1000, -1)
+    except BaseException:
+        # A partial file would be reused by every later construction.
+        os.unlink(path)
+        raise
+
+
 class FakeMultiNodeProvider(NodeProvider):
     """A node provider that implements multi-node on a single machine.
 
     This is used for laptop mode testing of autoscaling functionality."""
 
-    def __init__(self, provider_config, cluster_name):
+    def __init__(
+        self,
+        provider_config: Dict[str, Any],
+        cluster_name: str,
+    ):
+        """Initialize the fake multi-node provider.
+
+        Args:
+            provider_config: Configuration for the provider.
+            cluster_name: Name of the cluster.
+        """
+
         NodeProvider.__init__(self, provider_config, cluster_name)
         self.lock = RLock()
         if "RAY_FAKE_CLUSTER" not in os.environ:
@@ -247,13 +287,26 @@ class FakeMultiNodeProvider(NodeProvider):
                 "FakeMultiNodeProvider requires ray to be started with "
                 "RAY_FAKE_CLUSTER=1 ray start ..."
             )
+        # GCS address to use for the cluster
+        self._gcs_address = provider_config.get("gcs_address", None)
+        # Head node id
+        self._head_node_id = provider_config.get("head_node_id", FAKE_HEAD_NODE_ID)
+        # Whether to launch multiple nodes at once, or one by one regardless of
+        # the count (default)
+        self._launch_multiple = provider_config.get("launch_multiple", False)
+
+        # These are injected errors for testing purposes. If not None,
+        # these will be raised on `create_node_with_resources_and_labels`` and
+        # `terminate_node``, respectively.
+        self._creation_error = None
+        self._termination_errors = None
 
         self._nodes = {
-            FAKE_HEAD_NODE_ID: {
+            self._head_node_id: {
                 "tags": {
                     TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
                     TAG_RAY_USER_NODE_TYPE: FAKE_HEAD_NODE_TYPE,
-                    TAG_RAY_NODE_NAME: FAKE_HEAD_NODE_ID,
+                    TAG_RAY_NODE_NAME: self._head_node_id,
                     TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE,
                 }
             },
@@ -303,7 +356,28 @@ class FakeMultiNodeProvider(NodeProvider):
     def set_node_tags(self, node_id, tags):
         raise AssertionError("Readonly node provider cannot be updated")
 
-    def create_node_with_resources(self, node_config, tags, count, resources):
+    def create_node_with_resources_and_labels(
+        self, node_config, tags, count, resources, labels
+    ):
+        if self._creation_error:
+            raise self._creation_error
+
+        if self._launch_multiple:
+            for _ in range(count):
+                self._create_node_with_resources_and_labels(
+                    node_config, tags, count, resources, labels
+                )
+        else:
+            self._create_node_with_resources_and_labels(
+                node_config, tags, count, resources, labels
+            )
+
+    def _create_node_with_resources_and_labels(
+        self, node_config, tags, count, resources, labels
+    ):
+        # This function calls `pop`. To avoid side effects, we make a
+        # copy of `resources`.
+        resources = copy.deepcopy(resources)
         with self.lock:
             node_type = tags[TAG_RAY_USER_NODE_TYPE]
             next_id = self._next_hex_node_id()
@@ -311,36 +385,50 @@ class FakeMultiNodeProvider(NodeProvider):
                 min_worker_port=0,
                 max_worker_port=0,
                 dashboard_port=None,
+                dashboard_agent_listen_port=0,
                 num_cpus=resources.pop("CPU", 0),
                 num_gpus=resources.pop("GPU", 0),
                 object_store_memory=resources.pop("object_store_memory", None),
                 resources=resources,
-                redis_address="{}:6379".format(
-                    ray._private.services.get_node_ip_address()
-                ),
-                gcs_address="{}:6379".format(
-                    ray._private.services.get_node_ip_address()
-                ),
+                labels=labels,
+                redis_address=build_address(
+                    ray._private.services.get_node_ip_address(), 6379
+                )
+                if not self._gcs_address
+                else self._gcs_address,
+                gcs_address=build_address(
+                    ray._private.services.get_node_ip_address(), 6379
+                )
+                if not self._gcs_address
+                else self._gcs_address,
                 env_vars={
                     "RAY_OVERRIDE_NODE_ID_FOR_TESTING": next_id,
-                    "RAY_OVERRIDE_RESOURCES": json.dumps(resources),
+                    "RAY_CLOUD_INSTANCE_ID": next_id,
+                    "RAY_NODE_TYPE_NAME": node_type,
+                    ray_constants.RESOURCES_ENVIRONMENT_VARIABLE: json.dumps(resources),
+                    ray_constants.LABELS_ENVIRONMENT_VARIABLE: json.dumps(labels),
                 },
             )
             node = ray._private.node.Node(
                 ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False
             )
+            all_tags = {
+                TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
+                TAG_RAY_USER_NODE_TYPE: node_type,
+                TAG_RAY_NODE_NAME: next_id,
+                TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE,
+            }
+            all_tags.update(tags)
             self._nodes[next_id] = {
-                "tags": {
-                    TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
-                    TAG_RAY_USER_NODE_TYPE: node_type,
-                    TAG_RAY_NODE_NAME: next_id,
-                    TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE,
-                },
+                "tags": all_tags,
                 "node": node,
             }
 
     def terminate_node(self, node_id):
         with self.lock:
+            if self._termination_errors:
+                raise self._termination_errors
+
             try:
                 node = self._nodes.pop(node_id)
             except Exception as e:
@@ -354,6 +442,18 @@ class FakeMultiNodeProvider(NodeProvider):
     @staticmethod
     def bootstrap_config(cluster_config):
         return cluster_config
+
+    ############################
+    # Test only methods
+    ############################
+    def _test_set_creation_error(self, e: Exception):
+        """Set an error that will be raised on
+        create_node_with_resources_and_labels."""
+        self._creation_error = e
+
+    def _test_add_termination_errors(self, e: Exception):
+        """Set an error that will be raised on terminate_node."""
+        self._termination_errors = e
 
 
 class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
@@ -402,7 +502,7 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
         if not self.in_docker_container:
             # Create private key
             if not os.path.exists(self._private_key_path):
-                subprocess.check_output(
+                subprocess.check_call(
                     f'ssh-keygen -b 2048 -t rsa -q -N "" '
                     f"-f {self._private_key_path}",
                     shell=True,
@@ -410,7 +510,7 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
 
             # Create public key
             if not os.path.exists(self._public_key_path):
-                subprocess.check_output(
+                subprocess.check_call(
                     f"ssh-keygen -y "
                     f"-f {self._private_key_path} "
                     f"> {self._public_key_path}",
@@ -421,6 +521,16 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
             self._volume_dir, "docker-compose.yaml"
         )
         self._docker_compose_config = None
+
+        self._auth_token_path = None
+        # shortcut: in token mode this mounts the local token even when the
+        # cluster YAML mounts its own ~/.ray/auth_token, which the provider
+        # can't see. Pass the YAML's file_mounts in if a test needs it.
+        # The provider gets only the provider section, so DockerCluster copies the
+        # cluster YAML's auth_mode into it.
+        self._auth_mode = provider_config.get("auth_mode")
+        if (self._auth_mode or "token") == "token":
+            self._auth_token_path = os.path.join(self._volume_dir, "auth_token")
 
         self._node_state_path = os.path.join(self._volume_dir, "nodes.json")
         self._docker_status_path = os.path.join(self._volume_dir, "status.json")
@@ -460,6 +570,17 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
 
         resource_str = json.dumps(resources, indent=None)
 
+        # The docker monitor may start a node before the token is written, and
+        # Docker would create a missing bind mount source as a directory. Inside
+        # the head the host file always exists: `ray up` wrote it first.
+        auth_token_path = self._auth_token_path
+        if (
+            auth_token_path
+            and not self.in_docker_container
+            and not os.path.exists(auth_token_path)
+        ):
+            auth_token_path = None
+
         return create_node_spec(
             head=head,
             docker_image=self._docker_image,
@@ -473,7 +594,9 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
             resources=resources,
             env_vars={
                 "RAY_OVERRIDE_NODE_ID_FOR_TESTING": node_id,
-                "RAY_OVERRIDE_RESOURCES": resource_str,
+                ray_constants.RESOURCES_ENVIRONMENT_VARIABLE: resource_str,
+                # Nodes here run no start commands, so `ray up` can't set it.
+                **({"RAY_AUTH_MODE": self._auth_mode} if self._auth_mode else {}),
                 **self.provider_config.get("env_vars", {}),
             },
             volume_dir=self._volume_dir,
@@ -483,6 +606,7 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
             bootstrap_config_path=self._boostrap_config_path,
             public_key_path=self._public_key_path,
             private_key_path=self._private_key_path,
+            auth_token_path=auth_token_path,
         )
 
     def _load_node_state(self) -> bool:
@@ -573,6 +697,11 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
 
             return node_id not in self._nodes and not self._is_docker_running(node_id)
 
+    @property
+    def mounts_auth_token(self) -> bool:
+        """Whether every node gets the token as a read-only volume."""
+        return self._auth_token_path is not None
+
     def get_command_runner(
         self,
         log_prefix: str,
@@ -622,7 +751,9 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
         assert node_id in self._nodes
         self._nodes[node_id]["tags"].update(tags)
 
-    def create_node_with_resources(self, node_config, tags, count, resources):
+    def create_node_with_resources_and_labels(
+        self, node_config, tags, count, resources, labels
+    ):
         with self.lock:
             is_head = tags[TAG_RAY_NODE_KIND] == NODE_KIND_HEAD
 
@@ -630,6 +761,15 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
                 next_id = FAKE_HEAD_NODE_ID
             else:
                 next_id = self._next_hex_node_id()
+
+            # Written on the first launch, by then `ray up` has created the
+            # local token. Later launches reuse it: nodes bind-mount the file.
+            if (
+                self._auth_token_path
+                and not self.in_docker_container
+                and not os.path.exists(self._auth_token_path)
+            ):
+                _write_cluster_auth_token(self._auth_token_path)
 
             self._nodes[next_id] = {
                 "tags": tags,
@@ -644,7 +784,9 @@ class FakeMultiNodeDockerProvider(FakeMultiNodeProvider):
         self, node_config: Dict[str, Any], tags: Dict[str, str], count: int
     ) -> Optional[Dict[str, Any]]:
         resources = self._head_resources
-        return self.create_node_with_resources(node_config, tags, count, resources)
+        return self.create_node_with_resources_and_labels(
+            node_config, tags, count, resources, {}
+        )
 
     def _terminate_node(self, node):
         self._update_docker_compose_config()

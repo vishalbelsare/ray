@@ -2,7 +2,7 @@
 
 import argparse
 import json
-import logging.handlers
+import logging
 import os
 import signal
 import sys
@@ -10,12 +10,31 @@ import time
 import traceback
 from collections import Counter
 from dataclasses import asdict
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import ray
 import ray._private.ray_constants as ray_constants
-import ray._private.utils
+from ray._common.network_utils import (
+    build_address,
+    get_localhost_ip,
+    is_localhost,
+    parse_address,
+)
+from ray._common.ray_constants import (
+    LOGGING_ROTATE_BACKUP_COUNT,
+    LOGGING_ROTATE_BYTES,
+)
+from ray._private import logging_utils
+from ray._private.authentication.http_token_authentication import (
+    start_metrics_http_server,
+)
 from ray._private.event.event_logger import get_event_logger
+from ray._private.gcs_passive_utils import (
+    PassiveLatch,
+    del_kv_passive_safe,
+    is_refused_by_passive_gcs,
+    put_kv_passive_safe,
+)
 from ray._private.ray_logging import setup_component_logger
 from ray._raylet import GcsClient
 from ray.autoscaler._private.autoscaler import StandardAutoscaler
@@ -24,16 +43,18 @@ from ray.autoscaler._private.constants import (
     AUTOSCALER_MAX_RESOURCE_DEMAND_VECTOR_SIZE,
     AUTOSCALER_METRIC_PORT,
     AUTOSCALER_UPDATE_INTERVAL_S,
+    DISABLE_LAUNCH_CONFIG_CHECK_KEY,
 )
 from ray.autoscaler._private.event_summarizer import EventSummarizer
 from ray.autoscaler._private.load_metrics import LoadMetrics
 from ray.autoscaler._private.prom_metrics import AutoscalerPrometheusMetrics
 from ray.autoscaler._private.util import format_readonly_node_type
-from ray.core.generated import gcs_pb2, gcs_service_pb2, gcs_service_pb2_grpc
+from ray.autoscaler.v2.sdk import get_cluster_resource_state
+from ray.core.generated import autoscaler_pb2
+from ray.core.generated.autoscaler_pb2 import NodeStatus
 from ray.core.generated.event_pb2 import Event as RayEvent
 from ray.experimental.internal_kv import (
     _initialize_internal_kv,
-    _internal_kv_del,
     _internal_kv_get,
     _internal_kv_initialized,
     _internal_kv_put,
@@ -48,47 +69,36 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def parse_resource_demands(resource_load_by_shape):
-    """Handle the message.resource_load_by_shape protobuf for the demand
-    based autoscaling. Catch and log all exceptions so this doesn't
-    interfere with the utilization based autoscaler until we're confident
-    this is stable. Worker queue backlogs are added to the appropriate
-    resource demand vector.
+def parse_resource_demands(
+    pending_resource_requests: Iterable["autoscaler_pb2.ResourceRequestByCount"],
+) -> List[Dict]:
+    """Flatten the cluster_resource_state.pending_resource_requests protobuf
+    into a bundle-per-request demand vector. Catch and log all exceptions so
+    this doesn't interfere with the utilization based autoscaler until we're
+    confident this is stable.
 
     Args:
-        resource_load_by_shape (pb2.gcs.ResourceLoad): The resource demands
-            in protobuf form or None.
+        pending_resource_requests: The per-shape pending resource request
+            counts from ClusterResourceState.
 
     Returns:
-        List[ResourceDict]: Waiting bundles (ready and feasible).
-        List[ResourceDict]: Infeasible bundles.
+        The pending demand, one dict per requested bundle.
     """
-    waiting_bundles, infeasible_bundles = [], []
+    demand_bundles = []
     try:
-        for resource_demand_pb in list(resource_load_by_shape.resource_demands):
-            request_shape = dict(resource_demand_pb.shape)
-            for _ in range(resource_demand_pb.num_ready_requests_queued):
-                waiting_bundles.append(request_shape)
-            for _ in range(resource_demand_pb.num_infeasible_requests_queued):
-                infeasible_bundles.append(request_shape)
-
-            # Infeasible and ready states for tasks are (logically)
-            # mutually exclusive.
-            if resource_demand_pb.num_infeasible_requests_queued > 0:
-                backlog_queue = infeasible_bundles
-            else:
-                backlog_queue = waiting_bundles
-            for _ in range(resource_demand_pb.backlog_size):
-                backlog_queue.append(request_shape)
-            if (
-                len(waiting_bundles + infeasible_bundles)
-                > AUTOSCALER_MAX_RESOURCE_DEMAND_VECTOR_SIZE
-            ):
-                break
+        shapes = [
+            (
+                dict(request_by_count.request.resources_bundle),
+                min(request_by_count.count, AUTOSCALER_MAX_RESOURCE_DEMAND_VECTOR_SIZE),
+            )
+            for request_by_count in pending_resource_requests
+        ]
+        for i in range(max((count for _, count in shapes), default=0)):
+            demand_bundles.extend(shape for shape, count in shapes if count > i)
     except Exception:
         logger.exception("Failed to parse resource demands.")
 
-    return waiting_bundles, infeasible_bundles
+    return demand_bundles
 
 
 # Readonly provider config (e.g., for laptop mode, manually setup clusters).
@@ -101,6 +111,7 @@ BASE_READONLY_CONFIG = {
     "provider": {
         "type": "readonly",
         "use_node_id_as_ip": True,  # For emulated multi-node on laptop.
+        DISABLE_LAUNCH_CONFIG_CHECK_KEY: True,  # No launch check.
     },
     "auth": {},
     "available_node_types": {
@@ -118,8 +129,6 @@ BASE_READONLY_CONFIG = {
     "worker_setup_commands": [],
     "head_start_ray_commands": [],
     "worker_start_ray_commands": [],
-    "head_node": {},
-    "worker_nodes": {},
 }
 
 
@@ -140,33 +149,29 @@ class Monitor:
         retry_on_failure: bool = True,
     ):
         self.gcs_address = address
-        options = ray_constants.GLOBAL_GRPC_OPTIONS
-        gcs_channel = ray._private.utils.init_grpc_channel(self.gcs_address, options)
-        # TODO: Use gcs client for this
-        self.gcs_node_resources_stub = (
-            gcs_service_pb2_grpc.NodeResourceInfoGcsServiceStub(gcs_channel)
-        )
-        self.gcs_node_info_stub = gcs_service_pb2_grpc.NodeInfoGcsServiceStub(
-            gcs_channel
-        )
         worker = ray._private.worker.global_worker
-        gcs_client = GcsClient(address=self.gcs_address)
+        # TODO: eventually plumb ClusterID through to here
+        self.gcs_client = GcsClient(address=self.gcs_address)
 
-        if monitor_ip:
-            monitor_addr = f"{monitor_ip}:{AUTOSCALER_METRIC_PORT}"
-            gcs_client.internal_kv_put(
-                b"AutoscalerMetricsAddress", monitor_addr.encode(), True, None
-            )
-        _initialize_internal_kv(gcs_client)
-        if monitor_ip:
-            monitor_addr = f"{monitor_ip}:{AUTOSCALER_METRIC_PORT}"
-            gcs_client.internal_kv_put(
-                b"AutoscalerMetricsAddress", monitor_addr.encode(), True, None
-            )
-        self._session_name = self.get_session_name(gcs_client)
+        _initialize_internal_kv(self.gcs_client)
+
+        self._autoscaler_passive_latch = PassiveLatch(
+            "Autoscaling",
+            logger,
+            action_desc_passive=(
+                "GCS is in passive mode. Autoscaling stays paused until this head is "
+                "promoted."
+            ),
+            action_desc_promoted="GCS was promoted to leader. Resuming autoscaling.",
+        )
+        self._metrics_address = (
+            build_address(monitor_ip, AUTOSCALER_METRIC_PORT) if monitor_ip else None
+        )
+        self._publish_metrics_address()
+        self._session_name = self.get_session_name(self.gcs_client)
         logger.info(f"session_name: {self._session_name}")
         worker.mode = 0
-        head_node_ip = self.gcs_address.split(":")[0]
+        head_node_ip = parse_address(self.gcs_address)[0]
 
         self.load_metrics = LoadMetrics()
         self.last_avail_resources = None
@@ -201,8 +206,10 @@ class Monitor:
                         AUTOSCALER_METRIC_PORT
                     )
                 )
-                kwargs = {"addr": "127.0.0.1"} if head_node_ip == "127.0.0.1" else {}
-                prometheus_client.start_http_server(
+                kwargs = (
+                    {"addr": get_localhost_ip()} if is_localhost(head_node_ip) else {}
+                )
+                start_metrics_http_server(
                     port=AUTOSCALER_METRIC_PORT,
                     registry=self.prom_metrics.registry,
                     **kwargs,
@@ -223,6 +230,40 @@ class Monitor:
 
         logger.info("Monitor: Started")
 
+    def _publish_metrics_address(self) -> bool:
+        if self._metrics_address is None:
+            return True
+        return put_kv_passive_safe(
+            self.gcs_client,
+            b"AutoscalerMetricsAddress",
+            self._metrics_address,
+            overwrite=True,
+            latch=self._autoscaler_passive_latch,
+        )
+
+    def _clear_previous_autoscaling_error(self) -> bool:
+        if not _internal_kv_initialized():
+            return True
+        return del_kv_passive_safe(
+            self.gcs_client,
+            ray_constants.DEBUG_AUTOSCALING_ERROR,
+            latch=self._autoscaler_passive_latch,
+        )
+
+    def _resume_after_promotion(self) -> bool:
+        """Take over the keys this head could not write while it was passive.
+
+        The metrics address names the current leader's endpoint, so every promotion
+        rewrites it. Returns True if already active or takeover succeeded, False if
+        a demotion raced the takeover write.
+        """
+        if not self._autoscaler_passive_latch.waiting_for_promotion:
+            return True
+        if self._publish_metrics_address() and self._clear_previous_autoscaling_error():
+            self._autoscaler_passive_latch.promoted()
+            return True
+        return False
+
     def _initialize_autoscaler(self):
         if self.autoscaling_config:
             autoscaling_config = self.autoscaling_config
@@ -239,7 +280,7 @@ class Monitor:
         self.autoscaler = StandardAutoscaler(
             autoscaling_config,
             self.load_metrics,
-            self.gcs_node_info_stub,
+            self.gcs_client,
             self._session_name,
             prefix_cluster_info=self.prefix_cluster_info,
             event_summarizer=self.event_summarizer,
@@ -249,58 +290,58 @@ class Monitor:
     def update_load_metrics(self):
         """Fetches resource usage data from GCS and updates load metrics."""
 
-        request = gcs_service_pb2.GetAllResourceUsageRequest()
-        response = self.gcs_node_resources_stub.GetAllResourceUsage(request, timeout=60)
-        resources_batch_data = response.resource_usage_data
-        log_resource_batch_data_if_desired(resources_batch_data)
+        cluster_resource_state = get_cluster_resource_state(self.gcs_client)
+        log_resource_batch_data_if_desired(cluster_resource_state)
+        # Dead raylets are included in cluster_resource_state (for v2). Skip
+        # them so they cannot overwrite live LoadMetrics by IP or appear as
+        # active in the readonly provider (ray status).
+        alive_node_states = [
+            node
+            for node in cluster_resource_state.node_states
+            if node.status != NodeStatus.DEAD
+        ]
+        ray_nodes_idle_duration_ms_by_id = {
+            node.node_id: node.idle_duration_ms for node in alive_node_states
+        }
 
         # Tell the readonly node provider what nodes to report.
         if self.readonly_config:
             new_nodes = []
-            for msg in list(resources_batch_data.batch):
+            for msg in alive_node_states:
                 node_id = msg.node_id.hex()
-                new_nodes.append((node_id, msg.node_manager_address))
+                new_nodes.append((node_id, msg.node_ip_address))
             self.autoscaler.provider._set_nodes(new_nodes)
 
+        waiting_bundles = parse_resource_demands(
+            cluster_resource_state.pending_resource_requests
+        )
+        # GCS no longer distinguishes feasible from infeasible demand for
+        # this RPC; infeasibility is determined independently downstream
+        # against the configured node types (see
+        # StandardAutoscaler._report_pending_infeasible).
+        infeasible_bundles: List[Dict] = []
+
+        pending_placement_groups = list(
+            cluster_resource_state.placement_group_load.placement_group_data
+        )
+
         mirror_node_types = {}
-        cluster_full = False
-        if (
-            hasattr(response, "cluster_full_of_actors_detected_by_gcs")
-            and response.cluster_full_of_actors_detected_by_gcs
-        ):
-            # GCS has detected the cluster full of actors.
-            cluster_full = True
-        for resource_message in resources_batch_data.batch:
+        for resource_message in alive_node_states:
             node_id = resource_message.node_id
             # Generate node type config based on GCS reported node list.
             if self.readonly_config:
                 # Keep prefix in sync with ReadonlyNodeProvider.
                 node_type = format_readonly_node_type(node_id.hex())
                 resources = {}
-                for k, v in resource_message.resources_total.items():
+                for k, v in resource_message.total_resources.items():
                     resources[k] = v
                 mirror_node_types[node_type] = {
                     "resources": resources,
                     "node_config": {},
                     "max_workers": 1,
                 }
-            if (
-                hasattr(resource_message, "cluster_full_of_actors_detected")
-                and resource_message.cluster_full_of_actors_detected
-            ):
-                # A worker node has detected the cluster full of actors.
-                cluster_full = True
-            resource_load = dict(resource_message.resource_load)
-            total_resources = dict(resource_message.resources_total)
-            available_resources = dict(resource_message.resources_available)
-
-            waiting_bundles, infeasible_bundles = parse_resource_demands(
-                resources_batch_data.resource_load_by_shape
-            )
-
-            pending_placement_groups = list(
-                resources_batch_data.placement_group_load.placement_group_data
-            )
+            total_resources = dict(resource_message.total_resources)
+            available_resources = dict(resource_message.available_resources)
 
             use_node_id_as_ip = self.autoscaler is not None and self.autoscaler.config[
                 "provider"
@@ -318,17 +359,25 @@ class Monitor:
                 else:
                     ip = node_id.hex()
             else:
-                ip = resource_message.node_manager_address
+                ip = resource_message.node_ip_address
+
+            idle_duration_s = 0.0
+            if node_id in ray_nodes_idle_duration_ms_by_id:
+                idle_duration_s = ray_nodes_idle_duration_ms_by_id[node_id] / 1000
+            else:
+                logger.warning(
+                    f"node_id {node_id} not found in ray_nodes_idle_duration_ms_by_id"
+                )
+
             self.load_metrics.update(
                 ip,
                 node_id,
                 total_resources,
                 available_resources,
-                resource_load,
+                idle_duration_s,
                 waiting_bundles,
                 infeasible_bundles,
                 pending_placement_groups,
-                cluster_full,
             )
         if self.readonly_config:
             self.readonly_config["available_node_types"].update(mirror_node_types)
@@ -370,74 +419,93 @@ class Monitor:
 
     def _run(self):
         """Run the monitor loop."""
+
         while True:
-            try:
-                gcs_request_start_time = time.time()
-                self.update_load_metrics()
-                gcs_request_time = time.time() - gcs_request_start_time
-                self.update_resource_requests()
-                self.update_event_summary()
-                load_metrics_summary = self.load_metrics.summary()
-                status = {
-                    "gcs_request_time": gcs_request_time,
-                    "time": time.time(),
-                    "monitor_pid": os.getpid(),
-                }
+            # The cloud provider is not leader-gated, so ask rather than wait
+            # for a refused RPC.
+            if (
+                ray_constants.RAY_ENABLE_GCS_LEADER_ELECTION
+                and not self.gcs_client.is_gcs_leader()
+            ):
+                self._autoscaler_passive_latch.note_passive()
+            elif self._resume_after_promotion():
+                try:
+                    gcs_request_start_time = time.time()
+                    self.update_load_metrics()
+                    gcs_request_time = time.time() - gcs_request_start_time
+                    self.update_resource_requests()
+                    self.update_event_summary()
+                    load_metrics_summary = self.load_metrics.summary()
+                    status = {
+                        "gcs_request_time": gcs_request_time,
+                        "time": time.time(),
+                        "monitor_pid": os.getpid(),
+                    }
 
-                if self.autoscaler and not self.load_metrics:
-                    # load_metrics is Falsey iff we haven't collected any
-                    # resource messages from the GCS, which can happen at startup if
-                    # the GCS hasn't yet received data from the Raylets.
-                    # In this case, do not do an autoscaler update.
-                    # Wait to get load metrics.
-                    logger.info(
-                        "Autoscaler has not yet received load metrics. Waiting."
-                    )
-                elif self.autoscaler:
-                    # Process autoscaling actions
-                    update_start_time = time.time()
-                    self.autoscaler.update()
-                    status["autoscaler_update_time"] = time.time() - update_start_time
-                    autoscaler_summary = self.autoscaler.summary()
-                    self.emit_metrics(
-                        load_metrics_summary,
-                        autoscaler_summary,
-                        self.autoscaler.all_node_types,
-                    )
-                    if autoscaler_summary:
-                        status["autoscaler_report"] = asdict(autoscaler_summary)
-                        status[
-                            "non_terminated_nodes_time"
-                        ] = (
-                            self.autoscaler.non_terminated_nodes.non_terminated_nodes_time  # noqa: E501
+                    if self.autoscaler and not self.load_metrics:
+                        # load_metrics is Falsey iff we haven't collected any
+                        # resource messages from the GCS, which can happen at startup
+                        # if the GCS hasn't yet received data from the Raylets.
+                        # In this case, do not do an autoscaler update.
+                        # Wait to get load metrics.
+                        logger.info(
+                            "Autoscaler has not yet received load metrics. Waiting."
                         )
-
-                    for msg in self.event_summarizer.summary():
-                        # Need to prefix each line of the message for the lines to
-                        # get pushed to the driver logs.
-                        for line in msg.split("\n"):
-                            logger.info(
-                                "{}{}".format(
-                                    ray_constants.LOG_PREFIX_EVENT_SUMMARY, line
-                                )
+                    elif self.autoscaler:
+                        # Process autoscaling actions
+                        update_start_time = time.time()
+                        self.autoscaler.update()
+                        status["autoscaler_update_time"] = (
+                            time.time() - update_start_time
+                        )
+                        autoscaler_summary = self.autoscaler.summary()
+                        try:
+                            self.emit_metrics(
+                                load_metrics_summary,
+                                autoscaler_summary,
+                                self.autoscaler.all_node_types,
                             )
-                            if self.event_logger:
-                                self.event_logger.info(line)
+                        except Exception:
+                            logger.exception("Error emitting metrics")
 
-                    self.event_summarizer.clear()
+                        if autoscaler_summary:
+                            status["autoscaler_report"] = asdict(autoscaler_summary)
+                            status[
+                                "non_terminated_nodes_time"
+                            ] = (
+                                self.autoscaler.non_terminated_nodes.non_terminated_nodes_time  # noqa: E501
+                            )
 
-                status["load_metrics_report"] = asdict(load_metrics_summary)
-                as_json = json.dumps(status)
-                if _internal_kv_initialized():
-                    _internal_kv_put(
-                        ray_constants.DEBUG_AUTOSCALING_STATUS, as_json, overwrite=True
-                    )
-            except Exception:
-                # By default, do not exit the monitor on failure.
-                if self.retry_on_failure:
-                    logger.exception("Monitor: Execution exception. Trying again...")
-                else:
-                    raise
+                        for msg in self.event_summarizer.summary():
+                            # Need to prefix each line of the message for the lines
+                            # to get pushed to the driver logs.
+                            for line in msg.split("\n"):
+                                logger.info(
+                                    "{}{}".format(
+                                        ray_constants.LOG_PREFIX_EVENT_SUMMARY, line
+                                    )
+                                )
+                                if self.event_logger:
+                                    self.event_logger.info(line)
+
+                        self.event_summarizer.clear()
+
+                    status["load_metrics_report"] = asdict(load_metrics_summary)
+                    as_json = json.dumps(status)
+                    if _internal_kv_initialized():
+                        _internal_kv_put(  # passive-ok: loop body runs only when active leader
+                            ray_constants.DEBUG_AUTOSCALING_STATUS,
+                            as_json,
+                            overwrite=True,
+                        )
+                except Exception:
+                    # By default, do not exit the monitor on failure.
+                    if self.retry_on_failure:
+                        logger.exception(
+                            "Monitor: Execution exception. Trying again..."
+                        )
+                    else:
+                        raise
 
             # Wait for a autoscaler update interval before processing the next
             # round of messages.
@@ -447,7 +515,7 @@ class Monitor:
         if autoscaler_summary is None:
             return None
 
-        for resource_name in ["CPU", "GPU"]:
+        for resource_name in ["CPU", "GPU", "TPU"]:
             _, total = load_metrics_summary.usage.get(resource_name, (0, 0))
             pending = autoscaler_summary.pending_resources.get(resource_name, 0)
             self.prom_metrics.cluster_resources.labels(
@@ -463,7 +531,7 @@ class Monitor:
         for _, node_type, _ in autoscaler_summary.pending_nodes:
             pending_node_count[node_type] += 1
 
-        for node_type, count in autoscaler_summary.pending_launches:
+        for node_type, count in autoscaler_summary.pending_launches.items():
             pending_node_count[node_type] += count
 
         for node_type in node_types:
@@ -497,14 +565,14 @@ class Monitor:
     def update_event_summary(self):
         """Report the current size of the cluster.
 
-        To avoid log spam, only cluster size changes (CPU or GPU count change)
+        To avoid log spam, only cluster size changes (CPU, GPU or TPU count change)
         are reported to the event summarizer. The event summarizer will report
         only the latest cluster size per batch.
         """
         avail_resources = self.load_metrics.resources_avail_summary()
         if not self.readonly_config and avail_resources != self.last_avail_resources:
             self.event_summarizer.add(
-                "Resized to {}.",  # e.g., Resized to 100 CPUs, 4 GPUs.
+                "Resized to {}.",  # e.g., Resized to 100 CPUs, 4 GPUs, 4 TPUs.
                 quantity=avail_resources,
                 aggregate=lambda old, new: new,
             )
@@ -543,9 +611,10 @@ class Monitor:
                 time.sleep(2)
 
     def _handle_failure(self, error):
-        logger.exception("Error in monitor loop")
         if (
             self.autoscaler is not None
+            # Those workers belong to the head that is leading, not to this one.
+            and not self._autoscaler_passive_latch.waiting_for_promotion
             and os.environ.get("RAY_AUTOSCALER_FATESHARE_WORKERS", "") == "1"
         ):
             self.autoscaler.kill_workers()
@@ -556,16 +625,19 @@ class Monitor:
         # drivers.
         message = f"The autoscaler failed with the following error:\n{error}"
         if _internal_kv_initialized():
-            _internal_kv_put(
-                ray_constants.DEBUG_AUTOSCALING_ERROR, message, overwrite=True
+            put_kv_passive_safe(
+                self.gcs_client,
+                ray_constants.DEBUG_AUTOSCALING_ERROR,
+                message,
+                overwrite=True,
+                latch=self._autoscaler_passive_latch,
             )
-        gcs_publisher = ray._raylet.GcsPublisher(address=self.gcs_address)
         from ray._private.utils import publish_error_to_driver
 
         publish_error_to_driver(
             ray_constants.MONITOR_DIED_ERROR,
             message,
-            gcs_publisher=gcs_publisher,
+            gcs_client=self.gcs_client,
         )
 
     def _signal_handler(self, sig, frame):
@@ -584,22 +656,26 @@ class Monitor:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         try:
-            if _internal_kv_initialized():
-                # Delete any previous autoscaling errors.
-                _internal_kv_del(ray_constants.DEBUG_AUTOSCALING_ERROR)
+            # Delete any previous autoscaling errors.
+            self._clear_previous_autoscaling_error()
             self._initialize_autoscaler()
             self._run()
-        except Exception:
-            self._handle_failure(traceback.format_exc())
+        except Exception as e:
+            logger.exception("Error in monitor loop")
+            # Nothing above is expected to leak a passive rejection, but if one
+            # does: a standby head's autoscaler is parked, not dead, and saying
+            # otherwise would tell every driver the cluster lost its autoscaler.
+            if not is_refused_by_passive_gcs(e, latch=self._autoscaler_passive_latch):
+                self._handle_failure(traceback.format_exc())
             raise
 
 
 def log_resource_batch_data_if_desired(
-    resources_batch_data: gcs_pb2.ResourceUsageBatchData,
+    cluster_resource_state: autoscaler_pb2.ClusterResourceState,
 ) -> None:
     if os.getenv("AUTOSCALER_LOG_RESOURCE_BATCH_DATA") == "1":
         logger.info("Logging raw resource message pulled from GCS.")
-        logger.info(resources_batch_data)
+        logger.info(cluster_resource_state)
         logger.info("Done logging raw resource message.")
 
 
@@ -609,16 +685,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--gcs-address", required=False, type=str, help="The address (ip:port) of GCS."
-    )
-    parser.add_argument(
-        "--redis-address", required=False, type=str, help="This is deprecated"
-    )
-    parser.add_argument(
-        "--redis-password",
-        required=False,
-        type=str,
-        default=None,
-        help="This is deprecated",
     )
     parser.add_argument(
         "--autoscaling-config",
@@ -660,18 +726,18 @@ if __name__ == "__main__":
         "--logging-rotate-bytes",
         required=False,
         type=int,
-        default=ray_constants.LOGGING_ROTATE_BYTES,
+        default=LOGGING_ROTATE_BYTES,
         help="Specify the max bytes for rotating "
         "log file, default is "
-        f"{ray_constants.LOGGING_ROTATE_BYTES} bytes.",
+        f"{LOGGING_ROTATE_BYTES} bytes.",
     )
     parser.add_argument(
         "--logging-rotate-backup-count",
         required=False,
         type=int,
-        default=ray_constants.LOGGING_ROTATE_BACKUP_COUNT,
+        default=LOGGING_ROTATE_BACKUP_COUNT,
         help="Specify the backup count of rotated log file, default is "
-        f"{ray_constants.LOGGING_ROTATE_BACKUP_COUNT}.",
+        f"{LOGGING_ROTATE_BACKUP_COUNT}.",
     )
     parser.add_argument(
         "--monitor-ip",
@@ -680,15 +746,43 @@ if __name__ == "__main__":
         default=None,
         help="The IP address of the machine hosting the monitor process.",
     )
+    parser.add_argument(
+        "--stdout-filepath",
+        required=False,
+        type=str,
+        default="",
+        help="The filepath to dump monitor stdout.",
+    )
+    parser.add_argument(
+        "--stderr-filepath",
+        required=False,
+        type=str,
+        default="",
+        help="The filepath to dump monitor stderr.",
+    )
 
     args = parser.parse_args()
+
+    # Disable log rotation for windows, because NTFS doesn't allow file deletion when there're multiple owners or borrowers, which happens to be how ray accesses log files.
+    logging_rotation_bytes = args.logging_rotate_bytes if sys.platform != "win32" else 0
+    logging_rotation_backup_count = (
+        args.logging_rotate_backup_count if sys.platform != "win32" else 1
+    )
     setup_component_logger(
         logging_level=args.logging_level,
         logging_format=args.logging_format,
         log_dir=args.logs_dir,
         filename=args.logging_filename,
-        max_bytes=args.logging_rotate_bytes,
-        backup_count=args.logging_rotate_backup_count,
+        max_bytes=logging_rotation_bytes,
+        backup_count=logging_rotation_backup_count,
+    )
+
+    # Setup stdout/stderr redirect files if redirection enabled.
+    logging_utils.redirect_stdout_stderr_if_needed(
+        args.stdout_filepath,
+        args.stderr_filepath,
+        logging_rotation_bytes,
+        logging_rotation_backup_count,
     )
 
     logger.info(f"Starting monitor using ray installation: {ray.__file__}")

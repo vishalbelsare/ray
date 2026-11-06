@@ -1,23 +1,16 @@
-import os
 import sys
-import tempfile
 
 import pytest
 
 import ray
 from ray import serve
-from ray.serve._private.constants import (
-    SERVE_DEFAULT_APP_NAME,
-    DEPLOYMENT_NAME_PREFIX_SEPARATOR,
-)
-
-
-def get_deployment_name(name: str):
-    return f"{SERVE_DEFAULT_APP_NAME}{DEPLOYMENT_NAME_PREFIX_SEPARATOR}{name}"
+from ray._common.test_utils import wait_for_condition
+from ray.serve._private.common import DeploymentID
+from ray.serve._private.test_utils import FailedReplicaStore
 
 
 def test_deploy_with_consistent_constructor_failure(serve_instance):
-    # # Test failed to deploy with total of 1 replica
+    # Test failed to deploy with total of 1 replica
     @serve.deployment(num_replicas=1)
     class ConstructorFailureDeploymentOneReplica:
         def __init__(self):
@@ -31,9 +24,9 @@ def test_deploy_with_consistent_constructor_failure(serve_instance):
 
     # Assert no replicas are running in deployment deployment after failed
     # deploy call
-    deployment_name = get_deployment_name("ConstructorFailureDeploymentOneReplica")
+    deployment_id = DeploymentID(name="ConstructorFailureDeploymentOneReplica")
     deployment_dict = ray.get(serve_instance._controller._all_running_replicas.remote())
-    assert deployment_dict[deployment_name] == []
+    assert deployment_dict[deployment_id] == []
 
     # # Test failed to deploy with total of 2 replicas
     @serve.deployment(num_replicas=2)
@@ -49,71 +42,67 @@ def test_deploy_with_consistent_constructor_failure(serve_instance):
 
     # Assert no replicas are running in deployment deployment after failed
     # deploy call
-    deployment_name = get_deployment_name("ConstructorFailureDeploymentTwoReplicas")
+    deployment_id = DeploymentID(name="ConstructorFailureDeploymentTwoReplicas")
     deployment_dict = ray.get(serve_instance._controller._all_running_replicas.remote())
-    assert deployment_dict[deployment_name] == []
+    assert deployment_dict[deployment_id] == []
 
 
 def test_deploy_with_partial_constructor_failure(serve_instance):
     # Test deploy with 2 replicas but one of them failed all
-    # attempts
-    with tempfile.TemporaryDirectory() as tmpdir:
-        file_path = os.path.join(tmpdir, "test_deploy.txt")
+    # attempts.
+    failed_store = FailedReplicaStore.remote()
 
-        @serve.deployment(num_replicas=2)
-        class PartialConstructorFailureDeployment:
-            def __init__(self):
-                if not os.path.exists(file_path):
-                    with open(file_path, "w") as f:
-                        # Write first replica tag to local file so that it will
-                        # consistently fail even retried on other actor
-                        f.write(serve.get_replica_context().replica_tag)
-                    raise RuntimeError("Consistently throwing on same replica.")
-                else:
-                    with open(file_path) as f:
-                        content = f.read()
-                        if content == serve.get_replica_context().replica_tag:
-                            raise RuntimeError("Consistently throwing on same replica.")
-                        else:
-                            return True
+    @serve.deployment(num_replicas=2)
+    class PartialConstructorFailureDeployment:
+        def __init__(self, store):
+            if ray.get(store.should_fail.remote()):
+                raise RuntimeError("Consistently throwing on same replica.")
 
-            async def serve(self, request):
-                return "hi"
+        async def serve(self, request):
+            return "hi"
 
-        serve.run(PartialConstructorFailureDeployment.bind())
+    serve._run(PartialConstructorFailureDeployment.bind(failed_store), _blocking=False)
 
-    # Assert 2 replicas are running in deployment deployment after partially
-    # successful deploy call
-    deployment_dict = ray.get(serve_instance._controller._all_running_replicas.remote())
-    deployment_name = get_deployment_name("PartialConstructorFailureDeployment")
-    assert len(deployment_dict[deployment_name]) == 2
+    deployment_id = DeploymentID(name="PartialConstructorFailureDeployment")
+
+    def _one_replica_running() -> bool:
+        deployment_dict = ray.get(
+            serve_instance._controller._all_running_replicas.remote()
+        )
+        return len(deployment_dict.get(deployment_id, [])) == 1
+
+    wait_for_condition(_one_replica_running, timeout=30)
+
+    # Wait past the failed-to-start threshold
+    # (min(max_constructor_retry_count, num_replicas * 3) = 6 here)
+    # to prove the deployment stays stuck and never transitions.
+    def _enough_retries_and_still_stable() -> bool:
+        fail_count = ray.get(failed_store.get_fail_count.remote())
+        return fail_count >= 8 and _one_replica_running()
+
+    wait_for_condition(_enough_retries_and_still_stable, timeout=90)
 
 
 def test_deploy_with_transient_constructor_failure(serve_instance):
     # Test failed to deploy with total of 2 replicas,
     # but first constructor call fails.
-    with tempfile.TemporaryDirectory() as tmpdir:
-        file_path = os.path.join(tmpdir, "test_deploy.txt")
+    failed_store = FailedReplicaStore.remote(fail_first=True)
 
-        @serve.deployment(num_replicas=2)
-        class TransientConstructorFailureDeployment:
-            def __init__(self):
-                if os.path.exists(file_path):
-                    return True
-                else:
-                    with open(file_path, "w") as f:
-                        f.write("ONE")
-                    raise RuntimeError("Intentionally throw on first try.")
+    @serve.deployment(num_replicas=2)
+    class TransientConstructorFailureDeployment:
+        def __init__(self, store):
+            if ray.get(store.should_fail.remote()):
+                raise RuntimeError("Intentionally throw on first try.")
 
-            async def serve(self, request):
-                return "hi"
+        async def serve(self, request):
+            return "hi"
 
-        serve.run(TransientConstructorFailureDeployment.bind())
+    serve.run(TransientConstructorFailureDeployment.bind(failed_store))
     # Assert 2 replicas are running in deployment deployment after partially
     # successful deploy call with transient error
     deployment_dict = ray.get(serve_instance._controller._all_running_replicas.remote())
-    deployment_name = get_deployment_name("TransientConstructorFailureDeployment")
-    assert len(deployment_dict[deployment_name]) == 2
+    deployment_id = DeploymentID(name="TransientConstructorFailureDeployment")
+    assert len(deployment_dict[deployment_id]) == 2
 
 
 if __name__ == "__main__":

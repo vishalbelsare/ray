@@ -1,28 +1,38 @@
+import contextlib
 import copy
-import mock
+import datetime
 import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import List, Set
+from unittest import mock
 
 import jsonpatch
 import pytest
+import yaml
 
-from ray.autoscaler.batching_node_provider import NodeData
+from ray.autoscaler._private.kuberay import node_provider as node_provider_module
 from ray.autoscaler._private.kuberay.node_provider import (
+    IN_CLUSTER_CA_CERT_PATH,
+    IN_CLUSTER_TOKEN_PATH,
+    KUBERAY_REQUEST_TIMEOUT_S,
+    KubeRayNodeProvider,
+    KubernetesHttpApiClient,
+    ScaleRequest,
     _worker_group_index,
     _worker_group_max_replicas,
     _worker_group_replicas,
-    KuberayNodeProvider,
-    ScaleRequest,
+    load_k8s_secrets,
 )
 from ray.autoscaler._private.util import NodeID
-from pathlib import Path
-import yaml
-
+from ray.autoscaler.batching_node_provider import NodeData
 from ray.tests.kuberay.test_autoscaling_config import get_basic_ray_cr
-from typing import Set, List
 
 
 def _get_basic_ray_cr_workers_to_delete(
-    cpu_workers_to_delete: List[NodeID], gpu_workers_to_delete: List[NodeID]
+    cpu_workers_to_delete: List[NodeID],
+    gpu_workers_to_delete: List[NodeID],
+    tpu_workers_to_delete: List[NodeID],
 ):
     """Generate a Ray cluster with non-empty workersToDelete field."""
     raycluster = get_basic_ray_cr()
@@ -31,6 +41,9 @@ def _get_basic_ray_cr_workers_to_delete(
     }
     raycluster["spec"]["workerGroupSpecs"][1]["scaleStrategy"] = {
         "workersToDelete": gpu_workers_to_delete
+    }
+    raycluster["spec"]["workerGroupSpecs"][2]["scaleStrategy"] = {
+        "workersToDelete": tpu_workers_to_delete
     }
     return raycluster
 
@@ -57,7 +70,7 @@ def test_worker_group_index(group_name, expected_index):
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="Not relevant on Windows.")
 @pytest.mark.parametrize(
     "group_index,expected_max_replicas,expected_replicas",
-    [(0, 300, 1), (1, 200, 1), (2, None, 0)],
+    [(0, 300, 1), (1, 200, 1), (2, 4, 1), (3, None, 0)],
 )
 def test_worker_group_replicas(group_index, expected_max_replicas, expected_replicas):
     """Basic unit test for _worker_group_max_replicas and _worker_group_replicas
@@ -86,9 +99,9 @@ def test_worker_group_replicas(group_index, expected_max_replicas, expected_repl
     [(200, 200), (250, 250), (300, 300), (400, 300), (1000, 300)],
 )
 def test_create_node_cap_at_max(
-    attempted_target_replica_count, expected_target_replica_count
+    attempted_target_replica_count: int, expected_target_replica_count: int
 ):
-    """Validates that KuberayNodeProvider does not attempt to create more nodes than
+    """Validates that KubeRayNodeProvider does not attempt to create more nodes than
     allowed by maxReplicas. For the config in this test, maxReplicas is fixed at 300.
 
     Args:
@@ -98,8 +111,8 @@ def test_create_node_cap_at_max(
             capped at maxReplicas (300, for the config in this test.)
     """
     raycluster = get_basic_ray_cr()
-    with mock.patch.object(KuberayNodeProvider, "__init__", return_value=None):
-        kr_node_provider = KuberayNodeProvider(provider_config={}, cluster_name="fake")
+    with mock.patch.object(KubeRayNodeProvider, "__init__", return_value=None):
+        kr_node_provider = KubeRayNodeProvider(provider_config={}, cluster_name="fake")
         scale_request = ScaleRequest(
             workers_to_delete=set(),
             desired_num_workers={"small-group": attempted_target_replica_count},
@@ -119,10 +132,18 @@ def test_create_node_cap_at_max(
             "podlist1.yaml",
             {
                 "raycluster-autoscaler-head-8zsc8": NodeData(
-                    kind="head", type="head-group", ip="10.4.2.6", status="up-to-date"
+                    kind="head",
+                    type="headgroup",
+                    replica_index=None,
+                    ip="10.4.2.6",
+                    status="up-to-date",
                 ),  # up-to-date status because the Ray container is in running status
                 "raycluster-autoscaler-worker-small-group-dkz2r": NodeData(
-                    kind="worker", type="small-group", ip="10.4.1.8", status="waiting"
+                    kind="worker",
+                    type="small-group",
+                    replica_index=None,
+                    ip="10.4.1.8",
+                    status="waiting",
                 ),  # waiting status, because Ray container's state is "waiting".
                 # The pod list includes a worker with non-null deletion timestamp.
                 # It is excluded from the node data because it is considered
@@ -134,24 +155,45 @@ def test_create_node_cap_at_max(
             "podlist2.yaml",
             {
                 "raycluster-autoscaler-head-8zsc8": NodeData(
-                    kind="head", type="head-group", ip="10.4.2.6", status="up-to-date"
+                    kind="head",
+                    type="headgroup",
+                    replica_index=None,
+                    ip="10.4.2.6",
+                    status="up-to-date",
                 ),
                 "raycluster-autoscaler-worker-fake-gpu-group-2qnhv": NodeData(
                     kind="worker",
                     type="fake-gpu-group",
+                    replica_index=None,
                     ip="10.4.0.6",
                     status="up-to-date",
                 ),
                 "raycluster-autoscaler-worker-small-group-dkz2r": NodeData(
                     kind="worker",
                     type="small-group",
+                    replica_index=None,
                     ip="10.4.1.8",
                     status="up-to-date",
                 ),
                 "raycluster-autoscaler-worker-small-group-lbfm4": NodeData(
                     kind="worker",
                     type="small-group",
+                    replica_index=None,
                     ip="10.4.0.5",
+                    status="up-to-date",
+                ),
+                "raycluster-autoscaler-tpu-group-worker-s8jhq": NodeData(
+                    kind="worker",
+                    type="tpu-group",
+                    replica_index="tpu-group-0",
+                    ip="10.24.9.4",
+                    status="up-to-date",
+                ),
+                "raycluster-autoscaler-tpu-group-worker-jd69f": NodeData(
+                    kind="worker",
+                    type="tpu-group",
+                    replica_index="tpu-group-0",
+                    ip="10.24.8.4",
                     status="up-to-date",
                 ),
             },
@@ -171,10 +213,11 @@ def test_get_node_data(podlist_file: str, expected_node_data):
             raise ValueError("Invalid path.")
 
     with mock.patch.object(
-        KuberayNodeProvider, "__init__", return_value=None
-    ), mock.patch.object(KuberayNodeProvider, "_get", mock_get):
-        kr_node_provider = KuberayNodeProvider(provider_config={}, cluster_name="fake")
+        KubeRayNodeProvider, "__init__", return_value=None
+    ), mock.patch.object(KubeRayNodeProvider, "_get", mock_get):
+        kr_node_provider = KubeRayNodeProvider(provider_config={}, cluster_name="fake")
         kr_node_provider.cluster_name = "fake"
+        kr_node_provider.replica_index_to_nodes = defaultdict(list[str])
         nodes = kr_node_provider.non_terminated_nodes({})
         assert kr_node_provider.node_data_dict == expected_node_data
         assert set(nodes) == set(expected_node_data.keys())
@@ -187,23 +230,30 @@ def test_get_node_data(podlist_file: str, expected_node_data):
         (
             {
                 "raycluster-autoscaler-head-8zsc8": NodeData(
-                    kind="head", type="head-group", ip="10.4.2.6", status="up-to-date"
+                    kind="head",
+                    type="headgroup",
+                    replica_index=None,
+                    ip="10.4.2.6",
+                    status="up-to-date",
                 ),
                 "raycluster-autoscaler-worker-fake-gpu-group-2qnhv": NodeData(
                     kind="worker",
                     type="fake-gpu-group",
+                    replica_index=None,
                     ip="10.4.0.6",
                     status="up-to-date",
                 ),
                 "raycluster-autoscaler-worker-small-group-dkz2r": NodeData(
                     kind="worker",
                     type="small-group",
+                    replica_index=None,
                     ip="10.4.1.8",
                     status="up-to-date",
                 ),
                 "raycluster-autoscaler-worker-small-group-lbfm4": NodeData(
                     kind="worker",
                     type="small-group",
+                    replica_index=None,
                     ip="10.4.0.5",
                     status="up-to-date",
                 ),
@@ -221,7 +271,7 @@ def test_get_node_data(podlist_file: str, expected_node_data):
             [
                 {
                     "op": "replace",
-                    "path": "/spec/workerGroupSpecs/2/replicas",
+                    "path": "/spec/workerGroupSpecs/3/replicas",
                     "value": 5,
                 },
                 {
@@ -238,7 +288,7 @@ def test_get_node_data(podlist_file: str, expected_node_data):
     ],
 )
 def test_submit_scale_request(node_data_dict, scale_request, expected_patch_payload):
-    """Test the KuberayNodeProvider's RayCluster patch payload given a dict
+    """Test the KubeRayNodeProvider's RayCluster patch payload given a dict
     of current node counts and a scale request.
     """
     raycluster = get_basic_ray_cr()
@@ -246,8 +296,8 @@ def test_submit_scale_request(node_data_dict, scale_request, expected_patch_payl
     blah_group = copy.deepcopy(raycluster["spec"]["workerGroupSpecs"][1])
     blah_group["groupName"] = "blah-group"
     raycluster["spec"]["workerGroupSpecs"].append(blah_group)
-    with mock.patch.object(KuberayNodeProvider, "__init__", return_value=None):
-        kr_node_provider = KuberayNodeProvider(provider_config={}, cluster_name="fake")
+    with mock.patch.object(KubeRayNodeProvider, "__init__", return_value=None):
+        kr_node_provider = KubeRayNodeProvider(provider_config={}, cluster_name="fake")
         kr_node_provider.node_data_dict = node_data_dict
         patch_payload = kr_node_provider._scale_request_to_patch_payload(
             scale_request=scale_request, raycluster=raycluster
@@ -258,18 +308,20 @@ def test_submit_scale_request(node_data_dict, scale_request, expected_patch_payl
 @pytest.mark.parametrize("node_set", [{"A", "B", "C", "D", "E"}])
 @pytest.mark.parametrize("cpu_workers_to_delete", ["A", "Z"])
 @pytest.mark.parametrize("gpu_workers_to_delete", ["B", "Y"])
+@pytest.mark.parametrize("tpu_workers_to_delete", ["C", "X"])
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="Not relevant on Windows.")
 def test_safe_to_scale(
     node_set: Set[NodeID],
     cpu_workers_to_delete: List[NodeID],
     gpu_workers_to_delete: List[NodeID],
+    tpu_workers_to_delete: List[NodeID],
 ):
     # NodeData values unimportant for this test.
-    mock_node_data = NodeData("-", "-", "-", "-")
+    mock_node_data = NodeData("-", "-", "-", "-", "-")
     node_data_dict = {node_id: mock_node_data for node_id in node_set}
 
     raycluster = _get_basic_ray_cr_workers_to_delete(
-        cpu_workers_to_delete, gpu_workers_to_delete
+        cpu_workers_to_delete, gpu_workers_to_delete, tpu_workers_to_delete
     )
 
     def mock_patch(kuberay_provider, path, patch_payload):
@@ -277,21 +329,28 @@ def test_safe_to_scale(
         kuberay_provider._patched_raycluster = patch.apply(kuberay_provider._raycluster)
 
     with mock.patch.object(
-        KuberayNodeProvider, "__init__", return_value=None
-    ), mock.patch.object(KuberayNodeProvider, "_patch", mock_patch):
-        kr_node_provider = KuberayNodeProvider(provider_config={}, cluster_name="fake")
+        KubeRayNodeProvider, "__init__", return_value=None
+    ), mock.patch.object(KubeRayNodeProvider, "_patch", mock_patch):
+        kr_node_provider = KubeRayNodeProvider(provider_config={}, cluster_name="fake")
         kr_node_provider.cluster_name = "fake"
         kr_node_provider._patched_raycluster = raycluster
         kr_node_provider._raycluster = raycluster
         kr_node_provider.node_data_dict = node_data_dict
         actual_safe = kr_node_provider.safe_to_scale()
 
-    expected_safe = not any(
-        cpu_worker_to_delete in node_set
-        for cpu_worker_to_delete in cpu_workers_to_delete
-    ) and not any(
-        gpu_worker_to_delete in node_set
-        for gpu_worker_to_delete in gpu_workers_to_delete
+    expected_safe = (
+        not any(
+            cpu_worker_to_delete in node_set
+            for cpu_worker_to_delete in cpu_workers_to_delete
+        )
+        and not any(
+            gpu_worker_to_delete in node_set
+            for gpu_worker_to_delete in gpu_workers_to_delete
+        )
+        and not any(
+            tpu_worker_to_delete in node_set
+            for tpu_worker_to_delete in tpu_workers_to_delete
+        )
     )
     assert expected_safe is actual_safe
     patched_cpu_workers_to_delete = kr_node_provider._patched_raycluster["spec"][
@@ -300,15 +359,212 @@ def test_safe_to_scale(
     patched_gpu_workers_to_delete = kr_node_provider._patched_raycluster["spec"][
         "workerGroupSpecs"
     ][1]["scaleStrategy"]["workersToDelete"]
+    patched_tpu_workers_to_delete = kr_node_provider._patched_raycluster["spec"][
+        "workerGroupSpecs"
+    ][2]["scaleStrategy"]["workersToDelete"]
 
     if expected_safe:
         # Cleaned up workers to delete
         assert patched_cpu_workers_to_delete == []
         assert patched_gpu_workers_to_delete == []
+        assert patched_tpu_workers_to_delete == []
     else:
         # Did not clean up workers to delete
         assert patched_cpu_workers_to_delete == cpu_workers_to_delete
         assert patched_gpu_workers_to_delete == gpu_workers_to_delete
+        assert patched_tpu_workers_to_delete == tpu_workers_to_delete
+
+
+CLIENT_CERT_PATH = "/etc/ray-k8s-auth/tls.crt"
+CLIENT_KEY_PATH = "/etc/ray-k8s-auth/tls.key"
+CA_CERT_PATH = "/etc/ray-k8s-auth/ca.crt"
+
+
+def _mock_auth_config(
+    client_cert_path=None, client_key_path=None, ca_cert_path=None
+) -> mock._patch:
+    """Patch the auth configuration read from the environment at import time."""
+    return mock.patch.multiple(
+        node_provider_module,
+        KUBERAY_CLIENT_CERT_PATH=client_cert_path,
+        KUBERAY_CLIENT_KEY_PATH=client_key_path,
+        KUBERAY_CA_CERT_PATH=ca_cert_path,
+    )
+
+
+@contextlib.contextmanager
+def _mock_token_file(token: str = "fake-token", exists: bool = True):
+    """Fake the ServiceAccount token file projected into a Pod by Kubernetes."""
+    with mock.patch(
+        "builtins.open", mock.mock_open(read_data=token)
+    ) as mock_open, mock.patch.object(
+        node_provider_module.os.path, "exists", return_value=exists
+    ):
+        yield mock_open
+
+
+def _mock_ok_response(payload):
+    response = mock.MagicMock()
+    response.status_code = 200
+    response.json.return_value = payload
+    return response
+
+
+def test_load_k8s_secrets_defaults_to_in_cluster_auth():
+    """With no auth configured, the in-cluster ServiceAccount is used, as before."""
+    with _mock_auth_config(), _mock_token_file() as mock_open:
+        headers, verify, cert = load_k8s_secrets()
+
+    mock_open.assert_called_once_with(IN_CLUSTER_TOKEN_PATH)
+    assert headers == {"Authorization": "Bearer fake-token"}
+    assert verify == IN_CLUSTER_CA_CERT_PATH
+    assert cert is None
+
+
+def test_load_k8s_secrets_with_client_cert():
+    """A configured client certificate is returned for use as `requests`' `cert`."""
+    with _mock_auth_config(
+        client_cert_path=CLIENT_CERT_PATH,
+        client_key_path=CLIENT_KEY_PATH,
+        ca_cert_path=CA_CERT_PATH,
+    ), _mock_token_file():
+        headers, verify, cert = load_k8s_secrets()
+
+    assert headers == {"Authorization": "Bearer fake-token"}
+    assert verify == CA_CERT_PATH
+    assert cert == (CLIENT_CERT_PATH, CLIENT_KEY_PATH)
+
+
+def test_load_k8s_secrets_ca_cert_override_only():
+    """The CA certificate can be overridden without configuring a client cert."""
+    with _mock_auth_config(ca_cert_path=CA_CERT_PATH), _mock_token_file():
+        headers, verify, cert = load_k8s_secrets()
+
+    assert headers == {"Authorization": "Bearer fake-token"}
+    assert verify == CA_CERT_PATH
+    assert cert is None
+
+
+def test_load_k8s_secrets_token_optional_with_client_cert():
+    """A missing ServiceAccount token is tolerated when using a client cert."""
+    with _mock_auth_config(
+        client_cert_path=CLIENT_CERT_PATH, client_key_path=CLIENT_KEY_PATH
+    ), _mock_token_file(exists=False):
+        headers, verify, cert = load_k8s_secrets()
+
+    assert headers == {}
+    assert verify == IN_CLUSTER_CA_CERT_PATH
+    assert cert == (CLIENT_CERT_PATH, CLIENT_KEY_PATH)
+
+
+def test_load_k8s_secrets_token_required_without_client_cert():
+    """A missing ServiceAccount token still raises in the default configuration."""
+    with _mock_auth_config(), mock.patch(
+        "builtins.open", side_effect=FileNotFoundError
+    ):
+        with pytest.raises(FileNotFoundError):
+            load_k8s_secrets()
+
+
+@pytest.mark.parametrize(
+    "client_cert_path,client_key_path",
+    [(CLIENT_CERT_PATH, None), (None, CLIENT_KEY_PATH)],
+)
+def test_load_k8s_secrets_requires_cert_and_key_together(
+    client_cert_path, client_key_path
+):
+    with _mock_auth_config(
+        client_cert_path=client_cert_path, client_key_path=client_key_path
+    ), _mock_token_file():
+        with pytest.raises(ValueError, match="must be set together"):
+            load_k8s_secrets()
+
+
+def test_client_get_defaults_unchanged():
+    """`get` sends the in-cluster bearer token and no client cert, as before."""
+    client = KubernetesHttpApiClient(namespace="default")
+    with _mock_auth_config(), _mock_token_file(), mock.patch.object(
+        node_provider_module.requests, "get"
+    ) as mock_get:
+        mock_get.return_value = _mock_ok_response({"kind": "PodList"})
+        assert client.get("pods") == {"kind": "PodList"}
+
+    args, kwargs = mock_get.call_args
+    assert args == (
+        node_provider_module.url_from_resource(namespace="default", path="pods"),
+    )
+    assert kwargs == {
+        "headers": {"Authorization": "Bearer fake-token"},
+        "timeout": KUBERAY_REQUEST_TIMEOUT_S,
+        "verify": IN_CLUSTER_CA_CERT_PATH,
+        "cert": None,
+    }
+
+
+def test_client_patch_defaults_unchanged():
+    """`patch` sends the in-cluster bearer token and no client cert, as before."""
+    client = KubernetesHttpApiClient(namespace="default")
+    with _mock_auth_config(), _mock_token_file(), mock.patch.object(
+        node_provider_module.requests, "patch"
+    ) as mock_patch:
+        mock_patch.return_value = _mock_ok_response({"kind": "RayCluster"})
+        assert client.patch("rayclusters/fake", [{"op": "remove", "path": "/x"}]) == {
+            "kind": "RayCluster"
+        }
+
+    _, kwargs = mock_patch.call_args
+    assert kwargs == {
+        "headers": {
+            "Authorization": "Bearer fake-token",
+            "Content-type": "application/json-patch+json",
+        },
+        "timeout": KUBERAY_REQUEST_TIMEOUT_S,
+        "verify": IN_CLUSTER_CA_CERT_PATH,
+        "cert": None,
+    }
+
+
+def test_client_caches_credentials_until_they_expire():
+    """Credentials are loaded once and reused until the refresh period elapses."""
+    client = KubernetesHttpApiClient(namespace="default")
+    with _mock_auth_config(), _mock_token_file(), mock.patch.object(
+        node_provider_module, "load_k8s_secrets", return_value=({}, "ca", None)
+    ) as mock_load, mock.patch.object(node_provider_module.requests, "get") as mock_get:
+        mock_get.return_value = _mock_ok_response({})
+
+        client.get("pods")
+        client.get("pods")
+        assert mock_load.call_count == 1
+
+        # Force the cached credentials to look expired.
+        client._token_expires_at = datetime.datetime.now() - datetime.timedelta(
+            seconds=1
+        )
+        client.get("pods")
+        assert mock_load.call_count == 2
+
+
+@pytest.mark.parametrize("method", ["get", "patch"])
+def test_client_uses_configured_client_cert(method: str):
+    """A configured client cert and CA are passed through to `requests`."""
+    client = KubernetesHttpApiClient(namespace="default")
+    with _mock_auth_config(
+        client_cert_path=CLIENT_CERT_PATH,
+        client_key_path=CLIENT_KEY_PATH,
+        ca_cert_path=CA_CERT_PATH,
+    ), _mock_token_file(), mock.patch.object(
+        node_provider_module.requests, method
+    ) as mock_request:
+        mock_request.return_value = _mock_ok_response({})
+        if method == "get":
+            client.get("pods")
+        else:
+            client.patch("rayclusters/fake", [])
+
+    _, kwargs = mock_request.call_args
+    assert kwargs["cert"] == (CLIENT_CERT_PATH, CLIENT_KEY_PATH)
+    assert kwargs["verify"] == CA_CERT_PATH
+    assert kwargs["headers"]["Authorization"] == "Bearer fake-token"
 
 
 if __name__ == "__main__":

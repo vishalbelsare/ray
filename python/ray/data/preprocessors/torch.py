@@ -1,10 +1,12 @@
-from typing import TYPE_CHECKING, Callable, Dict, List, Union, Optional, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Union
 
 import numpy as np
 
-from ray.air.util.data_batch_conversion import BatchFormat
-from ray.air.util.tensor_extensions.utils import _create_possibly_ragged_ndarray
-from ray.data.preprocessor import Preprocessor
+from ray.data._internal.tensor_extensions.utils import _create_possibly_ragged_ndarray
+from ray.data.preprocessor import SerializablePreprocessorBase
+from ray.data.preprocessors.utils import _Computed, _PublicField, migrate_private_fields
+from ray.data.preprocessors.version_support import SerializablePreprocessor
+from ray.data.util.data_batch_conversion import BatchFormat
 from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
@@ -12,34 +14,34 @@ if TYPE_CHECKING:
 
 
 @PublicAPI(stability="alpha")
-class TorchVisionPreprocessor(Preprocessor):
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.torchvision_preprocessor"
+)
+class TorchVisionPreprocessor(SerializablePreprocessorBase):
     """Apply a `TorchVision transform <https://pytorch.org/vision/stable/transforms.html>`_
     to image columns.
 
     Examples:
-        >>> import ray
-        >>> dataset = ray.data.read_images("s3://anonymous@air-example-data-2/imagenet-sample-images")
-        >>> dataset  # doctest: +ellipsis
-        Dataset(num_blocks=..., num_rows=..., schema={image: numpy.ndarray(shape=(..., 3), dtype=float)})
-
         Torch models expect inputs of shape :math:`(B, C, H, W)` in the range
         :math:`[0.0, 1.0]`. To convert images to this format, add ``ToTensor`` to your
         preprocessing pipeline.
 
         >>> from torchvision import transforms
+        >>> import ray
         >>> from ray.data.preprocessors import TorchVisionPreprocessor
         >>> transform = transforms.Compose([
         ...     transforms.ToTensor(),
         ...     transforms.Resize((224, 224)),
         ... ])
         >>> preprocessor = TorchVisionPreprocessor(["image"], transform=transform)
-        >>> dataset = preprocessor.transform(dataset)  # doctest: +ellipsis
-        >>> dataset  # doctest: +ellipsis
-        Dataset(num_blocks=..., num_rows=..., schema={image: numpy.ndarray(shape=(3, 224, 224), dtype=float)})
+        >>> dataset = ray.data.read_images("s3://anonymous@air-example-data-2/imagenet-sample-images")
+        >>> dataset = preprocessor.transform(dataset)
 
         For better performance, set ``batched`` to ``True`` and replace ``ToTensor``
         with a batch-supporting ``Lambda``.
 
+        >>> import numpy as np
+        >>> import torch
         >>> def to_tensor(batch: np.ndarray) -> torch.Tensor:
         ...     tensor = torch.as_tensor(batch, dtype=torch.float)
         ...     # (B, H, W, C) -> (B, C, H, W)
@@ -51,12 +53,9 @@ class TorchVisionPreprocessor(Preprocessor):
         ...     transforms.Lambda(to_tensor),
         ...     transforms.Resize((224, 224))
         ... ])
-        >>> preprocessor = TorchVisionPreprocessor(
-        ...     ["image"], transform=transform, batched=True
-        ... )
-        >>> dataset = preprocessor.transform(dataset)  # doctest: +ellipsis
-        >>> dataset  # doctest: +ellipsis
-        Dataset(num_blocks=..., num_rows=..., schema={image: numpy.ndarray(shape=(3, 224, 224), dtype=float)})
+        >>> preprocessor = TorchVisionPreprocessor(["image"], transform=transform, batched=True)
+        >>> dataset = ray.data.read_images("s3://anonymous@air-example-data-2/imagenet-sample-images")
+        >>> dataset = preprocessor.transform(dataset)
 
     Args:
         columns: The columns to apply the TorchVision transform to.
@@ -78,6 +77,7 @@ class TorchVisionPreprocessor(Preprocessor):
         output_columns: Optional[List[str]] = None,
         batched: bool = False,
     ):
+        super().__init__()
         if not output_columns:
             output_columns = columns
         if len(columns) != len(output_columns):
@@ -89,6 +89,31 @@ class TorchVisionPreprocessor(Preprocessor):
         self._output_columns = output_columns
         self._torchvision_transform = transform
         self._batched = batched
+
+    @property
+    def columns(self) -> List[str]:
+        """The columns to apply the TorchVision transform to."""
+        return self._columns
+
+    @property
+    def torchvision_transform(
+        self,
+    ) -> Callable[[Union["np.ndarray", "torch.Tensor"]], "torch.Tensor"]:
+        """The TorchVision transform to apply."""
+        return self._torchvision_transform
+
+    @property
+    def batched(self) -> bool:
+        """Whether the transform is applied to batches instead of individual images."""
+        return self._batched
+
+    @property
+    def output_columns(self) -> List[str]:
+        """The names of the transformed columns.
+
+        Same as ``columns`` if you didn't set ``output_columns``.
+        """
+        return self._output_columns
 
     def __repr__(self) -> str:
         return (
@@ -102,7 +127,8 @@ class TorchVisionPreprocessor(Preprocessor):
         self, data_batch: Dict[str, "np.ndarray"]
     ) -> Dict[str, "np.ndarray"]:
         import torch
-        from ray.air._internal.torch_utils import convert_ndarray_to_torch_tensor
+
+        from ray.data.util.torch_utils import convert_ndarray_to_torch_tensor
 
         def apply_torchvision_transform(array: np.ndarray) -> np.ndarray:
             try:
@@ -138,5 +164,58 @@ class TorchVisionPreprocessor(Preprocessor):
 
         return data_batch
 
+    def get_input_columns(self) -> List[str]:
+        """Return the names of the columns this preprocessor reads.
+
+        Returns:
+            The columns to apply the TorchVision transform to.
+        """
+        return self._columns
+
+    def get_output_columns(self) -> List[str]:
+        """Return the names of the columns this preprocessor writes.
+
+        Returns:
+            The output column names.
+        """
+        return self._output_columns
+
     def preferred_batch_format(cls) -> BatchFormat:
+        """Return the batch format this preprocessor prefers.
+
+        Returns:
+            ``BatchFormat.NUMPY``.
+        """
         return BatchFormat.NUMPY
+
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        return {
+            "columns": self._columns,
+            "output_columns": self._output_columns,
+            "torchvision_transform": self._torchvision_transform,
+            "batched": self._batched,
+        }
+
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        # required fields
+        self._columns = fields["columns"]
+        self._output_columns = fields["output_columns"]
+        self._torchvision_transform = fields["torchvision_transform"]
+        self._batched = fields["batched"]
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        super().__setstate__(state)
+        migrate_private_fields(
+            self,
+            fields={
+                "_columns": _PublicField(public_field="columns"),
+                "_torchvision_transform": _PublicField(
+                    public_field="torchvision_transform"
+                ),
+                "_batched": _PublicField(public_field="batched", default=False),
+                "_output_columns": _PublicField(
+                    public_field="output_columns",
+                    default=_Computed(lambda obj: obj._columns),
+                ),
+            },
+        )

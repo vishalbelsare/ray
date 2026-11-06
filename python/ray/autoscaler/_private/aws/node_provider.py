@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 import botocore
 from boto3.resources.base import ServiceResource
 
+import ray
 import ray._private.ray_constants as ray_constants
 from ray.autoscaler._private.aws.cloudwatch.cloudwatch_helper import (
     CLOUDWATCH_AGENT_INSTALLED_AMI_TAG,
@@ -37,6 +38,7 @@ from ray.autoscaler.tags import (
 logger = logging.getLogger(__name__)
 
 TAG_BATCH_DELAY = 1
+LIST_RETRY_DELAY_SEC = 1
 
 
 def to_aws_format(tags):
@@ -67,11 +69,13 @@ def list_ec2_instances(
     region: str, aws_credentials: Dict[str, Any] = None
 ) -> List[Dict[str, Any]]:
     """Get all instance-types/resources available in the user's AWS region.
+
     Args:
         region: the region of the AWS provider. e.g., "us-west-2".
+        aws_credentials: AWS credentials to use for the boto3 client.
+
     Returns:
-        final_instance_types: a list of instances. An example of one element in
-        the list:
+        A list of instances. An example of one element in the list:
             {'InstanceType': 'm5a.xlarge', 'ProcessorInfo':
             {'SupportedArchitectures': ['x86_64'], 'SustainedClockSpeedInGhz':
             2.5},'VCpuInfo': {'DefaultVCpus': 4, 'DefaultCores': 2,
@@ -125,6 +129,8 @@ class AWSNodeProvider(NodeProvider):
         self.ready_for_new_batch.set()
         self.tag_cache_lock = threading.Lock()
         self.count_lock = threading.Lock()
+        # Prevent concurrent create_node calls to get the same stopped/stopping node to reuse.
+        self._reuse_node_lock = threading.Lock()
 
         # Cache of node objects from the last nodes() call. This avoids
         # excessive DescribeInstances requests.
@@ -288,32 +294,35 @@ class AWSNodeProvider(NodeProvider):
                     }
                 )
 
-            reuse_nodes = list(self.ec2.instances.filter(Filters=filters))[:count]
-            reuse_node_ids = [n.id for n in reuse_nodes]
-            reused_nodes_dict = {n.id: n for n in reuse_nodes}
-            if reuse_nodes:
-                cli_logger.print(
-                    # todo: handle plural vs singular?
-                    "Reusing nodes {}. "
-                    "To disable reuse, set `cache_stopped_nodes: False` "
-                    "under `provider` in the cluster configuration.",
-                    cli_logger.render_list(reuse_node_ids),
-                )
+            with self._reuse_node_lock:
+                reuse_nodes = list(self.ec2.instances.filter(Filters=filters))[:count]
+                reuse_node_ids = [n.id for n in reuse_nodes]
+                reused_nodes_dict = {n.id: n for n in reuse_nodes}
+                if reuse_nodes:
+                    cli_logger.print(
+                        # todo: handle plural vs singular?
+                        "Reusing nodes {}. "
+                        "To disable reuse, set `cache_stopped_nodes: False` "
+                        "under `provider` in the cluster configuration.",
+                        cli_logger.render_list(reuse_node_ids),
+                    )
 
-                # todo: timed?
-                with cli_logger.group("Stopping instances to reuse"):
-                    for node in reuse_nodes:
-                        self.tag_cache[node.id] = from_aws_format(
-                            {x["Key"]: x["Value"] for x in node.tags}
-                        )
-                        if node.state["Name"] == "stopping":
-                            cli_logger.print("Waiting for instance {} to stop", node.id)
-                            node.wait_until_stopped()
+                    # todo: timed?
+                    with cli_logger.group("Stopping instances to reuse"):
+                        for node in reuse_nodes:
+                            self.tag_cache[node.id] = from_aws_format(
+                                {x["Key"]: x["Value"] for x in node.tags}
+                            )
+                            if node.state["Name"] == "stopping":
+                                cli_logger.print(
+                                    "Waiting for instance {} to stop", node.id
+                                )
+                                node.wait_until_stopped()
 
-                self.ec2.meta.client.start_instances(InstanceIds=reuse_node_ids)
-                for node_id in reuse_node_ids:
-                    self.set_node_tags(node_id, tags)
-                count -= len(reuse_node_ids)
+                    self.ec2.meta.client.start_instances(InstanceIds=reuse_node_ids)
+                    for node_id in reuse_node_ids:
+                        self.set_node_tags(node_id, tags)
+                    count -= len(reuse_node_ids)
 
         created_nodes_dict = {}
         if count:
@@ -327,8 +336,7 @@ class AWSNodeProvider(NodeProvider):
     def _merge_tag_specs(
         tag_specs: List[Dict[str, Any]], user_tag_specs: List[Dict[str, Any]]
     ) -> None:
-        """
-        Merges user-provided node config tag specifications into a base
+        """Merges user-provided node config tag specifications into a base
         list of node provider tag specifications. The base list of
         node provider tag specs is modified in-place.
 
@@ -338,8 +346,8 @@ class AWSNodeProvider(NodeProvider):
         tag specs.
 
         Args:
-            tag_specs (List[Dict[str, Any]]): base node provider tag specs
-            user_tag_specs (List[Dict[str, Any]]): user's node config tag specs
+            tag_specs: base node provider tag specs
+            user_tag_specs: user's node config tag specs
         """
 
         for user_tag_spec in user_tag_specs:
@@ -438,14 +446,18 @@ class AWSNodeProvider(NodeProvider):
 
                         # The correct value is technically
                         # {"code": "0", "Message": "pending"}
-                        state_reason = instance.state_reason or {"Message": "pending"}
+                        state_reason = "pending"
+                        if instance.state_reason:
+                            state_reason = (
+                                instance.state_reason["Message"] or state_reason
+                            )
 
                         cli_logger.print(
                             "Launched instance {}",
                             instance.instance_id,
                             _tags=dict(
                                 state=instance.state["Name"],
-                                info=state_reason["Message"],
+                                info=state_reason,
                             ),
                         )
                 break
@@ -464,7 +476,9 @@ class AWSNodeProvider(NodeProvider):
                         # In theory, all ClientError's we expect to get should
                         # have these fields, but just in case we can't parse
                         # it, it's fine, just throw the original error.
-                        logger.warning("Couldn't parse exception.", exc)
+                        logger.warning(
+                            "Couldn't parse exception: %s", exc, exc_info=True
+                        )
                         pass
                     cli_logger.abort(
                         "Failed to launch instances. Max attempts exceeded.",
@@ -589,9 +603,24 @@ class AWSNodeProvider(NodeProvider):
 
         # Node not in {pending, running} -- retry with a point query. This
         # usually means the node was recently preempted or terminated.
-        matches = list(self.ec2.instances.filter(InstanceIds=[node_id]))
-        assert len(matches) == 1, "Invalid instance id {}".format(node_id)
-        return matches[0]
+        # The EC2 API is eventually consistent. This means that an instance
+        # might not be immediately visible. So we need to retry the query a few times.
+        # See: https://docs.aws.amazon.com/ec2/latest/devguide/eventual-consistency.html
+        # and https://github.com/ray-project/ray/issues/51861
+        for attempts in range(max(BOTO_MAX_RETRIES, 1)):  # at least try once.
+            matches = list(self.ec2.instances.filter(InstanceIds=[node_id]))
+            if len(matches) == 1:
+                return matches[0]
+            cli_logger.warning(
+                "Attempt to fetch EC2 instances that have instance ID {}. Got {} matching EC2 instances. Will retry after {} second. This is retry number {}, and the maximum number of retries is {}.",
+                node_id,
+                len(matches),
+                LIST_RETRY_DELAY_SEC,
+                attempts + 1,
+                BOTO_MAX_RETRIES,
+            )
+            time.sleep(LIST_RETRY_DELAY_SEC)
+        raise AssertionError("Invalid instance id {}".format(node_id))
 
     def _get_cached_node(self, node_id):
         """Return node info from cache if possible, otherwise fetches it."""
@@ -640,14 +669,28 @@ class AWSNodeProvider(NodeProvider):
                     memory_resources = int(memory_total * prop)
                     autodetected_resources["memory"] = memory_resources
 
-                gpus = instances_dict[instance_type].get("GpuInfo", {}).get("Gpus")
-                if gpus is not None:
-                    # TODO(ameer): currently we support one gpu type per node.
-                    assert len(gpus) == 1
-                    gpu_name = gpus[0]["Name"]
-                    autodetected_resources.update(
-                        {"GPU": gpus[0]["Count"], f"accelerator_type:{gpu_name}": 1}
+                for (
+                    accelerator_manager
+                ) in ray._private.accelerators.get_all_accelerator_managers():
+                    num_accelerators = (
+                        accelerator_manager.get_ec2_instance_num_accelerators(
+                            instance_type, instances_dict
+                        )
                     )
+                    accelerator_type = (
+                        accelerator_manager.get_ec2_instance_accelerator_type(
+                            instance_type, instances_dict
+                        )
+                    )
+                    if num_accelerators:
+                        autodetected_resources[
+                            accelerator_manager.get_resource_name()
+                        ] = num_accelerators
+                        if accelerator_type:
+                            autodetected_resources[
+                                f"accelerator_type:{accelerator_type}"
+                            ] = 1
+
                 autodetected_resources.update(
                     available_node_types[node_type].get("resources", {})
                 )

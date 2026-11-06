@@ -3,13 +3,18 @@
 import copy
 import logging
 import math
+from typing import Dict, List, Optional, Union
 
 # use cloudpickle instead of pickle to make BOHB obj
 # pickleable
 from ray import cloudpickle
-from typing import Dict, List, Optional, Union
-
 from ray.tune.result import DEFAULT_METRIC
+from ray.tune.search import (
+    UNDEFINED_METRIC_MODE,
+    UNDEFINED_SEARCH_SPACE,
+    UNRESOLVED_SEARCH_SPACE,
+    Searcher,
+)
 from ray.tune.search.sample import (
     Categorical,
     Domain,
@@ -19,12 +24,6 @@ from ray.tune.search.sample import (
     Normal,
     Quantized,
     Uniform,
-)
-from ray.tune.search import (
-    UNRESOLVED_SEARCH_SPACE,
-    UNDEFINED_METRIC_MODE,
-    UNDEFINED_SEARCH_SPACE,
-    Searcher,
 )
 from ray.tune.search.variant_generator import parse_spec_vars
 from ray.tune.utils.util import flatten_dict, unflatten_list_dict
@@ -272,10 +271,10 @@ class TuneBOHB(Searcher):
     # TODO(team-ml): Refactor alongside HyperBandForBOHB
     def on_pause(self, trial_id: str):
         self.paused.add(trial_id)
-        self.running.remove(trial_id)
+        self.running.discard(trial_id)
 
     def on_unpause(self, trial_id: str):
-        self.paused.remove(trial_id)
+        self.paused.discard(trial_id)
         self.running.add(trial_id)
 
     @staticmethod
@@ -295,61 +294,57 @@ class TuneBOHB(Searcher):
         def resolve_value(
             par: str, domain: Domain
         ) -> ConfigSpace.hyperparameters.Hyperparameter:
-            quantize = None
 
             sampler = domain.get_sampler()
             if isinstance(sampler, Quantized):
-                quantize = sampler.q
+                logger.warning(
+                    "TuneBOHB does not support quantization. "
+                    "Dropped quantization for parameter '%s'.",
+                    par,
+                )
                 sampler = sampler.sampler
 
             if isinstance(domain, Float):
                 if isinstance(sampler, LogUniform):
-                    lower = domain.lower
-                    upper = domain.upper
-                    if quantize:
-                        lower = math.ceil(domain.lower / quantize) * quantize
-                        upper = math.floor(domain.upper / quantize) * quantize
                     return ConfigSpace.UniformFloatHyperparameter(
-                        par, lower=lower, upper=upper, q=quantize, log=True
+                        par, lower=domain.lower, upper=domain.upper, log=True
                     )
                 elif isinstance(sampler, Uniform):
-                    lower = domain.lower
-                    upper = domain.upper
-                    if quantize:
-                        lower = math.ceil(domain.lower / quantize) * quantize
-                        upper = math.floor(domain.upper / quantize) * quantize
                     return ConfigSpace.UniformFloatHyperparameter(
-                        par, lower=lower, upper=upper, q=quantize, log=False
+                        par, lower=domain.lower, upper=domain.upper, log=False
                     )
                 elif isinstance(sampler, Normal):
+                    if (
+                        domain.lower is None
+                        or domain.upper is None
+                        or not math.isfinite(domain.lower)
+                        or not math.isfinite(domain.upper)
+                    ):
+                        raise ValueError(
+                            f"TuneBOHB does not support unbounded normal "
+                            f"distributions. Please specify bounds for "
+                            f"parameter '{par}' using tune.randn(...).clip(lower, upper) "
+                            f"or Float(lower, upper).normal(mean, sd)."
+                        )
                     return ConfigSpace.hyperparameters.NormalFloatHyperparameter(
-                        par, mu=sampler.mean, sigma=sampler.sd, q=quantize, log=False
+                        par,
+                        mu=sampler.mean,
+                        sigma=sampler.sd,
+                        lower=domain.lower,
+                        upper=domain.upper,
+                        log=False,
                     )
 
             elif isinstance(domain, Integer):
                 if isinstance(sampler, LogUniform):
-                    lower = domain.lower
-                    upper = domain.upper
-                    if quantize:
-                        lower = math.ceil(domain.lower / quantize) * quantize
-                        upper = math.floor(domain.upper / quantize) * quantize
-                    else:
-                        # Tune search space integers are exclusive
-                        upper -= 1
+                    # Tune search space integers are exclusive on upper bound
                     return ConfigSpace.UniformIntegerHyperparameter(
-                        par, lower=lower, upper=upper, q=quantize, log=True
+                        par, lower=domain.lower, upper=domain.upper - 1, log=True
                     )
                 elif isinstance(sampler, Uniform):
-                    lower = domain.lower
-                    upper = domain.upper
-                    if quantize:
-                        lower = math.ceil(domain.lower / quantize) * quantize
-                        upper = math.floor(domain.upper / quantize) * quantize
-                    else:
-                        # Tune search space integers are exclusive
-                        upper -= 1
+                    # Tune search space integers are exclusive on upper bound
                     return ConfigSpace.UniformIntegerHyperparameter(
-                        par, lower=lower, upper=upper, q=quantize, log=False
+                        par, lower=domain.lower, upper=domain.upper - 1, log=False
                     )
 
             elif isinstance(domain, Categorical):

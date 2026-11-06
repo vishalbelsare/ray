@@ -25,7 +25,7 @@ extern "C" {
  * Class:     io_ray_runtime_RayNativeRuntime
  * Method:    nativeInitialize
  * Signature:
- * (ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;[BLio/ray/runtime/gcs/GcsClientOptions;Ljava/lang/String;[BII)V
+ * (ILjava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;[BLio/ray/runtime/gcs/GcsClientOptions;Ljava/lang/String;[B[BI)V
  */
 JNIEXPORT void JNICALL Java_io_ray_runtime_RayNativeRuntime_nativeInitialize(JNIEnv *,
                                                                              jclass,
@@ -39,8 +39,17 @@ JNIEXPORT void JNICALL Java_io_ray_runtime_RayNativeRuntime_nativeInitialize(JNI
                                                                              jobject,
                                                                              jstring,
                                                                              jbyteArray,
-                                                                             jint,
+                                                                             jbyteArray,
                                                                              jint);
+
+/*
+ * Class:     io_ray_runtime_RayNativeRuntime
+ * Method:    nativeCreateTokenIfMissingForOwnCluster
+ * Signature: ()V
+ */
+JNIEXPORT void JNICALL
+Java_io_ray_runtime_RayNativeRuntime_nativeCreateTokenIfMissingForOwnCluster(JNIEnv *,
+                                                                             jclass);
 
 /*
  * Class:     io_ray_runtime_RayNativeRuntime

@@ -1,10 +1,12 @@
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from ray.air._internal.usage import tag_scheduler
-from ray.tune.execution import trial_runner
-from ray.tune.result import DEFAULT_METRIC
 from ray.tune.experiment import Trial
+from ray.tune.result import DEFAULT_METRIC
 from ray.util.annotations import DeveloperAPI, PublicAPI
+
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
 
 
 @DeveloperAPI
@@ -50,8 +52,11 @@ class TrialScheduler:
         Args:
             metric: Metric to optimize
             mode: One of ["min", "max"]. Direction to optimize.
-            **spec: Any kwargs for forward compatiblity.
+            **spec: Any kwargs for forward compatibility.
                 Info like Experiment.PUBLIC_KEYS is provided through here.
+
+        Returns:
+            True if the search properties were set successfully, False otherwise.
         """
         if self._metric and metric:
             return False
@@ -64,70 +69,120 @@ class TrialScheduler:
 
         return True
 
-    def on_trial_add(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
-        """Called when a new trial is added to the trial runner."""
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
+        """Called when a new trial is added to the trial runner.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial that was added.
+        """
 
         raise NotImplementedError
 
-    def on_trial_error(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_error(self, tune_controller: "TuneController", trial: Trial):
         """Notification for the error of trial.
 
-        This will only be called when the trial is in the RUNNING state."""
+        This will only be called when the trial is in the RUNNING state.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial that errored.
+        """
 
         raise NotImplementedError
 
     def on_trial_result(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ) -> str:
         """Called on each intermediate result returned by a trial.
 
         At this point, the trial scheduler can make a decision by returning
         one of CONTINUE, PAUSE, and STOP. This will only be called when the
-        trial is in the RUNNING state."""
+        trial is in the RUNNING state.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial that reported the result.
+            result: The result the trial reported.
+
+        Returns:
+            The scheduling decision for the trial: ``TrialScheduler.CONTINUE``,
+            ``TrialScheduler.PAUSE``, or ``TrialScheduler.STOP``. A scheduler
+            that has already changed the trial's state itself returns
+            ``TrialScheduler.NOOP``.
+        """
 
         raise NotImplementedError
 
     def on_trial_complete(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ):
         """Notification for the completion of trial.
 
         This will only be called when the trial is in the RUNNING state and
-        either completes naturally or by manual termination."""
+        either completes naturally or by manual termination.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial that completed.
+            result: The last result the trial reported.
+        """
 
         raise NotImplementedError
 
-    def on_trial_remove(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_remove(self, tune_controller: "TuneController", trial: Trial):
         """Called to remove trial.
 
         This is called when the trial is in PAUSED or PENDING state. Otherwise,
-        call `on_trial_complete`."""
+        call `on_trial_complete`.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial to remove.
+        """
 
         raise NotImplementedError
 
-    def choose_trial_to_run(
-        self, trial_runner: "trial_runner.TrialRunner"
-    ) -> Optional[Trial]:
+    def choose_trial_to_run(self, tune_controller: "TuneController") -> Optional[Trial]:
         """Called to choose a new trial to run.
 
-        This should return one of the trials in trial_runner that is in
+        This should return one of the trials in tune_controller that is in
         the PENDING or PAUSED state. This function must be idempotent.
 
-        If no trial is ready, return None."""
+        If no trial is ready, return None.
+
+        Args:
+            tune_controller: The controller running the experiment.
+
+        Returns:
+            The trial to run next, or ``None`` if no trial is ready.
+        """
 
         raise NotImplementedError
 
     def debug_string(self) -> str:
-        """Returns a human readable message for printing to the console."""
+        """Returns a human readable message for printing to the console.
+
+        Returns:
+            The message describing the scheduler's state.
+        """
 
         raise NotImplementedError
 
     def save(self, checkpoint_path: str):
-        """Save trial scheduler to a checkpoint"""
+        """Save trial scheduler to a checkpoint
+
+        Args:
+            checkpoint_path: Path of the file to write the scheduler state to.
+        """
         raise NotImplementedError
 
     def restore(self, checkpoint_path: str):
-        """Restore trial scheduler from checkpoint."""
+        """Restore trial scheduler from checkpoint.
+
+        Args:
+            checkpoint_path: Path of the file to read the scheduler state from.
+        """
         raise NotImplementedError
 
 
@@ -138,39 +193,31 @@ class FIFOScheduler(TrialScheduler):
     def __init__(self):
         super().__init__()
 
-    def on_trial_add(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
         pass
 
-    def on_trial_error(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_error(self, tune_controller: "TuneController", trial: Trial):
         pass
 
     def on_trial_result(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ) -> str:
         return TrialScheduler.CONTINUE
 
     def on_trial_complete(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ):
         pass
 
-    def on_trial_remove(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_remove(self, tune_controller: "TuneController", trial: Trial):
         pass
 
-    def choose_trial_to_run(
-        self, trial_runner: "trial_runner.TrialRunner"
-    ) -> Optional[Trial]:
-        for trial in trial_runner.get_trials():
-            if (
-                trial.status == Trial.PENDING
-                and trial_runner.trial_executor.has_resources_for_trial(trial)
-            ):
+    def choose_trial_to_run(self, tune_controller: "TuneController") -> Optional[Trial]:
+        for trial in tune_controller.get_trials():
+            if trial.status == Trial.PENDING:
                 return trial
-        for trial in trial_runner.get_trials():
-            if (
-                trial.status == Trial.PAUSED
-                and trial_runner.trial_executor.has_resources_for_trial(trial)
-            ):
+        for trial in tune_controller.get_trials():
+            if trial.status == Trial.PAUSED:
                 return trial
         return None
 

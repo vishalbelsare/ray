@@ -1,15 +1,23 @@
-from typing import Iterable, List, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Type, Union
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from ray.data import Dataset
 from ray.data.aggregate import Max, Min
-from ray.data.preprocessor import Preprocessor
+from ray.data.preprocessor import SerializablePreprocessorBase
+from ray.data.preprocessors.utils import (
+    _Computed,
+    _PublicField,
+    migrate_private_fields,
+)
+from ray.data.preprocessors.version_support import SerializablePreprocessor
 from ray.util.annotations import PublicAPI
 
+if TYPE_CHECKING:
+    from ray.data.dataset import Dataset
 
-class _AbstractKBinsDiscretizer(Preprocessor):
+
+class _AbstractKBinsDiscretizer(SerializablePreprocessorBase):
     """Abstract base class for all KBinsDiscretizers.
 
     Essentially a thin wraper around ``pd.cut``.
@@ -43,7 +51,9 @@ class _AbstractKBinsDiscretizer(Preprocessor):
                 duplicates=self.duplicates,
             )
 
-        return df.apply(bin_values, axis=0)
+        binned_df = df.apply(bin_values, axis=0)
+        df[self.output_columns] = binned_df[self.columns]
+        return df
 
     def _validate_bins_columns(self):
         if isinstance(self.bins, dict) and not all(
@@ -54,18 +64,34 @@ class _AbstractKBinsDiscretizer(Preprocessor):
                 "in it."
             )
 
+    def _validate_bins_are_positive(self):
+        # `bins=0` is translated to a single-edge array before reaching
+        # `pd.cut`, which then silently returns an all-null column. Only
+        # integers are checked here; `_fit` rejects other types by name.
+        counts = self.bins.values() if isinstance(self.bins, dict) else [self.bins]
+        for count in counts:
+            if isinstance(count, int) and count <= 0:
+                raise ValueError(
+                    f"bins must be a positive integer, but got {count} instead."
+                )
+
     def __repr__(self):
-        attr_str = ", ".join(
-            [
-                f"{attr_name}={attr_value!r}"
-                for attr_name, attr_value in vars(self).items()
-                if not attr_name.startswith("_")
-            ]
+        return (
+            f"{self.__class__.__name__}("
+            f"columns={self.columns!r}, "
+            f"bins={self.bins!r}, "
+            f"right={self.right!r}, "
+            f"include_lowest={self.include_lowest!r}, "
+            f"duplicates={self.duplicates!r}, "
+            f"dtypes={self.dtypes!r}, "
+            f"output_columns={self.output_columns!r})"
         )
-        return f"{self.__class__.__name__}({attr_str})"
 
 
 @PublicAPI(stability="alpha")
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.custom_kbins_discretizer"
+)
 class CustomKBinsDiscretizer(_AbstractKBinsDiscretizer):
     """Bin values into discrete intervals using custom bin edges.
 
@@ -95,6 +121,23 @@ class CustomKBinsDiscretizer(_AbstractKBinsDiscretizer):
         4        2        3
         5        1        3
 
+        :class:`CustomKBinsDiscretizer` can also be used in append mode by providing the
+        name of the output_columns that should hold the encoded values.
+
+        >>> discretizer = CustomKBinsDiscretizer(
+        ...     columns=["value_1", "value_2"],
+        ...     bins=[0, 1, 4, 10, 25],
+        ...     output_columns=["value_1_discretized", "value_2_discretized"]
+        ... )
+        >>> discretizer.fit_transform(ds).to_pandas()  # doctest: +SKIP
+           value_1  value_2  value_1_discretized  value_2_discretized
+        0      0.2       10                    0                    2
+        1      1.4       15                    1                    3
+        2      2.5       13                    1                    3
+        3      6.2       12                    2                    3
+        4      9.7       23                    2                    3
+        5      2.1       25                    1                    3
+
         You can also specify different bin edges per column.
 
         >>> discretizer = CustomKBinsDiscretizer(
@@ -106,8 +149,8 @@ class CustomKBinsDiscretizer(_AbstractKBinsDiscretizer):
         0      0.0        0
         1      1.0        0
         2      1.0        0
-        3      NaN        0
-        4      NaN        1
+        3     <NA>        0
+        4     <NA>        1
         5      1.0        1
 
 
@@ -128,6 +171,10 @@ class CustomKBinsDiscretizer(_AbstractKBinsDiscretizer):
             ``pd.CategoricalDtype`` with the categories being mapped to bins.
             You can use ``pd.CategoricalDtype(categories, ordered=True)`` to
             preserve information about bin order.
+        output_columns: The names of the transformed columns. If None, the transformed
+            columns will be the same as the input columns. If not None, the length of
+            ``output_columns`` must match the length of ``columns``, othwerwise an error
+            will be raised.
 
     .. seealso::
 
@@ -150,20 +197,127 @@ class CustomKBinsDiscretizer(_AbstractKBinsDiscretizer):
         dtypes: Optional[
             Dict[str, Union[pd.CategoricalDtype, Type[np.integer]]]
         ] = None,
+        output_columns: Optional[List[str]] = None,
     ):
-        self.columns = columns
-        self.bins = bins
-        self.right = right
-        self.include_lowest = include_lowest
-        self.duplicates = duplicates
-        self.dtypes = dtypes
+        self._columns = columns
+        self._bins = bins
+        self._right = right
+        self._include_lowest = include_lowest
+        self._duplicates = duplicates
+        self._dtypes = dtypes
+        self._output_columns = (
+            SerializablePreprocessorBase._derive_and_validate_output_columns(
+                columns, output_columns
+            )
+        )
 
         self._validate_bins_columns()
 
+    @property
+    def columns(self) -> List[str]:
+        """The columns to discretize."""
+        return self._columns
+
+    @property
+    def bins(
+        self,
+    ) -> Union[
+        Iterable[float],
+        pd.IntervalIndex,
+        Dict[str, Union[Iterable[float], pd.IntervalIndex]],
+    ]:
+        """The custom bin edges.
+
+        An iterable of numbers, a ``pd.IntervalIndex``, or a mapping from columns to
+        either of them.
+        """
+        return self._bins
+
+    @property
+    def right(self) -> bool:
+        """Whether bins include the rightmost edge."""
+        return self._right
+
+    @property
+    def include_lowest(self) -> bool:
+        """Whether the first interval is left-inclusive."""
+        return self._include_lowest
+
+    @property
+    def duplicates(self) -> str:
+        """What to do if bin edges aren't unique.
+
+        ``"raise"`` raises a ``ValueError``, and ``"drop"`` drops the duplicates.
+        """
+        return self._duplicates
+
+    @property
+    def dtypes(
+        self,
+    ) -> Optional[Dict[str, Union[pd.CategoricalDtype, Type[np.integer]]]]:
+        """The output dtype for each column.
+
+        A mapping from columns to ``pd.CategoricalDtype`` objects or ``np.integer``
+        types.
+        """
+        return self._dtypes
+
+    @property
+    def output_columns(self) -> List[str]:
+        """The names of the transformed columns.
+
+        Same as ``columns`` if you didn't set ``output_columns``.
+        """
+        return self._output_columns
+
     _is_fittable = False
+
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        return {
+            "columns": self._columns,
+            "bins": self._bins,
+            "right": self._right,
+            "include_lowest": self._include_lowest,
+            "duplicates": self._duplicates,
+            "dtypes": self._dtypes,
+            "output_columns": self._output_columns,
+        }
+
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        # required fields
+        self._columns = fields["columns"]
+        self._bins = fields["bins"]
+        self._right = fields["right"]
+        self._include_lowest = fields["include_lowest"]
+        self._duplicates = fields["duplicates"]
+        self._dtypes = fields["dtypes"]
+        self._output_columns = fields["output_columns"]
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        super().__setstate__(state)
+        migrate_private_fields(
+            self,
+            fields={
+                "_columns": _PublicField(public_field="columns"),
+                "_bins": _PublicField(public_field="bins"),
+                "_right": _PublicField(public_field="right", default=True),
+                "_include_lowest": _PublicField(
+                    public_field="include_lowest", default=False
+                ),
+                "_duplicates": _PublicField(public_field="duplicates", default="raise"),
+                "_dtypes": _PublicField(public_field="dtypes", default=None),
+                "_output_columns": _PublicField(
+                    public_field="output_columns",
+                    default=_Computed(lambda obj: obj._columns),
+                ),
+            },
+        )
 
 
 @PublicAPI(stability="alpha")
+@SerializablePreprocessor(
+    version=1, identifier="io.ray.preprocessors.uniform_kbins_discretizer"
+)
 class UniformKBinsDiscretizer(_AbstractKBinsDiscretizer):
     """Bin values into discrete intervals (bins) of uniform width.
 
@@ -191,6 +345,23 @@ class UniformKBinsDiscretizer(_AbstractKBinsDiscretizer):
         3        2        0
         4        3        3
         5        0        3
+
+        :class:`UniformKBinsDiscretizer` can also be used in append mode by providing the
+        name of the output_columns that should hold the encoded values.
+
+        >>> discretizer = UniformKBinsDiscretizer(
+        ...     columns=["value_1", "value_2"],
+        ...     bins=4,
+        ...     output_columns=["value_1_discretized", "value_2_discretized"]
+        ... )
+        >>> discretizer.fit_transform(ds).to_pandas()  # doctest: +SKIP
+           value_1  value_2  value_1_discretized  value_2_discretized
+        0      0.2       10                    0                    0
+        1      1.4       15                    0                    1
+        2      2.5       13                    0                    0
+        3      6.2       12                    2                    0
+        4      9.7       23                    3                    3
+        5      2.1       25                    0                    3
 
         You can also specify different number of bins per column.
 
@@ -227,6 +398,10 @@ class UniformKBinsDiscretizer(_AbstractKBinsDiscretizer):
             ``pd.CategoricalDtype`` with the categories being mapped to bins.
             You can use ``pd.CategoricalDtype(categories, ordered=True)`` to
             preserve information about bin order.
+        output_columns: The names of the transformed columns. If None, the transformed
+            columns will be the same as the input columns. If not None, the length of
+            ``output_columns`` must match the length of ``columns``, othwerwise an error
+            will be raised.
 
     .. seealso::
 
@@ -245,58 +420,182 @@ class UniformKBinsDiscretizer(_AbstractKBinsDiscretizer):
         dtypes: Optional[
             Dict[str, Union[pd.CategoricalDtype, Type[np.integer]]]
         ] = None,
+        output_columns: Optional[List[str]] = None,
     ):
-        self.columns = columns
-        self.bins = bins
-        self.right = right
-        self.include_lowest = include_lowest
-        self.duplicates = duplicates
-        self.dtypes = dtypes
+        super().__init__()
+        self._columns = columns
+        self._bins = bins
+        self._validate_bins_are_positive()
+        self._right = right
+        self._include_lowest = include_lowest
+        self._duplicates = duplicates
+        self._dtypes = dtypes
+        self._output_columns = (
+            SerializablePreprocessorBase._derive_and_validate_output_columns(
+                columns, output_columns
+            )
+        )
 
-    def _fit(self, dataset: Dataset) -> Preprocessor:
+    @property
+    def columns(self) -> List[str]:
+        """The columns to discretize."""
+        return self._columns
+
+    @property
+    def bins(self) -> Union[int, Dict[str, int]]:
+        """The number of equal-width bins.
+
+        An integer for all columns, or a mapping from columns to integers.
+        """
+        return self._bins
+
+    @property
+    def right(self) -> bool:
+        """Whether bins include the rightmost edge."""
+        return self._right
+
+    @property
+    def include_lowest(self) -> bool:
+        """Whether the first interval is left-inclusive."""
+        return self._include_lowest
+
+    @property
+    def duplicates(self) -> str:
+        """What to do if bin edges aren't unique.
+
+        ``"raise"`` raises a ``ValueError``, and ``"drop"`` drops the duplicates.
+        """
+        return self._duplicates
+
+    @property
+    def dtypes(
+        self,
+    ) -> Optional[Dict[str, Union[pd.CategoricalDtype, Type[np.integer]]]]:
+        """The output dtype for each column.
+
+        A mapping from columns to ``pd.CategoricalDtype`` objects or ``np.integer``
+        types.
+        """
+        return self._dtypes
+
+    @property
+    def output_columns(self) -> List[str]:
+        """The names of the transformed columns.
+
+        Same as ``columns`` if you didn't set ``output_columns``.
+        """
+        return self._output_columns
+
+    def _fit(self, dataset: "Dataset") -> SerializablePreprocessorBase:
         self._validate_on_fit()
-        stats = {}
-        aggregates = []
+
         if isinstance(self.bins, dict):
             columns = self.bins.keys()
         else:
             columns = self.columns
 
         for column in columns:
-            aggregates.extend(
-                self._fit_uniform_covert_bin_to_aggregate_if_needed(column)
-            )
-
-        aggregate_stats = dataset.aggregate(*aggregates)
-        mins = {}
-        maxes = {}
-        for key, value in aggregate_stats.items():
-            column_name = key[4:-1]  # min(column) -> column
-            if key.startswith("min"):
-                mins[column_name] = value
-            if key.startswith("max"):
-                maxes[column_name] = value
-
-        for column in mins.keys():
             bins = self.bins[column] if isinstance(self.bins, dict) else self.bins
-            stats[column] = _translate_min_max_number_of_bins_to_bin_edges(
-                mins[column], maxes[column], bins, self.right
-            )
+            if not isinstance(bins, int):
+                raise TypeError(
+                    f"`bins` must be an integer or a dict of integers, got {bins}"
+                )
 
-        self.stats_ = stats
+        self._stat_computation_plan.add_aggregator(
+            aggregator_fn=Min,
+            columns=columns,
+        )
+        self._stat_computation_plan.add_aggregator(
+            aggregator_fn=Max,
+            columns=columns,
+        )
+
         return self
 
     def _validate_on_fit(self):
         self._validate_bins_columns()
 
-    def _fit_uniform_covert_bin_to_aggregate_if_needed(self, column: str):
-        bins = self.bins[column] if isinstance(self.bins, dict) else self.bins
-        if isinstance(bins, int):
-            return (Min(column), Max(column))
-        else:
-            raise TypeError(
-                f"`bins` must be an integer or a dict of integers, got {bins}"
+    def _fit_execute(self, dataset: "Dataset"):
+        stats = self._stat_computation_plan.compute(dataset)
+        self.stats_ = post_fit_processor(stats, self.bins, self.right)
+        return self
+
+    def _get_serializable_fields(self) -> Dict[str, Any]:
+        return {
+            "columns": self._columns,
+            "bins": self._bins,
+            "right": self._right,
+            "include_lowest": self._include_lowest,
+            "duplicates": self._duplicates,
+            "dtypes": self._dtypes,
+            "output_columns": self._output_columns,
+            "_fitted": getattr(self, "_fitted", None),
+        }
+
+    def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
+        # required fields
+        self._columns = fields["columns"]
+        self._bins = fields["bins"]
+        self._right = fields["right"]
+        self._include_lowest = fields["include_lowest"]
+        self._duplicates = fields["duplicates"]
+        self._dtypes = fields["dtypes"]
+        self._output_columns = fields["output_columns"]
+        # optional fields
+        self._fitted = fields.get("_fitted")
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        super().__setstate__(state)
+        migrate_private_fields(
+            self,
+            fields={
+                "_columns": _PublicField(public_field="columns"),
+                "_bins": _PublicField(public_field="bins"),
+                "_right": _PublicField(public_field="right", default=True),
+                "_include_lowest": _PublicField(
+                    public_field="include_lowest", default=False
+                ),
+                "_duplicates": _PublicField(public_field="duplicates", default="raise"),
+                "_dtypes": _PublicField(public_field="dtypes", default=None),
+                "_output_columns": _PublicField(
+                    public_field="output_columns",
+                    default=_Computed(lambda obj: obj._columns),
+                ),
+            },
+        )
+
+
+def post_fit_processor(aggregate_stats: dict, bins: Union[str, Dict], right: bool):
+    mins, maxes, stats = {}, {}, {}
+    for key, value in aggregate_stats.items():
+        column_name = key[4:-1]  # min(column) -> column
+        if key.startswith("min"):
+            mins[column_name] = value
+        if key.startswith("max"):
+            maxes[column_name] = value
+
+    for column in mins.keys():
+        # A column with no observed values has no minimum or maximum, so there
+        # is no range to divide into bins and no defensible output to produce.
+        # Refuse, naming the column, in the same style as the infinity check in
+        # `_translate_min_max_number_of_bins_to_bin_edges` below -- which cannot
+        # do this check itself, since it is not told which column it is binning.
+        # Reaching it with None raises `TypeError: unsupported operand type(s)
+        # for +: 'NoneType' and 'float'` instead.
+        if mins[column] is None or maxes[column] is None:
+            raise ValueError(
+                f"Column {column} has no values to bin. Check the data used to "
+                "fit the discretizer."
             )
+
+        stats[column] = _translate_min_max_number_of_bins_to_bin_edges(
+            mn=mins[column],
+            mx=maxes[column],
+            bins=bins[column] if isinstance(bins, dict) else bins,
+            right=right,
+        )
+
+    return stats
 
 
 # Copied from

@@ -19,6 +19,7 @@ from typing import (
     cast,
 )
 
+import ray
 import ray._private.worker
 from ray._private.inspect_util import (
     is_class_method,
@@ -31,8 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class _OpenTelemetryProxy:
-    """
-    This proxy makes it possible for tracing to be disabled when opentelemetry
+    """This proxy makes it possible for tracing to be disabled when opentelemetry
     is not installed on the cluster, but is installed locally.
 
     The check for `opentelemetry`'s existence must happen where the functions
@@ -75,16 +75,15 @@ class _OpenTelemetryProxy:
         try:
             return importlib.import_module(module)
         except ImportError:
-            if os.getenv("RAY_TRACING_ENABLED", "False").lower() in ["true", "1"]:
+            if _is_tracing_enabled():
                 raise ImportError(
-                    "Install opentelemetry with "
-                    "'pip install opentelemetry-api==1.0.0rc1' "
-                    "and 'pip install opentelemetry-sdk==1.0.0rc1' to enable "
-                    "tracing. See more at docs.ray.io/tracing.html"
+                    "Install OpenTelemetry with "
+                    "'pip install opentelemetry-api==1.34.1 opentelemetry-sdk==1.34.1 opentelemetry-exporter-otlp==1.34.1' "
+                    "to enable tracing. See the Ray documentation for details: "
+                    "https://docs.ray.io/en/latest/ray-observability/user-guides/ray-tracing.html#installation"
                 )
 
 
-_nameable = Union[str, Callable[..., Any]]
 _global_is_tracing_enabled = False
 _opentelemetry = None
 
@@ -95,11 +94,27 @@ def _is_tracing_enabled() -> bool:
     return _global_is_tracing_enabled
 
 
-def _enbale_tracing():
+def _enable_tracing():
     global _global_is_tracing_enabled, _opentelemetry
     _global_is_tracing_enabled = True
     _opentelemetry = _OpenTelemetryProxy()
     _opentelemetry.try_all()
+
+
+def _get_opentelemetry() -> Optional["_OpenTelemetryProxy"]:
+    """Avoids pickling a stale `_opentelemetry` value into closures."""
+    return _opentelemetry
+
+
+def _get_actor_id_hex(actor_ref: Any) -> Optional[str]:
+    """Actor id extraction across core and client actor refs."""
+    ray_actor_id = getattr(actor_ref, "_ray_actor_id", None)
+    if ray_actor_id is not None:
+        return ray_actor_id.hex()
+    client_actor_id = getattr(actor_ref, "_actor_id", None)
+    if client_actor_id is not None:
+        return client_actor_id.hex()
+    return None
 
 
 def _sort_params_list(params_list: List[Parameter]):
@@ -166,13 +181,15 @@ class _DictPropagator:
     def inject_current_context() -> Dict[Any, Any]:
         """Inject trace context into otel propagator."""
         context_dict: Dict[Any, Any] = {}
-        _opentelemetry.propagate.inject(context_dict)
+        opentelemetry = _get_opentelemetry()
+        opentelemetry.propagate.inject(context_dict)
         return context_dict
 
     def extract(context_dict: Dict[Any, Any]) -> "_opentelemetry.Context":
         """Given a trace context, extract as a Context."""
+        opentelemetry = _get_opentelemetry()
         return cast(
-            _opentelemetry.Context, _opentelemetry.propagate.extract(context_dict)
+            opentelemetry.Context, opentelemetry.propagate.extract(context_dict)
         )
 
 
@@ -181,25 +198,26 @@ def _use_context(
     parent_context: "_opentelemetry.Context",
 ) -> Generator[None, None, None]:
     """Uses the Ray trace context for the span."""
+    opentelemetry = _get_opentelemetry()
     if parent_context is not None:
         new_context = parent_context
     else:
-        new_context = _opentelemetry.Context()
-    token = _opentelemetry.context.attach(new_context)
+        new_context = opentelemetry.Context()
+    token = opentelemetry.context.attach(new_context)
     try:
         yield
     finally:
-        _opentelemetry.context.detach(token)
+        opentelemetry.context.detach(token)
 
 
-def _function_hydrate_span_args(func: Callable[..., Any]):
+def _function_hydrate_span_args(function_name: str):
     """Get the Attributes of the function that will be reported as attributes
     in the trace."""
     runtime_context = get_runtime_context()
 
     span_args = {
         "ray.remote": "function",
-        "ray.function": func,
+        "ray.function": function_name,
         "ray.pid": str(os.getpid()),
         "ray.job_id": runtime_context.get_job_id(),
         "ray.node_id": runtime_context.get_node_id(),
@@ -220,21 +238,18 @@ def _function_hydrate_span_args(func: Callable[..., Any]):
 
 def _function_span_producer_name(func: Callable[..., Any]) -> str:
     """Returns the function span name that has span kind of producer."""
-    args = _function_hydrate_span_args(func)
-    name = args["ray.function"]
-
-    return f"{name} ray.remote"
+    return f"{func} ray.remote"
 
 
 def _function_span_consumer_name(func: Callable[..., Any]) -> str:
     """Returns the function span name that has span kind of consumer."""
-    args = _function_hydrate_span_args(func)
-    name = args["ray.function"]
-
-    return f"{name} ray.remote_worker"
+    return f"{func} ray.remote_worker"
 
 
-def _actor_hydrate_span_args(class_: _nameable, method: _nameable):
+def _actor_hydrate_span_args(
+    class_: Union[str, Callable[..., Any]],
+    method: Union[str, Callable[..., Any]],
+):
     """Get the Attributes of the actor that will be reported as attributes
     in the trace."""
     if callable(class_):
@@ -243,7 +258,6 @@ def _actor_hydrate_span_args(class_: _nameable, method: _nameable):
         method = method.__name__
 
     runtime_context = get_runtime_context()
-
     span_args = {
         "ray.remote": "actor",
         "ray.actor_class": class_,
@@ -268,22 +282,30 @@ def _actor_hydrate_span_args(class_: _nameable, method: _nameable):
     return span_args
 
 
-def _actor_span_producer_name(class_: _nameable, method: _nameable) -> str:
+def _actor_span_producer_name(
+    class_: Union[str, Callable[..., Any]],
+    method: Union[str, Callable[..., Any]],
+) -> str:
     """Returns the actor span name that has span kind of producer."""
-    args = _actor_hydrate_span_args(class_, method)
-    assert args is not None
-    name = args["ray.function"]
+    if not isinstance(class_, str):
+        class_ = class_.__name__
+    if not isinstance(method, str):
+        method = method.__name__
 
-    return f"{name} ray.remote"
+    return f"{class_}.{method} ray.remote"
 
 
-def _actor_span_consumer_name(class_: _nameable, method: _nameable) -> str:
+def _actor_span_consumer_name(
+    class_: Union[str, Callable[..., Any]],
+    method: Union[str, Callable[..., Any]],
+) -> str:
     """Returns the actor span name that has span kind of consumer."""
-    args = _actor_hydrate_span_args(class_, method)
-    assert args is not None
-    name = args["ray.function"]
+    if not isinstance(class_, str):
+        class_ = class_.__name__
+    if not isinstance(method, str):
+        method = method.__name__
 
-    return f"{name} ray.remote_worker"
+    return f"{class_}.{method} ray.remote_worker"
 
 
 def _tracing_task_invocation(method):
@@ -306,10 +328,11 @@ def _tracing_task_invocation(method):
             return method(self, args, kwargs, *_args, **_kwargs)
 
         assert "_ray_trace_ctx" not in kwargs
-        tracer = _opentelemetry.trace.get_tracer(__name__)
+        opentelemetry = _get_opentelemetry()
+        tracer = opentelemetry.trace.get_tracer(__name__)
         with tracer.start_as_current_span(
             _function_span_producer_name(self._function_name),
-            kind=_opentelemetry.trace.SpanKind.PRODUCER,
+            kind=opentelemetry.trace.SpanKind.PRODUCER,
             attributes=_function_hydrate_span_args(self._function_name),
         ):
             # Inject a _ray_trace_ctx as a dictionary
@@ -324,18 +347,13 @@ def _inject_tracing_into_function(function):
     future execution of that function will include tracing.
     Use the provided trace context from kwargs.
     """
-    # Add _ray_trace_ctx to function signature
     if not _is_tracing_enabled():
         return function
 
-    setattr(
+    function.__signature__ = _add_param_to_signature(
         function,
-        "__signature__",
-        _add_param_to_signature(
-            function,
-            inspect.Parameter(
-                "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
-            ),
+        inspect.Parameter(
+            "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
         ),
     )
 
@@ -348,7 +366,8 @@ def _inject_tracing_into_function(function):
         if _ray_trace_ctx is None:
             return function(*args, **kwargs)
 
-        tracer = _opentelemetry.trace.get_tracer(__name__)
+        opentelemetry = _get_opentelemetry()
+        tracer = opentelemetry.trace.get_tracer(__name__)
         function_name = function.__module__ + "." + function.__name__
 
         # Retrieves the context from the _ray_trace_ctx dictionary we injected
@@ -356,7 +375,7 @@ def _inject_tracing_into_function(function):
             _DictPropagator.extract(_ray_trace_ctx)
         ), tracer.start_as_current_span(
             _function_span_consumer_name(function_name),
-            kind=_opentelemetry.trace.SpanKind.CONSUMER,
+            kind=opentelemetry.trace.SpanKind.CONSUMER,
             attributes=_function_hydrate_span_args(function_name),
         ):
             return function(*args, **kwargs)
@@ -387,18 +406,20 @@ def _tracing_actor_creation(method):
         class_name = self.__ray_metadata__.class_name
         method_name = "__init__"
         assert "_ray_trace_ctx" not in _kwargs
-        tracer = _opentelemetry.trace.get_tracer(__name__)
+        opentelemetry = _get_opentelemetry()
+        tracer = opentelemetry.trace.get_tracer(__name__)
         with tracer.start_as_current_span(
             name=_actor_span_producer_name(class_name, method_name),
-            kind=_opentelemetry.trace.SpanKind.PRODUCER,
+            kind=opentelemetry.trace.SpanKind.PRODUCER,
             attributes=_actor_hydrate_span_args(class_name, method_name),
         ) as span:
             # Inject a _ray_trace_ctx as a dictionary
             kwargs["_ray_trace_ctx"] = _DictPropagator.inject_current_context()
 
             result = method(self, args, kwargs, *_args, **_kwargs)
-
-            span.set_attribute("ray.actor_id", result._ray_actor_id.hex())
+            actor_id = _get_actor_id_hex(result)
+            if actor_id:
+                span.set_attribute("ray.actor_id", actor_id)
 
             return result
 
@@ -417,27 +438,28 @@ def _tracing_actor_method_invocation(method):
         **_kwargs: Any,
     ) -> Any:
         # If tracing feature flag is not on, perform a no-op
-        if not _is_tracing_enabled() or self._actor_ref()._ray_is_cross_language:
+        if not _is_tracing_enabled() or self._actor._ray_is_cross_language:
             if kwargs is not None:
                 assert "_ray_trace_ctx" not in kwargs
             return method(self, args, kwargs, *_args, **_kwargs)
 
-        class_name = (
-            self._actor_ref()._ray_actor_creation_function_descriptor.class_name
-        )
+        class_name = self._actor._ray_actor_creation_function_descriptor.class_name
         method_name = self._method_name
         assert "_ray_trace_ctx" not in _kwargs
 
-        tracer = _opentelemetry.trace.get_tracer(__name__)
+        opentelemetry = _get_opentelemetry()
+        tracer = opentelemetry.trace.get_tracer(__name__)
         with tracer.start_as_current_span(
             name=_actor_span_producer_name(class_name, method_name),
-            kind=_opentelemetry.trace.SpanKind.PRODUCER,
+            kind=opentelemetry.trace.SpanKind.PRODUCER,
             attributes=_actor_hydrate_span_args(class_name, method_name),
         ) as span:
             # Inject a _ray_trace_ctx as a dictionary
             kwargs["_ray_trace_ctx"] = _DictPropagator.inject_current_context()
 
-            span.set_attribute("ray.actor_id", self._actor_ref()._ray_actor_id.hex())
+            actor_id = _get_actor_id_hex(self._actor)
+            if actor_id:
+                span.set_attribute("ray.actor_id", actor_id)
 
             return method(self, args, kwargs, *_args, **_kwargs)
 
@@ -455,15 +477,15 @@ def _inject_tracing_into_class(_cls):
             _ray_trace_ctx: Optional[Dict[str, Any]] = None,
             **_kwargs: Any,
         ) -> Any:
-            """
-            Wrap the user's function with a function that
+            """Wrap the user's function with a function that
             will extract the trace context
             """
             # If tracing feature flag is not on, perform a no-op
             if not _is_tracing_enabled() or _ray_trace_ctx is None:
                 return method(self, *_args, **_kwargs)
 
-            tracer: _opentelemetry.trace.Tracer = _opentelemetry.trace.get_tracer(
+            opentelemetry = _get_opentelemetry()
+            tracer: opentelemetry.trace.Tracer = opentelemetry.trace.get_tracer(
                 __name__
             )
 
@@ -473,7 +495,7 @@ def _inject_tracing_into_class(_cls):
                 _DictPropagator.extract(_ray_trace_ctx)
             ), tracer.start_as_current_span(
                 _actor_span_consumer_name(self.__class__.__name__, method),
-                kind=_opentelemetry.trace.SpanKind.CONSUMER,
+                kind=opentelemetry.trace.SpanKind.CONSUMER,
                 attributes=_actor_hydrate_span_args(self.__class__.__name__, method),
             ):
                 return method(self, *_args, **_kwargs)
@@ -487,15 +509,15 @@ def _inject_tracing_into_class(_cls):
             _ray_trace_ctx: Optional[Dict[str, Any]] = None,
             **_kwargs: Any,
         ) -> Any:
-            """
-            Wrap the user's function with a function that
+            """Wrap the user's function with a function that
             will extract the trace context
             """
             # If tracing feature flag is not on, perform a no-op
             if not _is_tracing_enabled() or _ray_trace_ctx is None:
                 return await method(self, *_args, **_kwargs)
 
-            tracer = _opentelemetry.trace.get_tracer(__name__)
+            opentelemetry = _get_opentelemetry()
+            tracer = opentelemetry.trace.get_tracer(__name__)
 
             # Retrieves the context from the _ray_trace_ctx dictionary we
             # injected, or starts a new context
@@ -503,7 +525,7 @@ def _inject_tracing_into_class(_cls):
                 _DictPropagator.extract(_ray_trace_ctx)
             ), tracer.start_as_current_span(
                 _actor_span_consumer_name(self.__class__.__name__, method.__name__),
-                kind=_opentelemetry.trace.SpanKind.CONSUMER,
+                kind=opentelemetry.trace.SpanKind.CONSUMER,
                 attributes=_actor_hydrate_span_args(
                     self.__class__.__name__, method.__name__
                 ),
@@ -520,6 +542,12 @@ def _inject_tracing_into_class(_cls):
         if is_static_method(_cls, name) or is_class_method(method):
             continue
 
+        if inspect.isgeneratorfunction(method) or inspect.isasyncgenfunction(method):
+            # Right now, this method somehow changes the signature of the method
+            # when they are generator.
+            # TODO(sang): Fix it.
+            continue
+
         # Don't decorate the __del__ magic method.
         # It's because the __del__ can be called after Python
         # modules are garbage colleted, which means the modules
@@ -531,23 +559,40 @@ def _inject_tracing_into_class(_cls):
         if name == "__del__":
             continue
 
-        # Add _ray_trace_ctx to method signature
-        setattr(
-            method,
-            "__signature__",
-            _add_param_to_signature(
-                method,
-                inspect.Parameter(
-                    "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
-                ),
+        # If the method is already wrapped, we still need to set __signature__
+        # on the deeply unwrapped original. This is because cloudpickle doesn't
+        # preserve __signature__ attributes, and _ActorClassMethodMetadata.create
+        # uses inspect.unwrap which goes all the way to the original method.
+        unwrapped_method = inspect.unwrap(method)
+
+        # Add _ray_trace_ctx to the UNWRAPPED method's signature.
+        # This ensures inspect.unwrap() will find the signature.
+        # Note: We always set the signature, even if it was already set by a
+        # previous call, because the signature might have been lost during
+        # serialization/deserialization.
+        unwrapped_method.__signature__ = _add_param_to_signature(
+            unwrapped_method,
+            inspect.Parameter(
+                "_ray_trace_ctx", inspect.Parameter.KEYWORD_ONLY, default=None
             ),
         )
+
+        # If method was already wrapped by tracing (e.g., preserved through
+        # cloudpickle), don't re-wrap it. We use a custom marker attribute
+        # instead of __wrapped__ because __wrapped__ could be from any
+        # decorator, not just tracing.
+        if getattr(method, "__ray_tracing_wrapped__", False):
+            continue
 
         if inspect.iscoroutinefunction(method):
             # If the method was async, swap out sync wrapper into async
             wrapped_method = wraps(method)(async_span_wrapper(method))
         else:
             wrapped_method = wraps(method)(span_wrapper(method))
+
+        # Mark the wrapped method so we don't re-wrap it if this class
+        # is processed again (e.g., after cloudpickle round-trip).
+        wrapped_method.__ray_tracing_wrapped__ = True
 
         setattr(_cls, name, wrapped_method)
 

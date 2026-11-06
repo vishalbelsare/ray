@@ -14,6 +14,9 @@
 
 #pragma once
 
+#include <optional>
+#include <utility>
+
 #include "ray/common/ray_config.h"
 #include "ray/raylet/scheduling/policy/scheduling_context.h"
 
@@ -36,7 +39,14 @@ enum class SchedulingType {
   BUNDLE_SPREAD = 5,
   BUNDLE_STRICT_PACK = 6,
   BUNDLE_STRICT_SPREAD = 7,
-  AFFINITY_WITH_BUNDLE = 8
+  NODE_LABEL = 8,
+};
+
+// Topology-level scheduling strategies for placement groups.
+// Only STRICT_PACK is supported for now.
+enum class TopologySchedulingStrategy {
+  NONE = 0,
+  STRICT_PACK = 1,
 };
 
 // Options that controls the scheduling behavior.
@@ -67,7 +77,7 @@ struct SchedulingOptions {
                              avoid_local_node,
                              require_node_available,
                              RayConfig::instance().scheduler_avoid_gpu_nodes(),
-                             /*max_cpu_fraction_per_node*/ 1.0,
+                             /*target_topology_assignment*/ std::nullopt,
                              /*scheduling_context*/ nullptr,
                              preferred_node_id);
   }
@@ -76,100 +86,123 @@ struct SchedulingOptions {
                                         bool require_node_available,
                                         std::string node_id,
                                         bool soft,
-                                        bool spill_on_unavailable = false) {
+                                        bool spill_on_unavailable = false,
+                                        bool fail_on_unavailable = false) {
     if (spill_on_unavailable) {
-      RAY_CHECK(soft);
+      RAY_CHECK(soft) << "spill_on_unavailable only works with soft == true";
+    }
+    if (fail_on_unavailable) {
+      RAY_CHECK(!soft) << "fail_on_unavailable only works with soft == false";
     }
     SchedulingOptions scheduling_options =
         Hybrid(avoid_local_node, require_node_available);
-    scheduling_options.scheduling_type = SchedulingType::NODE_AFFINITY;
-    scheduling_options.node_affinity_node_id = node_id;
-    scheduling_options.node_affinity_soft = soft;
-    scheduling_options.node_affinity_spill_on_unavailable = spill_on_unavailable;
+    scheduling_options.scheduling_type_ = SchedulingType::NODE_AFFINITY;
+    scheduling_options.node_affinity_node_id_ = node_id;
+    scheduling_options.node_affinity_soft_ = soft;
+    scheduling_options.node_affinity_spill_on_unavailable_ = spill_on_unavailable;
+    scheduling_options.node_affinity_fail_on_unavailable_ = fail_on_unavailable;
     return scheduling_options;
   }
 
-  // construct option for affinity with bundle scheduling policy.
-  static SchedulingOptions AffinityWithBundle(const BundleID &bundle_id) {
+  static SchedulingOptions NodeLabelScheduling(
+      const rpc::SchedulingStrategy &scheduling_strategy) {
     auto scheduling_context =
-        std::make_unique<AffinityWithBundleSchedulingContext>(bundle_id);
+        std::make_unique<NodeLabelSchedulingContext>(scheduling_strategy);
     return SchedulingOptions(
-        SchedulingType::AFFINITY_WITH_BUNDLE,
+        SchedulingType::NODE_LABEL,
         /*spread_threshold*/ 0,
         /*avoid_local_node*/ false,
         /*require_node_available*/ true,
         /*avoid_gpu_nodes*/ RayConfig::instance().scheduler_avoid_gpu_nodes(),
-        /*max_cpu_fraction_per_node*/ 0,
+        /*target_topology_assignment*/ std::nullopt,
         std::move(scheduling_context));
   }
-
   /*
    * Bundle scheduling options.
    */
 
   // construct option for soft pack scheduling policy.
-  static SchedulingOptions BundlePack(double max_cpu_fraction_per_node = 1.0) {
+  static SchedulingOptions BundlePack(
+      std::optional<std::pair<std::string, std::optional<std::string>>>
+          target_topology_assignment = std::nullopt) {
     return SchedulingOptions(SchedulingType::BUNDLE_PACK,
                              /*spread_threshold*/ 0,
                              /*avoid_local_node*/ false,
                              /*require_node_available*/ true,
                              /*avoid_gpu_nodes*/ false,
-                             /*max_cpu_fraction_per_node*/ max_cpu_fraction_per_node);
+                             std::move(target_topology_assignment));
   }
 
   // construct option for strict spread scheduling policy.
-  static SchedulingOptions BundleSpread(double max_cpu_fraction_per_node = 1.0) {
+  static SchedulingOptions BundleSpread(
+      std::optional<std::pair<std::string, std::optional<std::string>>>
+          target_topology_assignment = std::nullopt) {
     return SchedulingOptions(SchedulingType::BUNDLE_SPREAD,
                              /*spread_threshold*/ 0,
                              /*avoid_local_node*/ false,
                              /*require_node_available*/ true,
                              /*avoid_gpu_nodes*/ false,
-                             /*max_cpu_fraction_per_node*/ max_cpu_fraction_per_node);
+                             std::move(target_topology_assignment));
   }
 
   // construct option for strict pack scheduling policy.
-  static SchedulingOptions BundleStrictPack(double max_cpu_fraction_per_node = 1.0) {
-    return SchedulingOptions(SchedulingType::BUNDLE_STRICT_PACK,
-                             /*spread_threshold*/ 0,
-                             /*avoid_local_node*/ false,
-                             /*require_node_available*/ true,
-                             /*avoid_gpu_nodes*/ false,
-                             /*max_cpu_fraction_per_node*/ max_cpu_fraction_per_node);
+  static SchedulingOptions BundleStrictPack(
+      scheduling::NodeID soft_target_node_id = scheduling::NodeID::Nil(),
+      std::optional<std::pair<std::string, std::optional<std::string>>>
+          target_topology_assignment = std::nullopt) {
+    SchedulingOptions options(SchedulingType::BUNDLE_STRICT_PACK,
+                              /*spread_threshold*/ 0,
+                              /*avoid_local_node*/ false,
+                              /*require_node_available*/ true,
+                              /*avoid_gpu_nodes*/ false,
+                              std::move(target_topology_assignment));
+    options.bundle_strict_pack_soft_target_node_id_ = soft_target_node_id;
+    return options;
   }
 
   // construct option for strict spread scheduling policy.
   static SchedulingOptions BundleStrictSpread(
-      double max_cpu_fraction_per_node = 1.0,
-      std::unique_ptr<SchedulingContext> scheduling_context = nullptr) {
+      std::unique_ptr<SchedulingContext> scheduling_context = nullptr,
+      std::optional<std::pair<std::string, std::optional<std::string>>>
+          target_topology_assignment = std::nullopt) {
     return SchedulingOptions(SchedulingType::BUNDLE_STRICT_SPREAD,
                              /*spread_threshold*/ 0,
                              /*avoid_local_node*/ false,
                              /*require_node_available*/ true,
                              /*avoid_gpu_nodes*/ false,
-                             /*max_cpu_fraction_per_node*/ max_cpu_fraction_per_node,
-                             /*scheduling_context*/ std::move(scheduling_context));
+                             std::move(target_topology_assignment),
+                             std::move(scheduling_context));
   }
 
-  SchedulingType scheduling_type;
-  float spread_threshold;
-  bool avoid_local_node;
-  bool require_node_available;
-  bool avoid_gpu_nodes;
-  // Maximum reservable CPU fraction per node. It is applied across multiple
-  // bundles, individually. E.g., when you have 2 bundles {CPU: 4} from 2 different
-  // scheduilng request, and there's one node with {CPU: 8}, only 1 bundle from 1 request
-  // can be scheduled on this node. This is only used for bundle scheduling policies
-  // (bundle pack, spread).
-  double max_cpu_fraction_per_node;
-  std::shared_ptr<SchedulingContext> scheduling_context;
-  std::string node_affinity_node_id;
-  bool node_affinity_soft = false;
-  bool node_affinity_spill_on_unavailable = false;
+  SchedulingType scheduling_type_;
+  float spread_threshold_;
+  bool avoid_local_node_;
+  bool require_node_available_;
+  bool avoid_gpu_nodes_;
+  // The scheduling strategy for the topology level.
+  // Set to NONE to disable the topology strategy.
+  TopologySchedulingStrategy topology_scheduling_strategy_ =
+      TopologySchedulingStrategy::NONE;
+  // The topology target for topology strategy scheduling.
+  // first: the node label key used to partition nodes into groups.
+  // second: if set, constrains scheduling to this topology value
+  //   (bundle rescheduling). If nullopt, a new group is selected.
+  std::pair<std::string, std::optional<std::string>> target_topology_assignment_;
+  // ID of the target node where bundles should be placed
+  // iff the target node has enough available resources.
+  // Otherwise, the bundles can be placed elsewhere.
+  // This is only used by PG STRICT_PACK scheduling.
+  scheduling::NodeID bundle_strict_pack_soft_target_node_id_ = scheduling::NodeID::Nil();
+  std::shared_ptr<SchedulingContext> scheduling_context_;
+  std::string node_affinity_node_id_;
+  bool node_affinity_soft_ = false;
+  bool node_affinity_spill_on_unavailable_ = false;
+  bool node_affinity_fail_on_unavailable_ = false;
   // The node where the task is preferred to be placed. By default, this node id
   // is empty, which means no preferred node.
-  std::string preferred_node_id;
-  int32_t schedule_top_k_absolute;
-  float scheduler_top_k_fraction;
+  std::string preferred_node_id_;
+  int32_t schedule_top_k_absolute_;
+  float scheduler_top_k_fraction_;
 
  private:
   SchedulingOptions(
@@ -178,21 +211,28 @@ struct SchedulingOptions {
       bool avoid_local_node,
       bool require_node_available,
       bool avoid_gpu_nodes,
-      double max_cpu_fraction_per_node = 1.0,
+      std::optional<std::pair<std::string, std::optional<std::string>>>
+          target_topology_assignment = std::nullopt,
       std::shared_ptr<SchedulingContext> scheduling_context = nullptr,
       const std::string &preferred_node_id = std::string(),
       int32_t schedule_top_k_absolute = RayConfig::instance().scheduler_top_k_absolute(),
       float scheduler_top_k_fraction = RayConfig::instance().scheduler_top_k_fraction())
-      : scheduling_type(type),
-        spread_threshold(spread_threshold),
-        avoid_local_node(avoid_local_node),
-        require_node_available(require_node_available),
-        avoid_gpu_nodes(avoid_gpu_nodes),
-        max_cpu_fraction_per_node(max_cpu_fraction_per_node),
-        scheduling_context(std::move(scheduling_context)),
-        preferred_node_id(preferred_node_id),
-        schedule_top_k_absolute(schedule_top_k_absolute),
-        scheduler_top_k_fraction(scheduler_top_k_fraction) {}
+      : scheduling_type_(type),
+        spread_threshold_(spread_threshold),
+        avoid_local_node_(avoid_local_node),
+        require_node_available_(require_node_available),
+        avoid_gpu_nodes_(avoid_gpu_nodes),
+        topology_scheduling_strategy_(target_topology_assignment.has_value()
+                                          ? TopologySchedulingStrategy::STRICT_PACK
+                                          : TopologySchedulingStrategy::NONE),
+        target_topology_assignment_(
+            target_topology_assignment.has_value()
+                ? std::move(*target_topology_assignment)
+                : std::pair<std::string, std::optional<std::string>>{}),
+        scheduling_context_(std::move(scheduling_context)),
+        preferred_node_id_(preferred_node_id),
+        schedule_top_k_absolute_(schedule_top_k_absolute),
+        scheduler_top_k_fraction_(scheduler_top_k_fraction) {}
 
   friend class ::ray::raylet::SchedulingPolicyTest;
   friend class HybridSchedulingPolicyTest;

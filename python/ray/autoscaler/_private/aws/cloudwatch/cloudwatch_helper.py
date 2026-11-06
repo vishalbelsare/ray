@@ -89,8 +89,7 @@ class CloudwatchHelper:
             raise e
 
     def _update_cloudwatch_config(self, config_type: str, is_head_node: bool) -> None:
-        """
-        check whether update operations are needed in
+        """check whether update operations are needed in
         cloudwatch related configs
         """
         cwa_installed = self._setup_cwa()
@@ -100,8 +99,8 @@ class CloudwatchHelper:
                 cw_config_ssm = self._set_cloudwatch_ssm_config_param(
                     param_name, config_type
                 )
-                cur_cw_config_hash = self._sha1_hash_file(config_type)
-                ssm_cw_config_hash = self._sha1_hash_json(cw_config_ssm)
+                cur_cw_config_hash = self._sha256_hash_file(config_type)
+                ssm_cw_config_hash = self._sha256_hash_json(cw_config_ssm)
                 # check if user updated cloudwatch related config files.
                 # if so, perform corresponding actions.
                 if cur_cw_config_hash != ssm_cw_config_hash:
@@ -290,8 +289,7 @@ class CloudwatchHelper:
     def _replace_config_variables(
         self, string: str, node_id: str, cluster_name: str, region: str
     ) -> str:
-        """
-        replace known config variable occurrences in the input string
+        """replace known config variable occurrences in the input string
         does not replace variables with undefined or empty strings
         """
 
@@ -310,8 +308,7 @@ class CloudwatchHelper:
         cluster_name: str,
         region: str,
     ) -> Union[str, Dict[str, Any]]:
-        """
-        Replace known config variable occurrences in the input collection.
+        """Replace known config variable occurrences in the input collection.
         The input collection must be either a dict or list.
         Returns a tuple consisting of the output collection and the number of
         modified strings in the collection (which is not necessarily equal to
@@ -354,8 +351,7 @@ class CloudwatchHelper:
     def _set_cloudwatch_ssm_config_param(
         self, parameter_name: str, config_type: str
     ) -> str:
-        """
-        get cloudwatch config for the given param and config type from SSM
+        """get cloudwatch config for the given param and config type from SSM
         if it exists, put it in the SSM param store if not
         """
         try:
@@ -381,44 +377,42 @@ class CloudwatchHelper:
 
     def _get_default_empty_config_file_hash(self):
         default_cw_config = "{}"
-        parameter_value = self._sha1_hash_json(default_cw_config)
+        parameter_value = self._sha256_hash_json(default_cw_config)
         return parameter_value
 
     def _get_ssm_param(self, parameter_name: str) -> str:
-        """
-        get the SSM parameter value associated with the given parameter name
-        """
+        """get the SSM parameter value associated with the given parameter name"""
         response = self.ssm_client.get_parameter(Name=parameter_name)
         logger.info("Successfully fetch ssm parameter: {}".format(parameter_name))
         res = response.get("Parameter", {})
         cwa_parameter = res.get("Value", {})
         return cwa_parameter
 
-    def _sha1_hash_json(self, value: str) -> str:
-        """calculate the json string sha1 hash"""
-        sha1_hash = hashlib.new("sha1")
-        binary_value = value.encode("ascii")
-        sha1_hash.update(binary_value)
-        sha1_res = sha1_hash.hexdigest()
-        return sha1_res
+    def _sha256_hash_json(self, value: str) -> str:
+        """calculate the json string sha256 hash"""
+        sha256_hash = hashlib.new("sha256")
+        binary_value = value.encode("utf-8")
+        sha256_hash.update(binary_value)
+        sha256_res = sha256_hash.hexdigest()
+        return sha256_res
 
-    def _sha1_hash_file(self, config_type: str) -> str:
-        """calculate the config file sha1 hash"""
+    def _sha256_hash_file(self, config_type: str) -> str:
+        """calculate the config file sha256 hash"""
         config = self.CLOUDWATCH_CONFIG_TYPE_TO_CONFIG_VARIABLE_REPLACE_FUNC.get(
             config_type
         )(config_type)
         value = json.dumps(config)
-        sha1_res = self._sha1_hash_json(value)
-        return sha1_res
+        sha256_res = self._sha256_hash_json(value)
+        return sha256_res
 
     def _upload_config_to_ssm_and_set_hash_tag(self, config_type: str):
         data = self.CLOUDWATCH_CONFIG_TYPE_TO_CONFIG_VARIABLE_REPLACE_FUNC.get(
             config_type
         )(config_type)
-        sha1_hash_value = self._sha1_hash_file(config_type)
+        sha256_hash_value = self._sha256_hash_file(config_type)
         self._upload_config_to_ssm(data, config_type)
         self._update_cloudwatch_hash_tag_value(
-            self.node_id, sha1_hash_value, config_type
+            self.node_id, sha256_hash_value, config_type
         )
 
     def _add_cwa_installed_tag(self, node_id: str) -> None:
@@ -432,12 +426,12 @@ class CloudwatchHelper:
         )
 
     def _update_cloudwatch_hash_tag_value(
-        self, node_id: str, sha1_hash_value: str, config_type: str
+        self, node_id: str, sha256_hash_value: str, config_type: str
     ):
         hash_key_value = "-".join([CLOUDWATCH_CONFIG_HASH_TAG_BASE, config_type])
         self.ec2_client.create_tags(
             Resources=[node_id],
-            Tags=[{"Key": hash_key_value, "Value": sha1_hash_value}],
+            Tags=[{"Key": hash_key_value, "Value": sha256_hash_value}],
         )
         logger.info(
             "Successfully update cloudwatch {} hash tag on {}".format(
@@ -467,8 +461,7 @@ class CloudwatchHelper:
         self._put_ssm_param(param, param_name)
 
     def _replace_cwa_config_vars(self, config_type: str) -> Dict[str, Any]:
-        """
-        replace {instance_id}, {region}, {cluster_name}
+        """replace {instance_id}, {region}, {cluster_name}
         variable occurrences in Unified Cloudwatch Agent config file
         """
         cwa_config = self._load_config_file(config_type)
@@ -481,9 +474,7 @@ class CloudwatchHelper:
         return cwa_config
 
     def _replace_dashboard_config_vars(self, config_type: str) -> List[str]:
-        """
-        replace known variable occurrences in CloudWatch Dashboard config file
-        """
+        """replace known variable occurrences in CloudWatch Dashboard config file"""
         data = self._load_config_file(config_type)
         widgets = []
         for item in data:
@@ -497,8 +488,7 @@ class CloudwatchHelper:
         return widgets
 
     def _replace_alarm_config_vars(self, config_type: str) -> List[str]:
-        """
-        replace {instance_id}, {region}, {cluster_name}
+        """replace {instance_id}, {region}, {cluster_name}
         variable occurrences in cloudwatch alarm config file
         """
         data = self._load_config_file(config_type)
@@ -624,8 +614,7 @@ class CloudwatchHelper:
             )
 
     def _ensure_cwa_installed_ssm(self, node_id: str) -> bool:
-        """
-        Check if Unified Cloudwatch Agent is installed via ssm run command.
+        """Check if Unified Cloudwatch Agent is installed via ssm run command.
         If not, notify user to use an AMI with
         the Unified CloudWatch Agent installed.
         """
@@ -667,8 +656,7 @@ class CloudwatchHelper:
         return filters
 
     def _check_cwa_installed_ec2_tag(self) -> List[str]:
-        """
-        Filtering all nodes to get nodes
+        """Filtering all nodes to get nodes
         without Unified CloudWatch Agent installed
         """
         try:

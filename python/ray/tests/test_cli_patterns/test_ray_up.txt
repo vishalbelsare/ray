@@ -10,7 +10,6 @@ AWS config
 
 No head node found\. Launching a new cluster\. Confirm \[y/N\]: y \[automatic, due to --yes\]
 
-Usage stats collection is enabled by default without user confirmation because this terminal is detected to be non-interactive\..+
 
 Acquiring an up-to-date head node
   Launched 1 nodes \[subnet_id=subnet-.+\]
@@ -20,6 +19,7 @@ Acquiring an up-to-date head node
 
 <1/1> Setting up head node
   Prepared bootstrap config
+  Autoscaler v2 is now enabled by default.+
   New status: waiting-for-ssh
   \[1/7\] Waiting for SSH to become available
     Running `uptime` as a test\.
@@ -29,6 +29,7 @@ Acquiring an up-to-date head node
   New status: syncing-files
   \[2/7\] Processing file mounts
     ~/tests/ from ./
+    ~/\.ray/auth_token from .+/\.ray/auth_token
   \[3/7\] No worker file mounts to sync
   New status: setting-up
   \[4/7\] Running initialization commands
@@ -41,10 +42,28 @@ Acquiring an up-to-date head node
   \[7/7\] Starting the Ray runtime
   New status: up-to-date
 
-Useful commands
-  Monitor autoscaling with
-    ray exec .+ 'tail -n 100 -f /tmp/ray/session_latest/logs/monitor\*'
-  Connect to a terminal on the cluster head:
+-{60}
+Note: The output above is from the head node \(via `ray start`\)\.
+  Commands shown in 'Next steps' may only work from the head node
+  or from within the cluster network\.
+
+Useful commands for your local machine:
+  To terminate the cluster:
+    ray down .+
+
+  To retrieve the IP address of the cluster head:
+    ray get-head-ip .+
+
+  To port-forward the cluster's Ray Dashboard to the local machine:
+    ray dashboard .+
+
+  To submit a job to the cluster, port-forward the Ray Dashboard in another terminal and run:
+    ray job submit --address .+
+
+  To connect to a terminal on the cluster head for debugging:
     ray attach .+
-  Get a remote shell to the cluster manually:
-    ssh .+
+
+  To monitor autoscaling:
+    ray exec .+ 'tail -n 100 -f /tmp/ray/session_latest/logs/monitor\*'
+
+

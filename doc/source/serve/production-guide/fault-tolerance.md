@@ -1,11 +1,17 @@
+---
+myst:
+  html_meta:
+    description: "End-to-end Serve fault tolerance: replica health checks, constructor retries, worker node recovery, and GCS-backed head node recovery."
+---
+
 (serve-e2e-ft)=
-# Adding End-to-End Fault Tolerance
+# Add End-to-End Fault Tolerance
 
 This section helps you:
 
 * Provide additional fault tolerance for your Serve application
-* understand Serve's recovery procedures
-* simulate system errors in your Serve application
+* Understand Serve's recovery procedures
+* Simulate system errors in your Serve application
 
 :::{admonition} Relevant Guides
 :class: seealso
@@ -15,24 +21,58 @@ This section discusses concepts from:
 :::
 
 (serve-e2e-ft-guide)=
-## Guide: end-to-end fault tolerance for your Serve app
+## Guide: End-to-end fault tolerance for your Serve app
 
-Serve provides some [fault tolerance](serve-ft-detail) features out of the box. You can provide end-to-end fault tolerance by tuning these features and running Serve on top of [KubeRay].
+Serve provides some [fault tolerance](serve-ft-detail) features out of the box. Two options to get end-to-end fault tolerance are the following:
+* tune these features and run Serve on top of [KubeRay]
+* use the [Anyscale platform](https://docs.anyscale.com/platform/services/head-node-ft?utm_source=ray_docs&utm_medium=docs&utm_campaign=tolerance), a managed Ray platform
 
 ### Replica health-checking
 
 By default, the Serve controller periodically health-checks each Serve deployment replica and restarts it on failure.
 
-You can define custom application-level health-checks and adjust their frequency and timeout.
-To define a custom health-check, add a `check_health` method to your deployment class.
-This method should take no arguments and return no result, and it should raise an exception if the replica should be considered unhealthy.
-If the health-check fails, the Serve controller logs the exception, kills the unhealthy replica(s), and restarts them.
-You can also use the deployment options to customize how frequently the health-check is run and the timeout after which a replica is marked unhealthy.
+When user code runs in a separate thread (the default when `RAY_SERVE_RUN_USER_CODE_IN_SEPARATE_THREAD=1`) and no custom `check_health` is defined, Serve runs a background watchdog that periodically probes the user code event loop. If the loop is unresponsive—for example, because a request is blocking it with a long synchronous call—the probe times out. After a configurable number of consecutive timeouts, the replica immediately fails its next health check and is restarted. You can tune this behavior with the following environment variables:
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `RAY_SERVE_USER_HEALTH_CHECK_PROBE_INTERVAL_S` | `60` | How often (seconds) the watchdog probes the user loop. |
+| `RAY_SERVE_USER_HEALTH_CHECK_PROBE_TIMEOUT_S` | `300` | How long (seconds) each probe waits before counting as a failure. |
+| `RAY_SERVE_USER_HEALTH_CHECK_PROBE_MAX_FAIL` | `3` | Consecutive probe failures before the replica fails its health check. Set to `0` to disable the watchdog. |
+
+You can define custom application-level health-checks and adjust their frequency and timeout. To define a custom health-check, add a `check_health` method to your deployment class. This method should take no arguments and return no result, and it should raise an exception if Ray Serve considers the replica unhealthy. If the health-check fails, the Serve controller logs the exception, kills the unhealthy replica(s), and restarts them. You can also use the deployment options to customize how frequently Serve runs the health-check and the timeout after which Serve marks a replica unhealthy.
 
 ```{literalinclude} ../doc_code/fault_tolerance/replica_health_check.py
 :start-after: __health_check_start__
 :end-before: __health_check_end__
 :language: python
+```
+
+In this example, `check_health` raises an error if the connection to an external database is lost. The Serve controller periodically calls this method on each replica of the deployment. If the method raises an exception for a replica, Serve marks that replica as unhealthy and restarts it. Health checks are configured and performed on a per-replica basis.
+
+:::{note}
+You shouldn't call ``check_health`` directly through a deployment handle (e.g., ``await deployment_handle.check_health.remote()``). This would invoke the health check on a single, arbitrary replica. The ``check_health`` method is designed as an interface for the Serve controller, not for direct user calls.
+:::
+
+:::{note}
+In a composable deployment graph, each deployment is responsible for its own health, independent of the other deployments it's bound to. For example, in an application defined by ``app = ParentDeployment.bind(ChildDeployment.bind())``, ``ParentDeployment`` doesn't restart if ``ChildDeployment`` replicas fail their health checks. When the ``ChildDeployment`` replicas recover, the handle in ``ParentDeployment`` updates automatically to route requests to the healthy replicas.
+:::
+
+### Replica constructor retries
+
+When a replica's constructor (the `__init__` method) fails, Ray Serve automatically retries creating the replica. You can configure this behavior in two ways:
+
+- **Per-deployment**: Use the `max_constructor_retry_count` option in `@serve.deployment()` to set the maximum retries for that deployment. Default is `20`.
+- **Per-replica**: Use the `RAY_SERVE_MAX_PER_REPLICA_RETRY_COUNT` environment variable to limit retries per replica. Default is `3`.
+
+The total maximum constructor retries for a deployment is `min(num_replicas * RAY_SERVE_MAX_PER_REPLICA_RETRY_COUNT, max_constructor_retry_count)`.
+
+For example:
+
+```python
+# Set max constructor retries for this deployment
+@serve.deployment(max_constructor_retry_count=10)
+class MyDeployment:
+    ...
 ```
 
 ### Worker node recovery
@@ -60,19 +100,15 @@ See Serve's [Kubernetes production guide](serve-in-production-kubernetes) to lea
 
 In this section, you'll learn how to add fault tolerance to Ray's Global Control Store (GCS), which allows your Serve application to serve traffic even when the head node crashes.
 
-By default, the Ray head node is a single point of failure: if it crashes, the entire Ray cluster crashes and must be restarted. When running on Kubernetes, the `RayService` controller health-checks the Ray cluster and restarts it if this occurs, but this introduces some downtime.
+By default, the Ray head node is a single point of failure: if it crashes, the entire Ray cluster crashes and you must restart it. When running on Kubernetes, the `RayService` controller health-checks the Ray cluster and restarts it if this occurs, but this introduces some downtime.
 
-In Ray 2.0, KubeRay added **experimental support** for [Global Control Store (GCS) fault tolerance](https://ray-project.github.io/kuberay/guidance/gcs-ft/#ray-gcs-fault-tolerancegcs-ft-experimental), preventing the Ray cluster from crashing if the head node goes down.
-While the head node is recovering, Serve applications can still handle traffic via worker nodes but cannot be updated or recover from other failures (e.g. actors or worker nodes crashing).
-Once the GCS is recovered, the cluster will return to normal behavior.
+Starting with Ray 2.0+, KubeRay supports [Global Control Store (GCS) fault tolerance](kuberay-gcs-ft), preventing the Ray cluster from crashing if the head node goes down. While the head node is recovering, Serve applications can still handle traffic with worker nodes but you can't update or recover from other failures like Actors or Worker nodes crashing. Once the GCS recovers, the cluster returns to normal behavior.
 
-You can enable GCS fault tolerance on KubeRay by adding an external Redis server and modifying your `RayService` Kubernetes object.
-
-Below, we explain how to do each of these.
+You can enable GCS fault tolerance on KubeRay by adding an external Redis server and modifying your `RayService` Kubernetes object with the following steps:
 
 #### Step 1: Add external Redis server
 
-GCS fault tolerance requires an external Redis database. You can choose to host your own Redis database, or you can use one through a third-party vendor. We recommend using a highly-available Redis database for resiliency.
+GCS fault tolerance requires an external Redis database. You can choose to host your own Redis database, or you can use one through a third-party vendor. Use a highly available Redis database for resiliency.
 
 **For development purposes**, you can also host a small Redis database on the same Kubernetes cluster as your Ray cluster. For example, you can add a 1-node Redis cluster by prepending these three Redis objects to your Kubernetes YAML:
 
@@ -141,7 +177,7 @@ spec:
 ---
 ```
 
-**This configuration is NOT production-ready**, but it is useful for development and testing. When you move to production, it's highly recommended that you replace this 1-node Redis cluster with a highly-available Redis cluster.
+**This configuration is NOT production-ready**, but it's useful for development and testing. When you move to production, it's highly recommended that you replace this 1-node Redis cluster with a highly available Redis cluster.
 
 #### Step 2: Add Redis info to RayService
 
@@ -154,7 +190,7 @@ First, you need to update your `RayService` metadata's annotations:
 :::{tab-item} Vanilla Config
 ```yaml
 ...
-apiVersion: ray.io/v1alpha1
+apiVersion: ray.io/v1
 kind: RayService
 metadata:
   name: rayservice-sample
@@ -167,7 +203,7 @@ spec:
 :selected:
 ```yaml
 ...
-apiVersion: ray.io/v1alpha1
+apiVersion: ray.io/v1
 kind: RayService
 metadata:
   name: rayservice-sample
@@ -182,8 +218,8 @@ spec:
 ::::
 
 The annotations are:
-* `ray.io/ft-enabled` (REQUIRED): Enables GCS fault tolerance when true
-* `ray.io/external-storage-namespace` (OPTIONAL): Sets the [external storage namespace]
+* `ray.io/ft-enabled` REQUIRED: Enables GCS fault tolerance when true
+* `ray.io/external-storage-namespace` OPTIONAL: Sets the [external storage namespace]
 
 Next, you need to add the `RAY_REDIS_ADDRESS` environment variable to the `headGroupSpec`:
 
@@ -192,7 +228,7 @@ Next, you need to add the `RAY_REDIS_ADDRESS` environment variable to the `headG
 :::{tab-item} Vanilla Config
 
 ```yaml
-apiVersion: ray.io/v1alpha1
+apiVersion: ray.io/v1
 kind: RayService
 metadata:
     ...
@@ -215,7 +251,7 @@ spec:
 :selected:
 
 ```yaml
-apiVersion: ray.io/v1alpha1
+apiVersion: ray.io/v1
 kind: RayService
 metadata:
     ...
@@ -244,8 +280,39 @@ In the example above, the Redis deployment name (`redis`) is the host within the
 After you apply the Redis objects along with your updated `RayService`, your Ray cluster can recover from head node crashes without restarting all the workers!
 
 :::{seealso}
-Check out the KubeRay guide on [GCS fault tolerance](https://ray-project.github.io/kuberay/guidance/gcs-ft/#ray-gcs-fault-tolerancegcs-ft-experimental) to learn more about how Serve leverages the external Redis cluster to provide head node fault tolerance.
+Check out the KubeRay guide on [GCS fault tolerance](kuberay-gcs-ft) to learn more about how Serve leverages the external Redis cluster to provide head node fault tolerance.
 :::
+
+### Spreading replicas across nodes
+
+One way to improve the availability of your Serve application is to spread deployment replicas across multiple nodes so that you still have enough running replicas to serve traffic even after a certain number of node failures.
+
+By default, Serve soft spreads all deployment replicas but it has a few limitations:
+
+* The spread is soft and best-effort with no guarantee that the it's perfectly even.
+
+* Serve tries to spread replicas among the existing nodes if possible instead of launching new nodes. For example, if you have a big enough single node cluster, Serve schedules all replicas on that single node assuming it has enough resources. However, that node becomes the single point of failure.
+
+You can change the spread behavior of your deployment with the `max_replicas_per_node` [deployment option](../../serve/api/doc/ray.serve.deployment_decorator.rst), which hard limits the number of replicas of a given deployment that can run on a single node. If you set it to 1 then you're effectively strict spreading the deployment replicas. If you don't set it then there's no hard spread constraint and Serve uses the default soft spread mentioned in the preceding paragraph. `max_replicas_per_node` option is per deployment and only affects the spread of replicas within a deployment. There's no spread between replicas of different deployments.
+
+The following code example shows how to set `max_replicas_per_node` deployment option:
+
+```python
+import ray
+from ray import serve
+
+@serve.deployment(max_replicas_per_node=1)
+class Deployment1:
+  def __call__(self, request):
+    return "hello"
+
+@serve.deployment(max_replicas_per_node=2)
+class Deployment2:
+  def __call__(self, request):
+    return "world"
+```
+
+This example has two Serve deployments with different `max_replicas_per_node`: `Deployment1` can have at most one replica on each node and `Deployment2` can have at most two replicas on each node. If you schedule two replicas of `Deployment1` and two replicas of `Deployment2`, Serve runs a cluster with at least two nodes, each running one replica of `Deployment1`. The two replicas of `Deployment2` may run on either a single node or across two nodes because either satisfies the `max_replicas_per_node` constraint.
 
 (serve-e2e-ft-behavior)=
 ## Serve's recovery procedures
@@ -435,7 +502,7 @@ total_actors: 10
 Table (group by class):
 ------------------------------------
     CLASS_NAME              STATE_COUNTS
-0   HTTPProxyActor          ALIVE: 3
+0   ProxyActor          ALIVE: 3
 1   ServeReplica:SleepyPid  ALIVE: 6
 2   ServeController         ALIVE: 1
 
@@ -454,13 +521,11 @@ Table:
 
 You can then kill the Serve controller via the Python interpreter. Note that you'll need to use the `NAME` from the `ray list actor` output to get a handle to the Serve controller.
 
-```console
-$ python
+```python
+import ray
 
->>> import ray
->>> controller_handle = ray.get_actor("SERVE_CONTROLLER_ACTOR", namespace="serve")
->>> ray.kill(controller_handle, no_restart=True)
->>> exit()
+controller_handle = ray.get_actor("SERVE_CONTROLLER_ACTOR", namespace="serve")
+ray.kill(controller_handle, no_restart=True)
 ```
 
 You can use the Ray State API to check the controller's status:
@@ -482,14 +547,14 @@ Table:
 
 You should still be able to query your deployments while the controller is recovering:
 
+```python
+# If you're running KubeRay, run this from inside the Pod.
+import requests
+
+print(requests.get("http://localhost:8000").json())
 ```
-# If you're running KubeRay, you
-# can do this from inside the pod:
 
-$ python
-
->>> import requests
->>> requests.get("http://localhost:8000").json()
+```text
 347
 ```
 
@@ -499,7 +564,7 @@ While the controller is dead, replica health-checking and deployment autoscaling
 
 ### Deployment replica failure
 
-You can simulate replica failures by manually killing deployment replicas. If you're running KubeRay, make sure to `exec` into a Ray pod before running these commands.
+You can simulate replica failures by manually killing deployment replicas. If you're running KubeRay, make sure to `exec` into one of the RayCluster's Pods before running these commands.
 
 ```console
 $ ray summary actors
@@ -513,7 +578,7 @@ total_actors: 11
 Table (group by class):
 ------------------------------------
     CLASS_NAME              STATE_COUNTS
-0   HTTPProxyActor          ALIVE: 3
+0   ProxyActor          ALIVE: 3
 1   ServeController         ALIVE: 1
 2   ServeReplica:SleepyPid  ALIVE: 6
 
@@ -537,28 +602,28 @@ Table:
 
 You can use the `NAME` from the `ray list actor` output to get a handle to one of the replicas:
 
-```console
-$ python
+```python
+import ray
 
->>> import ray
->>> replica_handle = ray.get_actor("SERVE_REPLICA::SleepyPid#RlRptP", namespace="serve")
->>> ray.kill(replica_handle, no_restart=True)
->>> exit()
+replica_handle = ray.get_actor("SERVE_REPLICA::SleepyPid#RlRptP", namespace="serve")
+ray.kill(replica_handle, no_restart=True)
 ```
 
 While the replica is restarted, the other replicas can continue processing requests. Eventually the replica restarts and continues serving requests:
 
-```console
-$ python
+```python
+import requests
 
->>> import requests
->>> requests.get("http://localhost:8000").json()
+print(requests.get("http://localhost:8000").json())
+```
+
+```text
 383
 ```
 
-### HTTPProxy failure
+### Proxy failure
 
-You can simulate HTTPProxy failures by manually killing deployment replicas. If you're running KubeRay, make sure to `exec` into a Ray pod before running these commands.
+You can simulate Proxy failures by manually killing `ProxyActor` actors. If you're running KubeRay, make sure to `exec` into one of the RayCluster's Pods before running these commands.
 
 ```console
 $ ray summary actors
@@ -572,11 +637,11 @@ total_actors: 12
 Table (group by class):
 ------------------------------------
     CLASS_NAME              STATE_COUNTS
-0   HTTPProxyActor          ALIVE: 3
+0   ProxyActor          ALIVE: 3
 1   ServeController         ALIVE: 1
 2   ServeReplica:SleepyPid  ALIVE: 6
 
-$ ray list actors --filter "class_name=HTTPProxyActor"
+$ ray list actors --filter "class_name=ProxyActor"
 
 ======== List: 2022-10-04 21:52:39.853758 ========
 Stats:
@@ -586,26 +651,24 @@ Total: 3
 Table:
 ------------------------------
     ACTOR_ID                          CLASS_NAME      STATE    NAME                                                                                                 PID
- 0  283fc11beebb6149deb608eb01000000  HTTPProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-91f9a685e662313a0075efcb7fd894249a5bdae7ee88837bea7985a0    101
- 1  2b010ce28baeff5cb6cb161e01000000  HTTPProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-cc262f3dba544a49ea617d5611789b5613f8fe8c86018ef23c0131eb    133
- 2  7abce9dd241b089c1172e9ca01000000  HTTPProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-7589773fc62e08c2679847aee9416805bbbf260bee25331fa3389c4f    267
+ 0  283fc11beebb6149deb608eb01000000  ProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-91f9a685e662313a0075efcb7fd894249a5bdae7ee88837bea7985a0    101
+ 1  2b010ce28baeff5cb6cb161e01000000  ProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-cc262f3dba544a49ea617d5611789b5613f8fe8c86018ef23c0131eb    133
+ 2  7abce9dd241b089c1172e9ca01000000  ProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-7589773fc62e08c2679847aee9416805bbbf260bee25331fa3389c4f    267
 ```
 
 You can use the `NAME` from the `ray list actor` output to get a handle to one of the replicas:
 
-```console
-$ python
+```python
+import ray
 
->>> import ray
->>> proxy_handle = ray.get_actor("SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-91f9a685e662313a0075efcb7fd894249a5bdae7ee88837bea7985a0", namespace="serve")
->>> ray.kill(proxy_handle, no_restart=False)
->>> exit()
+proxy_handle = ray.get_actor("SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-91f9a685e662313a0075efcb7fd894249a5bdae7ee88837bea7985a0", namespace="serve")
+ray.kill(proxy_handle, no_restart=False)
 ```
 
 While the proxy is restarted, the other proxies can continue accepting requests. Eventually the proxy restarts and continues accepting requests. You can use the `ray list actor` command to see when the proxy restarts:
 
 ```console
-$ ray list actors --filter "class_name=HTTPProxyActor"
+$ ray list actors --filter "class_name=ProxyActor"
 
 ======== List: 2022-10-04 21:58:41.193966 ========
 Stats:
@@ -615,12 +678,41 @@ Total: 3
 Table:
 ------------------------------
     ACTOR_ID                          CLASS_NAME      STATE    NAME                                                                                                 PID
- 0  283fc11beebb6149deb608eb01000000  HTTPProxyActor  ALIVE     SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-91f9a685e662313a0075efcb7fd894249a5bdae7ee88837bea7985a0  57317
- 1  2b010ce28baeff5cb6cb161e01000000  HTTPProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-cc262f3dba544a49ea617d5611789b5613f8fe8c86018ef23c0131eb    133
- 2  7abce9dd241b089c1172e9ca01000000  HTTPProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-7589773fc62e08c2679847aee9416805bbbf260bee25331fa3389c4f    267
+ 0  283fc11beebb6149deb608eb01000000  ProxyActor  ALIVE     SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-91f9a685e662313a0075efcb7fd894249a5bdae7ee88837bea7985a0  57317
+ 1  2b010ce28baeff5cb6cb161e01000000  ProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-cc262f3dba544a49ea617d5611789b5613f8fe8c86018ef23c0131eb    133
+ 2  7abce9dd241b089c1172e9ca01000000  ProxyActor  ALIVE    SERVE_CONTROLLER_ACTOR:SERVE_PROXY_ACTOR-7589773fc62e08c2679847aee9416805bbbf260bee25331fa3389c4f    267
 ```
 
-Note that the PID for the first HTTPProxyActor has changed, indicating that it restarted.
+Note that the PID for the first ProxyActor has changed, indicating that it restarted.
 
-[KubeRay]: https://ray-project.github.io/kuberay/
-[external storage namespace]: https://ray-project.github.io/kuberay/guidance/gcs-ft/#external-storage-namespace
+## Environment variables
+
+These environment variables control fault tolerance-related behavior. Set them before starting Ray.
+
+### `RAY_SERVE_KV_TIMEOUT_S`
+
+**Default**: None (no timeout)
+
+Ray Serve persists deployment configurations and state in the Global Control Store (GCS) using its internal KV interface. Each read and write to the GCS KV store uses this timeout. By default, no timeout is set and these operations block until the GCS responds. If the GCS becomes unavailable (for example, during a head node restart), Serve operations that depend on the KV store — such as fetching or updating deployment configs — hang until the GCS recovers.
+
+Setting this value causes those operations to fail fast with a timeout error instead of blocking indefinitely, allowing Serve to detect GCS failures and trigger recovery sooner.
+
+```bash
+export RAY_SERVE_KV_TIMEOUT_S=5
+```
+
+### `LISTEN_FOR_CHANGE_REQUEST_TIMEOUT_S_LOWER_BOUND` / `LISTEN_FOR_CHANGE_REQUEST_TIMEOUT_S_UPPER_BOUND`
+
+**Defaults**: `30` / `60` seconds
+
+Ray Serve uses a long-polling mechanism for replicas and proxies to receive configuration updates from the controller. Each long-poll request uses a random timeout between the lower and upper bounds to avoid thundering herd problems when many clients poll simultaneously.
+
+```bash
+export LISTEN_FOR_CHANGE_REQUEST_TIMEOUT_S_LOWER_BOUND=10
+export LISTEN_FOR_CHANGE_REQUEST_TIMEOUT_S_UPPER_BOUND=30
+```
+
+Decreasing these values makes replicas and proxies detect controller changes faster, which can speed up recovery after controller restarts. Increasing them reduces the frequency of long-poll requests to the controller.
+
+[KubeRay]: kuberay-index
+[external storage namespace]: kuberay-external-storage-namespace

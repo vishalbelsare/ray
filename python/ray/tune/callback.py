@@ -1,14 +1,14 @@
-from abc import ABCMeta
 import glob
-import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import warnings
+from abc import ABCMeta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from ray.util.annotations import PublicAPI, DeveloperAPI
+import ray.tune
 from ray.tune.utils.util import _atomic_save, _load_newest_checkpoint
+from ray.util.annotations import DeveloperAPI, PublicAPI
 
 if TYPE_CHECKING:
-    from ray.air._internal.checkpoint_manager import _TrackedCheckpoint
     from ray.tune.experiment import Trial
     from ray.tune.stopper import Stopper
 
@@ -30,14 +30,12 @@ class _CallbackMeta(ABCMeta):
     def need_check(
         mcs, cls: type, name: str, bases: Tuple[type], attrs: Dict[str, Any]
     ) -> bool:
-
         return attrs.get("IS_CALLBACK_CONTAINER", False)
 
     @classmethod
     def check(
         mcs, cls: type, name: str, bases: Tuple[type], attrs: Dict[str, Any]
     ) -> None:
-
         methods = set()
         for base in bases:
             methods.update(
@@ -70,41 +68,39 @@ class _CallbackMeta(ABCMeta):
 
 @PublicAPI(stability="beta")
 class Callback(metaclass=_CallbackMeta):
-    """Tune base callback that can be extended and passed to a ``TrialRunner``
+    """Tune base callback that can be extended and passed to ``RunConfig(callbacks=...)``
 
-    Tune callbacks are called from within the ``TrialRunner`` class. There are
+    Tune callbacks are called from within the ``TuneController`` class. There are
     several hooks that can be used, all of which are found in the submethod
     definitions of this base class.
 
     The parameters passed to the ``**info`` dict vary between hooks. The
     parameters passed are described in the docstrings of the methods.
 
-    This example will print a metric each time a result is received:
+    Examples:
+        This example will print a metric each time a result is received:
 
-    .. code-block:: python
-
-        from ray import air, tune
-        from ray.tune import Callback
-
-
-        class MyCallback(Callback):
-            def on_trial_result(self, iteration, trials, trial, result,
-                                **info):
-                print(f"Got result: {result['metric']}")
-
-
-        def train(config):
-            for i in range(10):
-                tune.report(metric=i)
-
-        tuner = tune.Tuner(
-            train,
-            run_config=air.RunConfig(
-                callbacks=[MyCallback()]
-            )
-        )
-        tuner.fit()
-
+        >>> from ray import tune
+        >>> from ray.tune import Callback
+        >>> class MyCallback(Callback):
+        ...     def on_trial_result(self, iteration, trials, trial, result,
+        ...                         **info):
+        ...         print(f"Got result: {result['metric']}")
+        >>> def train_func(config):
+        ...     for i in range(10):
+        ...         tune.report({"metric": i})
+        >>> tuner = tune.Tuner(
+        ...     train_func,
+        ...     run_config=tune.RunConfig(
+        ...         callbacks=[MyCallback()]
+        ...     )
+        ... )
+        >>> print("[ignore]"); results = tuner.fit()  # doctest: +ELLIPSIS
+        [ignore]...
+        Got result: 0
+        ...
+        Got result: 9
+        ...
     """
 
     # File templates for any artifacts written by this callback
@@ -127,7 +123,7 @@ class Callback(metaclass=_CallbackMeta):
 
         Arguments:
             stop: Stopping criteria.
-                If ``time_budget_s`` was passed to ``air.RunConfig``, a
+                If ``time_budget_s`` was passed to ``tune.RunConfig``, a
                 ``TimeoutStopper`` will be passed here, either by itself
                 or as a part of a ``CombinedStopper``.
             num_samples: Number of times to sample from the
@@ -241,6 +237,22 @@ class Callback(metaclass=_CallbackMeta):
         """
         pass
 
+    def on_trial_recover(
+        self, iteration: int, trials: List["Trial"], trial: "Trial", **info
+    ):
+        """Called after a trial instance failed (errored) but the trial is scheduled
+        for retry.
+
+        The search algorithm and scheduler are not notified.
+
+        Arguments:
+            iteration: Number of iterations of the tuning loop.
+            trials: List of trials.
+            trial: Trial that just has errored.
+            **info: Kwargs dict for forward compatibility.
+        """
+        pass
+
     def on_trial_error(
         self, iteration: int, trials: List["Trial"], trial: "Trial", **info
     ):
@@ -262,7 +274,7 @@ class Callback(metaclass=_CallbackMeta):
         iteration: int,
         trials: List["Trial"],
         trial: "Trial",
-        checkpoint: "_TrackedCheckpoint",
+        checkpoint: "ray.tune.Checkpoint",
         **info,
     ):
         """Called after a trial saved a checkpoint with Tune.
@@ -296,27 +308,21 @@ class Callback(metaclass=_CallbackMeta):
         Upon :ref:`Tune experiment restoration <tune-experiment-level-fault-tolerance>`,
         callback state will be restored via :meth:`~ray.tune.Callback.set_state`.
 
-        .. code-block:: python
-
-            from typing import Dict, List, Optional
-
-            from ray.tune import Callback
-            from ray.tune.experiment import Trial
-
-            class MyCallback(Callback):
-                def __init__(self):
-                    self._trial_ids = set()
-
-                def on_trial_start(
-                    self, iteration: int, trials: List["Trial"], trial: "Trial", **info
-                ):
-                    self._trial_ids.add(trial.trial_id)
-
-                def get_state(self) -> Optional[Dict]:
-                    return {"trial_ids": self._trial_ids.copy()}
-
-                def set_state(self, state: Dict) -> Optional[Dict]:
-                    self._trial_ids = state["trial_ids"]
+        Examples:
+            >>> from typing import Dict, List, Optional
+            >>> from ray.tune import Callback
+            >>> from ray.tune.experiment import Trial
+            >>> class MyCallback(Callback):
+            ...     def __init__(self):
+            ...         self._trial_ids = set()
+            ...     def on_trial_start(
+            ...         self, iteration: int, trials: List["Trial"], trial: "Trial", **info
+            ...     ):
+            ...         self._trial_ids.add(trial.trial_id)
+            ...     def get_state(self) -> Optional[Dict]:
+            ...         return {"trial_ids": self._trial_ids.copy()}
+            ...     def set_state(self, state: Dict) -> Optional[Dict]:
+            ...         self._trial_ids = state["trial_ids"]
 
         Returns:
             dict: State of the callback. Should be `None` if the callback does not
@@ -395,6 +401,10 @@ class CallbackList(Callback):
         for callback in self._callbacks:
             callback.on_trial_complete(**info)
 
+    def on_trial_recover(self, **info):
+        for callback in self._callbacks:
+            callback.on_trial_recover(**info)
+
     def on_trial_error(self, **info):
         for callback in self._callbacks:
             callback.on_trial_error(**info)
@@ -442,7 +452,7 @@ class CallbackList(Callback):
 
         if state_dict:
             file_name = self.CKPT_FILE_TMPL.format(session_str)
-            tmp_file_name = f".tmp-{file_name}"
+            tmp_file_name = f"tmp-{file_name}"
             _atomic_save(
                 state=state_dict,
                 checkpoint_dir=checkpoint_dir,
@@ -475,12 +485,15 @@ class CallbackList(Callback):
     def can_restore(self, checkpoint_dir: str) -> bool:
         """Check if the checkpoint_dir contains the saved state for this callback list.
 
+        Args:
+            checkpoint_dir: Directory to look for a saved state file in.
+
         Returns:
             can_restore: True if the checkpoint_dir contains a file of the
                 format `CKPT_FILE_TMPL`. False otherwise.
         """
-        return bool(
-            glob.glob(os.path.join(checkpoint_dir, self.CKPT_FILE_TMPL.format("*")))
+        return any(
+            glob.iglob(Path(checkpoint_dir, self.CKPT_FILE_TMPL.format("*")).as_posix())
         )
 
     def __len__(self) -> int:

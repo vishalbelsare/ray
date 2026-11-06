@@ -1,21 +1,23 @@
-import argparse
+import os
 
-import numpy as np
-import pandas as pd
-import tensorflow as tf
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+import argparse
+import sys
 
 import ray
-from ray.air import session
-from ray.air.integrations.keras import ReportCheckpointCallback
-from ray.air.result import Result
-from ray.data import Dataset
+from ray import train
 from ray.data.preprocessors import Concatenator
-from ray.train.batch_predictor import BatchPredictor
-from ray.train.tensorflow import (
-    TensorflowPredictor,
-    TensorflowTrainer,
-)
-from ray.air.config import ScalingConfig
+from ray.train import Result, ScalingConfig
+
+if sys.version_info >= (3, 12):
+    # Skip this test in Python 3.12+ because TensorFlow is not supported.
+    sys.exit(0)
+else:
+    import tensorflow as tf
+
+    from ray.train.tensorflow import TensorflowTrainer
+    from ray.train.tensorflow.keras import ReportCheckpointCallback
 
 
 def build_model() -> tf.keras.Model:
@@ -43,7 +45,7 @@ def train_func(config: dict):
             metrics=[tf.keras.metrics.mean_squared_error],
         )
 
-    dataset = session.get_dataset_shard("train")
+    dataset = train.get_dataset_shard("train")
 
     results = []
     for _ in range(epochs):
@@ -59,7 +61,8 @@ def train_func(config: dict):
 
 def train_tensorflow_regression(num_workers: int = 2, use_gpu: bool = False) -> Result:
     dataset = ray.data.read_csv("s3://anonymous@air-example-data/regression.csv")
-    preprocessor = Concatenator(exclude=["", "y"], output_column_name="x")
+    columns_to_concatenate = [f"x{i:03}" for i in range(100)]
+    preprocessor = Concatenator(columns=columns_to_concatenate, output_column_name="x")
     dataset = preprocessor.fit_transform(dataset)
 
     config = {"lr": 1e-3, "batch_size": 32, "epochs": 4}
@@ -73,24 +76,6 @@ def train_tensorflow_regression(num_workers: int = 2, use_gpu: bool = False) -> 
     results = trainer.fit()
     print(results.metrics)
     return results
-
-
-def predict_regression(result: Result) -> Dataset:
-    batch_predictor = BatchPredictor.from_checkpoint(
-        result.checkpoint, TensorflowPredictor, model_definition=build_model
-    )
-
-    df = pd.DataFrame(
-        [[np.random.uniform(0, 1, size=100)] for i in range(100)], columns=["x"]
-    )
-    prediction_dataset = ray.data.from_pandas(df)
-
-    predictions = batch_predictor.predict(prediction_dataset, dtype=tf.float32)
-
-    print("PREDICTIONS")
-    predictions.show()
-
-    return predictions
 
 
 if __name__ == "__main__":
@@ -127,4 +112,4 @@ if __name__ == "__main__":
         result = train_tensorflow_regression(
             num_workers=args.num_workers, use_gpu=args.use_gpu
         )
-    predict_regression(result)
+    print(result)

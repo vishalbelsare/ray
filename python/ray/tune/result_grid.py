@@ -1,15 +1,13 @@
-from functools import partial
-import os
-import pandas as pd
 from typing import Optional, Union
 
+import pandas as pd
+import pyarrow
+
 from ray.air.result import Result
-from ray.cloudpickle import cloudpickle
 from ray.exceptions import RayTaskError
 from ray.tune.analysis import ExperimentAnalysis
 from ray.tune.error import TuneError
 from ray.tune.experiment import Trial
-from ray.tune.trainable.util import TrainableUtil
 from ray.util import PublicAPI
 
 
@@ -22,28 +20,29 @@ class ResultGrid:
     The constructor is a private API. This object can only be created as a result of
     ``Tuner.fit()``.
 
-    Example:
-         >>> import random
-         >>> from ray import air, tune
-         >>> def random_error_trainable(config):
-         ...     if random.random() < 0.5:
-         ...         return {"loss": 0.0}
-         ...     else:
-         ...         raise ValueError("This is an error")
-         >>> tuner = tune.Tuner(
-         ...     random_error_trainable,
-         ...     run_config=air.RunConfig(name="example-experiment"),
-         ...     tune_config=tune.TuneConfig(num_samples=10),
-         ... )
-         >>> result_grid = tuner.fit()  # doctest: +SKIP
-         >>> for i in range(len(result_grid)): # doctest: +SKIP
-         ...     result = result_grid[i]
-         ...     if not result.error:
-         ...             print(f"Trial finishes successfully with metrics"
-         ...                f"{result.metrics}.")
-         ...     else:
-         ...             print(f"Trial failed with error {result.error}.")
-
+    Examples:
+        >>> import random
+        >>> from ray import tune
+        >>> def random_error_trainable(config):
+        ...     if random.random() < 0.5:
+        ...         return {"loss": 0.0}
+        ...     else:
+        ...         raise ValueError("This is an error")
+        >>> tuner = tune.Tuner(
+        ...     random_error_trainable,
+        ...     run_config=tune.RunConfig(name="example-experiment"),
+        ...     tune_config=tune.TuneConfig(num_samples=10),
+        ... )
+        >>> print("[ignore]"); result_grid = tuner.fit()  # doctest: +ELLIPSIS
+        [ignore]...
+        >>> for i in range(len(result_grid)):
+        ...     result = result_grid[i]
+        ...     if not result.error:
+        ...         print(f"Trial finishes successfully with metrics "
+        ...               f"{result.metrics}.")
+        ...     else:
+        ...         print(f"Trial failed with error {result.error}.")
+        Trial ...
 
     You can also use ``result_grid`` for more advanced analysis.
 
@@ -55,45 +54,47 @@ class ResultGrid:
     >>> # Get a dataframe for the last reported results of all of the trials
     >>> df = result_grid.get_dataframe() # doctest: +SKIP
     >>> # Get a dataframe for the minimum loss seen for each trial
-    >>> df = result_grid.get_dataframe(metric="loss", mode="min") # doctest: +SKIP
+    >>> df = result_grid.get_dataframe( # doctest: +SKIP
+    ...     filter_metric="loss", filter_mode="min")
 
     Note that trials of all statuses are included in the final result grid.
     If a trial is not in terminated state, its latest result and checkpoint as
     seen by Tune will be provided.
 
-    See :doc:`/tune/examples/tune_analyze_results` for more usage examples.
+    See :doc:`/tune/examples/tune-analyze-results` for more usage examples.
     """
 
     def __init__(
         self,
         experiment_analysis: ExperimentAnalysis,
     ):
+        """Initialize a ``ResultGrid`` from an ``ExperimentAnalysis``.
+
+        Args:
+            experiment_analysis: The ``ExperimentAnalysis`` produced by the
+                completed Tune run, used to build the per-trial ``Result`` list.
+        """
         self._experiment_analysis = experiment_analysis
         self._results = [
             self._trial_to_result(trial) for trial in self._experiment_analysis.trials
         ]
 
     @property
-    def _local_path(self) -> str:
-        """Return path pointing to the experiment directory on the local disk."""
-        return self._experiment_analysis._local_path
-
-    @property
-    def _remote_path(self) -> Optional[str]:
-        """Return path pointing to the experiment directory on remote storage."""
-        return self._experiment_analysis._remote_path
-
-    @property
     def experiment_path(self) -> str:
         """Path pointing to the experiment directory on persistent storage.
 
         This can point to a remote storage location (e.g. S3) or to a local
-        location (path on the head node).
+        location (path on the head node)."""
+        return self._experiment_analysis.experiment_path
 
-        For instance, if your remote storage path is ``s3://bucket/location``,
-        this will point to ``s3://bucket/location/experiment_name``.
+    @property
+    def filesystem(self) -> pyarrow.fs.FileSystem:
+        """Return the filesystem that can be used to access the experiment path.
+
+        Returns:
+            pyarrow.fs.FileSystem implementation.
         """
-        return self._remote_path or self._local_path
+        return self._experiment_analysis._fs
 
     def get_best_result(
         self,
@@ -104,9 +105,21 @@ class ResultGrid:
     ) -> Result:
         """Get the best result from all the trials run.
 
+        For metrics that are reported in a nested dict, use a slash-separated
+        flat key to refer to the nested entry. For example, if a trial reports
+        ``{"eval": {"metrics": {"loss": 0.1}}}``, pass ``metric="eval/metrics/loss"``:
+
+        >>> best_result = result_grid.get_best_result( # doctest: +SKIP
+        ...     metric="eval/metrics/loss", mode="min")
+
+        This works because Tune flattens reported result dicts with ``/`` as the
+        default delimiter before tracking metrics.
+
         Args:
             metric: Key for trial info to order on. Defaults to
                 the metric specified in your Tuner's ``TuneConfig``.
+                For nested metrics, use a slash-separated flat key
+                (e.g. ``"eval/metrics/loss"``).
             mode: One of [min, max]. Defaults to the mode specified
                 in your Tuner's ``TuneConfig``.
             scope: One of [all, last, avg, last-5-avg, last-10-avg].
@@ -122,6 +135,10 @@ class ResultGrid:
             filter_nan_and_inf: If True (default), NaN or infinite
                 values are disregarded and these trials are never selected as
                 the best trial.
+
+        Returns:
+            The ``Result`` corresponding to the best trial under the given
+            metric, mode, and scope.
         """
         if len(self._experiment_analysis.trials) == 1:
             return self._trial_to_result(self._experiment_analysis.trials[0])
@@ -176,19 +193,21 @@ class ResultGrid:
         maximal is returned.
 
 
-        Example:
-
-            .. code-block:: python
-
-                result_grid = Tuner.fit(...)
-
-                # Get last reported results per trial
-                df = result_grid.get_dataframe()
-
-                # Get best ever reported accuracy per trial
-                df = result_grid.get_dataframe(
-                    filter_metric="accuracy", filter_mode="max"
-                )
+        Examples:
+            >>> import ray.tune
+            >>> def training_loop_per_worker(config):
+            ...     ray.tune.report({"accuracy": 0.8})
+            >>> print("[ignore]"); result_grid = ray.tune.Tuner(  # doctest: +ELLIPSIS
+            ...     trainable=training_loop_per_worker,
+            ...     run_config=ray.tune.RunConfig(name="my_tune_run")
+            ... ).fit()
+            [ignore]...
+            >>> # Get last reported results per trial
+            >>> df = result_grid.get_dataframe()
+            >>> # Get best ever reported accuracy per trial
+            >>> df = result_grid.get_dataframe(
+            ...     filter_metric="accuracy", filter_mode="max"
+            ... )
 
         Args:
             filter_metric: Metric to filter best result for.
@@ -234,47 +253,30 @@ class ResultGrid:
 
     @staticmethod
     def _populate_exception(trial: Trial) -> Optional[Union[TuneError, RayTaskError]]:
-        if trial.pickled_error_file and os.path.exists(trial.pickled_error_file):
-            with open(trial.pickled_error_file, "rb") as f:
-                e = cloudpickle.load(f)
-                return e
-        elif trial.error_file and os.path.exists(trial.error_file):
-            with open(trial.error_file, "r") as f:
-                return TuneError(f.read())
-        return None
+        if trial.status == Trial.TERMINATED:
+            return None
+        return trial.get_pickled_error() or trial.get_error()
 
     def _trial_to_result(self, trial: Trial) -> Result:
-        local_to_remote_path_fn = (
-            partial(
-                TrainableUtil.get_remote_storage_path,
-                local_path_prefix=trial.local_path,
-                remote_path_prefix=trial.remote_path,
-            )
-            if trial.uses_cloud_checkpointing
-            else None
-        )
-        checkpoint = trial.checkpoint.to_air_checkpoint(
-            local_to_remote_path_fn,
-        )
+        cpm = trial.run_metadata.checkpoint_manager
+        checkpoint = None
+        if cpm.latest_checkpoint_result:
+            checkpoint = cpm.latest_checkpoint_result.checkpoint
+        best_checkpoint_results = cpm.best_checkpoint_results
         best_checkpoints = [
-            (
-                checkpoint.to_air_checkpoint(local_to_remote_path_fn),
-                checkpoint.metrics,
-            )
-            for checkpoint in trial.get_trial_checkpoints()
+            (checkpoint_result.checkpoint, checkpoint_result.metrics)
+            for checkpoint_result in best_checkpoint_results
         ]
+
+        metrics_df = self._experiment_analysis.trial_dataframes.get(trial.trial_id)
 
         result = Result(
             checkpoint=checkpoint,
             metrics=trial.last_result.copy(),
             error=self._populate_exception(trial),
-            _local_path=trial.local_path,
-            _remote_path=trial.remote_path,
-            metrics_dataframe=self._experiment_analysis.trial_dataframes.get(
-                trial.local_path
-            )
-            if self._experiment_analysis.trial_dataframes
-            else None,
+            path=trial.path,
+            _storage_filesystem=self._experiment_analysis._fs,
+            metrics_dataframe=metrics_df,
             best_checkpoints=best_checkpoints,
         )
         return result

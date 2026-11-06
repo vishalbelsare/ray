@@ -1,40 +1,41 @@
-from typing import Callable, Dict, Optional, Tuple, Union
-from copy import deepcopy
 import logging
+from copy import deepcopy
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
 
 from ray.tune import TuneError
-from ray.tune.execution import trial_runner
 from ray.tune.experiment import Trial
 from ray.tune.schedulers import PopulationBasedTraining
 from ray.tune.schedulers.pbt import _PBTTrialState
 from ray.tune.utils.util import flatten_dict, unflatten_dict
 from ray.util.debug import log_once
 
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
+
 
 def import_pb2_dependencies():
-    try:
-        import GPy
-    except ImportError:
-        GPy = None
     try:
         import sklearn
     except ImportError:
         sklearn = None
-    return GPy, sklearn
+    return sklearn
 
 
-GPy, has_sklearn = import_pb2_dependencies()
+has_sklearn = import_pb2_dependencies()
 
-if GPy and has_sklearn:
+if has_sklearn:
+    from sklearn.gaussian_process import GaussianProcessRegressor
+
     from ray.tune.schedulers.pb2_utils import (
+        UCB,
+        TV_SquaredExp,
         normalize,
         optimize_acq,
         select_length,
-        UCB,
         standardize,
-        TV_SquaredExp,
     )
 
 logger = logging.getLogger(__name__)
@@ -99,7 +100,7 @@ def _select_config(
         bounds: Bounds for the hyperparameters. Used to normalize.
         num_f: The number of fixed params. Almost always 2 (reward+time)
 
-    Return:
+    Returns:
         xt: A vector of new hyperparameters.
     """
     length = select_length(Xraw, yraw, bounds, num_f)
@@ -119,26 +120,20 @@ def _select_config(
 
     fixed = normalize(newpoint, oldpoints)
 
-    kernel = TV_SquaredExp(
-        input_dim=X.shape[1], variance=1.0, lengthscale=1.0, epsilon=0.1
-    )
+    kernel = TV_SquaredExp(variance=1.0, lengthscale=1.0, epsilon=0.1)
 
     try:
-        m = GPy.models.GPRegression(X, y, kernel)
+        m = GaussianProcessRegressor(
+            kernel=kernel, optimizer="fmin_l_bfgs_b", alpha=1e-10
+        )
+        m.fit(X, y)
     except np.linalg.LinAlgError:
         # add diagonal ** we would ideally make this something more robust...
         X += np.eye(X.shape[0]) * 1e-3
-        m = GPy.models.GPRegression(X, y, kernel)
-
-    try:
-        m.optimize()
-    except np.linalg.LinAlgError:
-        # add diagonal ** we would ideally make this something more robust...
-        X += np.eye(X.shape[0]) * 1e-3
-        m = GPy.models.GPRegression(X, y, kernel)
-        m.optimize()
-
-    m.kern.lengthscale.fix(m.kern.lengthscale.clip(1e-5, 1))
+        m = GaussianProcessRegressor(
+            kernel=kernel, optimizer="fmin_l_bfgs_b", alpha=1e-10
+        )
+        m.fit(X, y)
 
     if current is None:
         m1 = deepcopy(m)
@@ -153,13 +148,11 @@ def _select_config(
         ypad = ypad.reshape(-1, 1)
         ynew = np.vstack((y, ypad))
 
-        # kernel = GPy.kern.RBF(input_dim=X.shape[1], variance=1.,
-        # lengthscale=1.)
-        kernel = TV_SquaredExp(
-            input_dim=X.shape[1], variance=1.0, lengthscale=1.0, epsilon=0.1
+        kernel1 = TV_SquaredExp(variance=1.0, lengthscale=1.0, epsilon=0.1)
+        m1 = GaussianProcessRegressor(
+            kernel=kernel1, optimizer="fmin_l_bfgs_b", alpha=1e-10
         )
-        m1 = GPy.models.GPRegression(Xnew, ynew, kernel)
-        m1.optimize()
+        m1.fit(Xnew, ynew)
 
     xt = optimize_acq(UCB, m, m1, fixed, num_f)
 
@@ -225,18 +218,18 @@ def _explore(
 
         new_config = config.copy()
         values = []
+        # Cast types for new hyperparameters.
         for i, col in enumerate(hparams.columns):
-            if isinstance(config[col], int):
-                new_config[col] = int(new[i])
-                values.append(int(new[i]))
-            else:
-                new_config[col] = new[i]
-                values.append(new[i])
+            # Use the type from the old config. Like this types
+            # should be passed on from the first config downwards.
+            type_ = type(config[col])
+            new_config[col] = type_(new[i])
+            values.append(type_(new[i]))
 
         new_T = df[df["Trial"] == str(base)].iloc[-1, :]["Time"]
         new_Reward = df[df["Trial"] == str(base)].iloc[-1, :].Reward
 
-        lst = [[old] + [new_T] + values + [new_Reward]]
+        lst = [[str(old)] + [new_T] + values + [new_Reward]]
         cols = ["Trial", "Time"] + list(bounds) + ["Reward"]
         new_entry = pd.DataFrame(lst, columns=cols)
 
@@ -279,6 +272,14 @@ class PB2(PopulationBasedTraining):
             Note that you can pass in something non-temporal such as
             `training_iteration` as a measure of progress, the only requirement
             is that the attribute should increase monotonically.
+            Valid values are any key reported in the result dict by your
+            trainable. The auto-filled keys ``"training_iteration"`` (the
+            iteration count) and ``"time_total_s"`` (wall-clock seconds since
+            the trial started) always work; any additional numeric, monotonic
+            key your trainable reports via ``tune.report({...})`` is also valid
+            (for example ``"timesteps_total"`` or a custom progress counter).
+            Passing a key that is not present in the reported result causes
+            the scheduler to skip its decision for that step.
         metric: The training result objective value attribute. Stopping
             procedures will use this attribute.
         mode: One of {min, max}. Determines whether objective is
@@ -298,10 +299,6 @@ class PB2(PopulationBasedTraining):
             `quantile_fraction` fraction of trials to the bottom
             `quantile_fraction` fraction. Needs to be between 0 and 0.5.
             Setting it to 0 essentially implies doing no exploitation at all.
-        custom_explore_fn: You can also specify a custom exploration
-            function. This function is invoked as `f(config)`, where the input
-            is the new config generated by Bayesian Optimization. This function
-            should return the `config` updated as needed.
         log_config: Whether to log the ray config of each model to
             local_dir at each exploit. Allows config schedule to be
             reconstructed.
@@ -315,6 +312,10 @@ class PB2(PopulationBasedTraining):
             synced at the same time_attr every perturbation_interval.
             Defaults to False. See Appendix A.1 here
             https://arxiv.org/pdf/1711.09846.pdf.
+        custom_explore_fn: You can also specify a custom exploration
+            function. This function is invoked as `f(config)`, where the input
+            is the new config generated by Bayesian Optimization. This function
+            should return the `config` updated as needed.
 
     Example:
 
@@ -323,7 +324,6 @@ class PB2(PopulationBasedTraining):
             from ray import tune
             from ray.tune.schedulers.pb2 import PB2
             from ray.tune.examples.pbt_function import pbt_function
-            # run "pip install gpy" to use PB2
 
             pb2 = PB2(
                 metric="mean_accuracy",
@@ -357,10 +357,7 @@ class PB2(PopulationBasedTraining):
         custom_explore_fn: Optional[Callable[[dict], dict]] = None,
     ):
 
-        gpy_available, sklearn_available = import_pb2_dependencies()
-        if not gpy_available:
-            raise RuntimeError("Please install GPy to use PB2.")
-
+        sklearn_available = import_pb2_dependencies()
         if not sklearn_available:
             raise RuntimeError("Please install scikit-learn to use PB2.")
 
@@ -399,14 +396,18 @@ class PB2(PopulationBasedTraining):
         #           are already in or scheduled to be in the next round.
         self.current = None
 
-    def on_trial_add(self, trial_runner: "trial_runner.TrialRunner", trial: Trial):
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial):
         filled_hyperparams = _fill_config(trial.config, self._hyperparam_bounds)
         # Make sure that the params we sampled show up in the CLI output
         trial.evaluated_params.update(flatten_dict(filled_hyperparams))
-        super().on_trial_add(trial_runner, trial)
+        super().on_trial_add(tune_controller, trial)
 
     def _validate_hyperparam_bounds(self, hyperparam_bounds: dict):
         """Check that each hyperparam bound is of the form [low, high].
+
+        Args:
+            hyperparam_bounds: Flattened mapping of hyperparameter name to a
+                ``[low, high]`` pair (or 2-tuple) describing the allowed range.
 
         Raises:
             ValueError: if any of the hyperparam bounds are of an invalid format.

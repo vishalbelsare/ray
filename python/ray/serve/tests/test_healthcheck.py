@@ -1,15 +1,18 @@
+import asyncio
+import threading
+
 import pytest
 
 import ray
-from ray.exceptions import RayError
-from ray._private.test_utils import wait_for_condition
 from ray import serve
+from ray._common.test_utils import async_wait_for_condition, wait_for_condition
+from ray.exceptions import RayError
 from ray.serve._private.common import DeploymentStatus
-from ray.serve._private.constants import REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD
 from ray.serve._private.constants import (
+    REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD,
     SERVE_DEFAULT_APP_NAME,
-    DEPLOYMENT_NAME_PREFIX_SEPARATOR,
 )
+from ray.serve.config import GangSchedulingConfig
 
 
 class Counter:
@@ -53,11 +56,11 @@ class Patient:
         return ray.get_runtime_context().current_actor
 
 
-def check_new_actor_started(handle, original_actors):
+async def check_new_actor_started(handle, original_actors):
     if not isinstance(original_actors, set):
         original_actors = {original_actors._actor_id}
     try:
-        return ray.get(handle.remote())._actor_id not in original_actors
+        return (await handle.remote())._actor_id not in original_actors
     except RayError:
         return False
 
@@ -80,43 +83,112 @@ def test_no_user_defined_method(serve_instance, use_class):
             return ray.get_runtime_context().current_actor
 
     h = serve.run(A.bind())
-    actor = ray.get(h.remote())
+    actor = h.remote().result()
     ray.kill(actor)
 
     # This would time out if we wait for multiple health check failures.
     wait_for_condition(check_new_actor_started, handle=h, original_actors=actor)
 
 
-def test_user_defined_method_fails(serve_instance):
+@pytest.mark.asyncio
+async def test_user_defined_method_fails(serve_instance):
     h = serve.run(Patient.bind())
-    actor = ray.get(h.remote())
-    ray.get(h.set_should_fail.remote())
+    actor = await h.remote()
+    await h.set_should_fail.remote()
 
-    wait_for_condition(check_new_actor_started, handle=h, original_actors=actor)
-    ray.get([h.remote() for _ in range(100)])
-
-
-def test_user_defined_method_hangs(serve_instance):
-    h = serve.run(Patient.bind())
-    actor = ray.get(h.remote())
-    ray.get(h.set_should_hang.remote())
-
-    wait_for_condition(check_new_actor_started, handle=h, original_actors=actor)
-    ray.get([h.remote() for _ in range(100)])
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actor
+    )
+    await asyncio.gather(*[h.remote() for _ in range(100)])
 
 
-def test_multiple_replicas(serve_instance):
+@pytest.mark.asyncio
+async def test_user_defined_method_hangs(serve_instance):
+    h = serve.run(Patient.options(graceful_shutdown_timeout_s=0).bind())
+    actor = await h.remote()
+    await h.set_should_hang.remote()
+
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actor
+    )
+    await asyncio.gather(*[h.remote() for _ in range(100)])
+
+
+@pytest.mark.asyncio
+async def test_multiple_replicas(serve_instance):
     h = serve.run(Patient.options(num_replicas=2).bind())
-    actors = {a._actor_id for a in ray.get([h.remote() for _ in range(100)])}
+    actors = {
+        a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(100)])
+    }
     assert len(actors) == 2
 
-    ray.get(h.set_should_fail.remote())
+    await h.set_should_fail.remote()
 
-    wait_for_condition(check_new_actor_started, handle=h, original_actors=actors)
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actors
+    )
 
-    new_actors = {a._actor_id for a in ray.get([h.remote() for _ in range(100)])}
+    new_actors = {
+        a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(100)])
+    }
     assert len(new_actors) == 2
     assert len(new_actors.intersection(actors)) == 1
+
+
+@pytest.mark.asyncio
+async def test_failing_replica_found_among_many(serve_instance):
+    """The health-check sweep finds a single failing replica at an arbitrary
+    position among many healthy ones and replaces only it."""
+    h = serve.run(
+        Patient.options(num_replicas=12, ray_actor_options={"num_cpus": 0.1}).bind()
+    )
+    actors = set()
+
+    async def all_replicas_seen():
+        actors.clear()
+        actors.update(
+            a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(300)])
+        )
+        return len(actors) == 12
+
+    await async_wait_for_condition(all_replicas_seen, timeout=30)
+
+    failed = (await h.set_should_fail.remote())._actor_id
+    await async_wait_for_condition(
+        check_new_actor_started, handle=h, original_actors=actors, timeout=60
+    )
+
+    async def only_failed_replica_replaced():
+        new_actors = {
+            a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(300)])
+        }
+        return (
+            len(new_actors) == 12
+            and failed not in new_actors
+            and len(new_actors.intersection(actors)) == 11
+        )
+
+    await async_wait_for_condition(only_failed_replica_replaced, timeout=60)
+
+
+@pytest.mark.asyncio
+async def test_crashed_replica_replaced_among_many(serve_instance):
+    """A replica whose actor dies outright is detected by the sweep and
+    replaced, restoring the full replica set."""
+    h = serve.run(
+        Patient.options(num_replicas=12, ray_actor_options={"num_cpus": 0.1}).bind()
+    )
+    victim = await h.remote()
+    victim_id = victim._actor_id
+    ray.kill(victim)
+
+    async def victim_replaced():
+        new_actors = {
+            a._actor_id for a in await asyncio.gather(*[h.remote() for _ in range(300)])
+        }
+        return victim_id not in new_actors and len(new_actors) == 12
+
+    await async_wait_for_condition(victim_replaced, timeout=60)
 
 
 def test_inherit_healthcheck(serve_instance):
@@ -137,10 +209,10 @@ def test_inherit_healthcheck(serve_instance):
             return ray.get_runtime_context().current_actor
 
     h = serve.run(Child.bind())
-    actors = {ray.get(h.remote())._actor_id for _ in range(100)}
+    actors = {h.remote().result()._actor_id for _ in range(100)}
     assert len(actors) == 1
 
-    ray.get(h.set_should_fail.remote())
+    h.set_should_fail.remote().result()
     wait_for_condition(check_new_actor_started, handle=h, original_actors=actors)
 
 
@@ -159,11 +231,11 @@ def test_nonconsecutive_failures(serve_instance):
             return ray.get_runtime_context().current_actor
 
     h = serve.run(FlakyHealthCheck.bind())
-    a1 = ray.get(h.remote())
+    a1 = h.remote().result()
 
     # Wait for 10 health check periods, should never get marked unhealthy.
     wait_for_condition(lambda: ray.get(counter.get.remote()) > 10)
-    assert ray.get(h.remote())._actor_id == a1._actor_id
+    assert h.remote().result()._actor_id == a1._actor_id
 
 
 def test_consecutive_failures(serve_instance):
@@ -192,10 +264,10 @@ def test_consecutive_failures(serve_instance):
     h = serve.run(ChronicallyUnhealthy.bind())
 
     def check_fails_3_times():
-        original_actor_id = ray.get(h.set_should_fail.remote())
+        original_actor_id = h.set_should_fail.remote().result()
 
         # Wait until a new actor is started.
-        wait_for_condition(lambda: ray.get(h.remote()) != original_actor_id)
+        wait_for_condition(lambda: h.remote().result() != original_actor_id)
 
         # Check that the health check failed N times before replica was killed.
         assert ray.get(counter.get.remote()) == REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD
@@ -207,7 +279,7 @@ def test_consecutive_failures(serve_instance):
     check_fails_3_times()
 
 
-def test_health_check_failure_makes_deployment_unhealthy(serve_instance):
+def test_health_check_failure_cause_deploy_failure(serve_instance):
     """If a deployment always fails health check, the deployment should be unhealthy."""
 
     @serve.deployment
@@ -221,11 +293,10 @@ def test_health_check_failure_makes_deployment_unhealthy(serve_instance):
     with pytest.raises(RuntimeError):
         serve.run(AlwaysUnhealthy.bind())
 
-    app_status = serve_instance.get_serve_status()
+    app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
     assert (
-        app_status.deployment_statuses[0].name
-        == f"{SERVE_DEFAULT_APP_NAME}{DEPLOYMENT_NAME_PREFIX_SEPARATOR}AlwaysUnhealthy"
-        and app_status.deployment_statuses[0].status == DeploymentStatus.UNHEALTHY
+        app_status.deployments["AlwaysUnhealthy"].status
+        == DeploymentStatus.DEPLOY_FAILED
     )
 
 
@@ -258,12 +329,9 @@ def test_health_check_failure_makes_deployment_unhealthy_transition(serve_instan
             return ray.get_runtime_context().current_actor
 
     def check_status(expected_status: DeploymentStatus):
-        app_status = serve_instance.get_serve_status()
-        return (
-            app_status.deployment_statuses[0].name == f"{SERVE_DEFAULT_APP_NAME}"
-            f"{DEPLOYMENT_NAME_PREFIX_SEPARATOR}WillBeUnhealthy"
-            and app_status.deployment_statuses[0].status == expected_status
-        )
+        app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+        assert app_status.deployments["WillBeUnhealthy"].status == expected_status
+        return True
 
     toggle = ray.remote(Toggle).remote()
     serve.run(WillBeUnhealthy.bind(toggle))
@@ -279,6 +347,199 @@ def test_health_check_failure_makes_deployment_unhealthy_transition(serve_instan
     # Check that deployment stays unhealthy
     for _ in range(5):
         assert check_status(DeploymentStatus.UNHEALTHY)
+
+
+def test_replica_stalled_in_user_code_marked_unhealthy(serve_instance):
+    """
+    When a replica stalls in the request-serving path and the user-loop watchdog is
+    enabled (RAY_SERVE_USER_HEALTH_CHECK_PROBE_MAX_FAIL > 0), repeated probe timeouts
+    cause call_user_health_check() to raise, the controller marks the replica unhealthy,
+    and a fresh replica is started (issue #61263).
+
+    The watchdog is on by default (MAX_FAIL=3). We use short intervals here so probe
+    failures accumulate quickly within the test window.
+    """
+    # threading.Event.wait() blocks the asyncio event loop (unlike asyncio.Event which
+    # yields control). This simulates a replica stuck in a long synchronous call.
+    @serve.deployment(
+        health_check_period_s=1,
+        health_check_timeout_s=3,
+        graceful_shutdown_timeout_s=0,
+        ray_actor_options={
+            "runtime_env": {
+                "env_vars": {
+                    # Enable the user-loop watchdog with short intervals so that
+                    # probe failures accumulate quickly within the test window.
+                    "RAY_SERVE_USER_HEALTH_CHECK_PROBE_MAX_FAIL": "2",
+                    "RAY_SERVE_USER_HEALTH_CHECK_PROBE_INTERVAL_S": "0.5",
+                    "RAY_SERVE_USER_HEALTH_CHECK_PROBE_TIMEOUT_S": "1",
+                }
+            }
+        },
+    )
+    class StalledReplica:
+        def __init__(self):
+            self._unblock = threading.Event()
+
+        async def __call__(self):
+            self._unblock.wait()
+            return "ok"
+
+        def set_unblock(self):
+            self._unblock.set()
+
+    handle = serve.run(StalledReplica.bind())
+
+    # Send a request so the replica blocks on _unblock.wait(), wedging the user loop.
+    ref = handle.remote()
+
+    def deployment_unhealthy():
+        app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+        return (
+            app_status.deployments["StalledReplica"].status
+            == DeploymentStatus.UNHEALTHY
+        )
+
+    wait_for_condition(deployment_unhealthy, timeout=60)
+
+    # Unblock so replicas can finish (stalled replica may already be replaced).
+    handle.set_unblock.remote()
+    try:
+        ray.get(ref, timeout=2)
+    except Exception:
+        pass
+
+    # Wait for deployment to recover (new replica is healthy).
+    def deployment_healthy():
+        app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+        return (
+            app_status.deployments["StalledReplica"].status == DeploymentStatus.HEALTHY
+        )
+
+    wait_for_condition(deployment_healthy, timeout=30)
+
+
+def test_gang_health_check_restarts_gang(serve_instance):
+    """RESTART_GANG tears down the entire gang on failure while the deployment
+    keeps serving traffic with no downtime."""
+
+    class Toggle:
+        def __init__(self):
+            self._should_fail = False
+
+        def set_should_fail(self):
+            self._should_fail = True
+
+        def unset_should_fail(self):
+            self._should_fail = False
+
+        def should_fail(self):
+            return self._should_fail
+
+    toggle = ray.remote(Toggle).remote()
+
+    @serve.deployment(health_check_period_s=1, health_check_timeout_s=1)
+    class GangPatient:
+        def __init__(self):
+            self._fail = False
+
+        def check_health(self):
+            if self._fail and ray.get(toggle.should_fail.remote()):
+                raise Exception("intended to fail")
+
+        def __call__(self):
+            ctx = ray.serve.context._get_internal_replica_context()
+            gc = ctx.gang_context
+            return {
+                "replica_id": ctx.replica_id.unique_id,
+                "gang_id": gc.gang_id if gc else None,
+            }
+
+        def set_should_fail(self):
+            self._fail = True
+            ctx = ray.serve.context._get_internal_replica_context()
+            gc = ctx.gang_context
+            return {
+                "replica_id": ctx.replica_id.unique_id,
+                "gang_id": gc.gang_id if gc else None,
+            }
+
+    num_replicas = 4
+    gang_size = 2
+    num_gangs = num_replicas // gang_size
+
+    h = serve.run(
+        GangPatient.options(
+            num_replicas=num_replicas,
+            gang_scheduling_config=GangSchedulingConfig(gang_size=gang_size),
+        ).bind()
+    )
+
+    # Collect initial replica state.
+    initial_replicas = {}
+    for _ in range(100):
+        result = h.remote().result()
+        initial_replicas[result["replica_id"]] = result
+        if len(initial_replicas) == num_replicas:
+            break
+    assert len(initial_replicas) == num_replicas
+
+    # Identify the two distinct gang IDs.
+    gang_ids = {r["gang_id"] for r in initial_replicas.values()}
+    assert len(gang_ids) == num_gangs
+
+    # Make one replica fail health checks.
+    fail_info = h.set_should_fail.remote().result()
+    target_gang_id = fail_info["gang_id"]
+    surviving_gang_id = (gang_ids - {target_gang_id}).pop()
+    ray.get(toggle.set_should_fail.remote())
+
+    # Wait for deployment to become UNHEALTHY.
+    def check_unhealthy():
+        app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+        assert (
+            app_status.deployments["GangPatient"].status == DeploymentStatus.UNHEALTHY
+        )
+        return True
+
+    wait_for_condition(check_unhealthy, timeout=10)
+
+    # Zero-downtime check.
+    # While the failed gang is being torn down and before the replacement
+    # gang comes up, the surviving gang must keep serving traffic.
+    for _ in range(30):
+        result = h.remote().result()
+        assert result["gang_id"] == surviving_gang_id
+
+    # Turn off failures so replacement replicas start healthy.
+    ray.get(toggle.unset_should_fail.remote())
+
+    # Wait for deployment to recover.
+    def check_healthy():
+        app_status = serve.status().applications[SERVE_DEFAULT_APP_NAME]
+        assert app_status.status == "RUNNING"
+        assert app_status.deployments["GangPatient"].status == DeploymentStatus.HEALTHY
+        return True
+
+    wait_for_condition(check_healthy, timeout=10)
+
+    # Collect final replica state.
+    final_replicas = {}
+    for _ in range(100):
+        result = h.remote().result()
+        final_replicas[result["replica_id"]] = result
+        if len(final_replicas) == num_replicas:
+            break
+    assert len(final_replicas) == num_replicas
+
+    # Both replicas from the failed gang should have been replaced.
+    old_gang_ids = {
+        r["replica_id"]
+        for r in initial_replicas.values()
+        if r["gang_id"] == target_gang_id
+    }
+    assert len(old_gang_ids) == gang_size
+    assert old_gang_ids.isdisjoint(final_replicas.keys())
 
 
 if __name__ == "__main__":

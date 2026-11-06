@@ -15,22 +15,21 @@ replicas on CPUs.
 """
 
 import os
-import ray
-from ray import serve
-from torchvision import models
-from typing import List
-import torch
-from ray.serve.drivers import DAGDriver
-from ray.dag.input_node import InputNode
+from typing import List, Optional
 import asyncio
-import aiohttp
-import starlette
 import time
-from serve_test_utils import save_test_results
-import numpy as np
+
+import aiohttp
 import click
-from typing import Optional
-from ray.serve.handle import RayServeHandle
+import numpy as np
+import starlette.requests
+import torch
+from torchvision import models
+
+from ray import serve
+from ray.serve.handle import DeploymentHandle
+
+from serve_test_utils import save_test_results
 
 
 # 8 images as input when batch size increase, we replica the input here
@@ -48,7 +47,7 @@ input_uris = [
 
 @serve.deployment
 class ImageObjectioner:
-    def __init__(self, handle: RayServeHandle, device="cpu"):
+    def __init__(self, handle: DeploymentHandle, device="cpu"):
         self.model = models.resnet50(pretrained=True)
         self.model.eval().to(device)
         self.device = device
@@ -58,7 +57,7 @@ class ImageObjectioner:
 
         preprocessing_tasks = []
         for uri in uris:
-            preprocessing_tasks.append(await self.handle.remote([uri]))
+            preprocessing_tasks.append(self.handle.remote([uri]))
         image_tensors_lists = await asyncio.gather(*preprocessing_tasks)
         image_tensors = [
             tensor for item_tensors in image_tensors_lists for tensor in item_tensors
@@ -69,38 +68,62 @@ class ImageObjectioner:
         end = time.time()
         return {"result": res, "model_inference_latency": end - start}
 
+    async def __call__(self, request: starlette.requests.Request):
+        uris = await request.json()
+        return await self.predict(uris)
+
 
 @serve.deployment(num_replicas=5)
 class DataDownloader:
     def __init__(self):
 
-        # For mutiple process scheduled in same node, torch.hub.load doesn't
-        # handle the multi process to dowloand module well. So this is to make sure
-        # there is only one replica to download the package
-        if os.path.exists("/home/ray/.cache/torch/") is False:
-            self.utils = torch.hub.load(
-                "NVIDIA/DeepLearningExamples:torchhub",
-                "nvidia_convnets_processing_utils",
-            )
-            with open("/home/ray/.cache/torch/success", "w") as _:
-                pass
+        # For multiple process scheduled on the same node, torch.hub.load doesn't
+        # handle the multi-process download well. This logic ensures only one
+        # replica downloads the package.
+        torch_cache_dir = os.path.dirname(torch.hub.get_dir())
+        lock_dir = os.path.join(torch_cache_dir, "serve_lock_dir")
+        success_file = os.path.join(lock_dir, "success")
 
-        else:
-            counter = 3
-            while counter:
-                print("waiting for torch hub NVIDIA package download...")
-                time.sleep(20)
-                if os.path.exists("/home/ray/.cache/torch/success"):
-                    self.utils = torch.hub.load(
-                        "NVIDIA/DeepLearningExamples:torchhub",
-                        "nvidia_convnets_processing_utils",
-                    )
+        os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+
+        try:
+            # Atomic operation acts as a lock.
+            os.mkdir(lock_dir)
+
+            # This replica is the first one, so it's responsible for downloading.
+            print("Downloading torch hub NVIDIA package...")
+            torch.hub.load(
+                repo_or_dir="NVIDIA/DeepLearningExamples:torchhub",
+                model="nvidia_convnets_processing_utils",
+                trust_repo=True,
+                force_reload=False,
+            )
+            with open(success_file, "w") as _:
+                pass
+            print("Download complete.")
+
+        except FileExistsError:
+            # Other replicas wait until downloaded.
+            print("Waiting for torch hub NVIDIA package download...")
+            counter = 10
+            while counter > 0:
+                if os.path.exists(success_file):
                     break
+                time.sleep(20)
                 counter -= 1
-            if counter == 0:
+
+            if not os.path.exists(success_file):
                 raise Exception(
-                    "Failed to load module nvidia_convnets_processing_utils"
+                    "Failed to load module 'nvidia_convnets_processing_utils' after waiting."
                 )
+
+        self.utils = torch.hub.load(
+            repo_or_dir="NVIDIA/DeepLearningExamples:torchhub",
+            model="nvidia_convnets_processing_utils",
+            trust_repo=True,
+            force_reload=False,
+        )
+        print("'nvidia_convnets_processing_utils' loaded")
 
     def __call__(self, uris: List[str]):
         return [self.utils.prepare_input_from_uri(uri) for uri in uris]
@@ -149,10 +172,6 @@ async def trial(measure_func, data_size: int = 8, num_clients: int = 1):
     return throughput_mean, inference_latency_mean
 
 
-async def json_resolver(request: starlette.requests.Request):
-    return await request.json()
-
-
 @click.command()
 @click.option(
     "--gpu-env",
@@ -170,26 +189,26 @@ def main(gpu_env: Optional[bool], smoke_run: Optional[bool]):
     if gpu_env:
         test_name = "resnet50_gpu"
         device = "cuda"
-        ImageObjectioner.set_options(ray_actor_options={"num_gpus": 1})
-
-    # batch size
-    batch_sizes = [16, 32, 64]
-
-    with InputNode() as user_input:
+        io = ImageObjectioner.options(ray_actor_options={"num_gpus": 1}).bind(
+            DataDownloader.bind(), device=device
+        )
+    else:
         io = ImageObjectioner.bind(DataDownloader.bind(), device=device)
-        dag = DAGDriver.bind(io.predict.bind(user_input), http_adapter=json_resolver)
-        handle = serve.run(dag)
+
+    handle = serve.run(io)
 
     if smoke_run:
         res = handle.predict.remote(input_uris)
-        print(ray.get(res))
+        print(res.result())
 
     else:
         result = {}
         print("warming up...")
         for _ in range(10):
-            res = handle.predict.remote([input_uris[0]])
+            handle.predict.remote([input_uris[0]]).result()
+
         print("start load testing...")
+        batch_sizes = [16, 32, 64]
         for batch_size in batch_sizes:
             throughput_mean_tps, model_inference_latency_mean = asyncio.run(
                 trial(measure_http_throughput_tps, batch_size)
@@ -200,10 +219,7 @@ def main(gpu_env: Optional[bool], smoke_run: Optional[bool]):
             }
             print(throughput_mean_tps, model_inference_latency_mean)
 
-        save_test_results(
-            {test_name: result},
-            default_output_file="/tmp/serve_resent_benchmark.json",
-        )
+        save_test_results({test_name: result})
 
 
 if __name__ == "__main__":

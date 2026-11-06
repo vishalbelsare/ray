@@ -1,10 +1,19 @@
-# flake8: noqa
+# ruff: noqa
 # fmt: off
 # isort: skip_file
 
 # __tf_setup_begin__
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+import sys
 import numpy as np
-import tensorflow as tf
+
+if sys.version_info >= (3, 12):
+    # Tensorflow is not installed for Python 3.12 because of keras compatibility.
+    sys.exit(0)
+else:
+    import tensorflow as tf
 
 def mnist_dataset(batch_size):
     (x_train, y_train), _ = tf.keras.datasets.mnist.load_data()
@@ -70,7 +79,7 @@ if __name__ == "__main__":
 
     # __tf_trainer_begin__
     from ray.train.tensorflow import TensorflowTrainer
-    from ray.air.config import ScalingConfig
+    from ray.train import ScalingConfig
 
     # For GPU Training, set `use_gpu` to True.
     use_gpu = False

@@ -1,32 +1,33 @@
 import csv
-from dataclasses import dataclass
 import glob
 import json
 import os
-import unittest
+import shutil
+import sys
 import tempfile
+import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import shutil
+
 import numpy as np
+import pytest
 
 import ray
-from ray.cloudpickle import cloudpickle
-from ray.tune.logger import (
-    CSVLoggerCallback,
-    JsonLoggerCallback,
-    JsonLogger,
-    CSVLogger,
-    TBXLoggerCallback,
-    TBXLogger,
-)
-from ray.tune.logger.aim import AimLoggerCallback
-from ray.tune.result import (
+from ray.air.constants import (
     EXPR_PARAM_FILE,
     EXPR_PARAM_PICKLE_FILE,
     EXPR_PROGRESS_FILE,
     EXPR_RESULT_FILE,
 )
+from ray.cloudpickle import cloudpickle
+from ray.tune import Checkpoint
+from ray.tune.logger import (
+    CSVLoggerCallback,
+    JsonLoggerCallback,
+    TBXLoggerCallback,
+)
+from ray.tune.logger.aim import AimLoggerCallback
 from ray.tune.utils import flatten_dict
 
 
@@ -37,7 +38,8 @@ class Trial:
     logdir: str
     experiment_path: Optional[str] = None
     experiment_dir_name: Optional[str] = None
-    remote_checkpoint_dir: Optional[str] = None
+    path: Optional[str] = None
+    checkpoint: Optional[Checkpoint] = None
 
     @property
     def config(self):
@@ -58,14 +60,10 @@ class Trial:
     def local_experiment_path(self):
         return self.experiment_path
 
-    @property
-    def remote_path(self):
-        return self.remote_checkpoint_dir
-
     def __hash__(self):
         return hash(self.trial_id)
 
-    def get_runner_ip(self) -> str:
+    def get_ray_actor_ip(self) -> str:
         return ray.util.get_node_ip_address()
 
 
@@ -88,17 +86,6 @@ class LoggerSuite(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
-
-    def testLegacyCSV(self):
-        config = {"a": 2, "b": 5, "c": {"c": {"D": 123}, "e": None}}
-        t = Trial(evaluated_params=config, trial_id="csv", logdir=self.test_dir)
-        logger = CSVLogger(config=config, logdir=self.test_dir, trial=t)
-        logger.on_result(result(2, 4))
-        logger.on_result(result(2, 5))
-        logger.on_result(result(2, 6, score=[1, 2, 3], hello={"world": 1}))
-        logger.close()
-
-        self._validate_csv_result()
 
     def testCSV(self):
         config = {"a": 2, "b": 5, "c": {"c": {"D": 123}, "e": None}}
@@ -148,17 +135,6 @@ class LoggerSuite(unittest.TestCase):
             [int(row["episode_reward_mean"]) for row in results], [4, 5, 6]
         )
 
-    def testJSONLegacyLogger(self):
-        config = {"a": 2, "b": 5, "c": {"c": {"D": 123}, "e": None}}
-        t = Trial(evaluated_params=config, trial_id="json", logdir=self.test_dir)
-        logger = JsonLogger(config=config, logdir=self.test_dir, trial=t)
-        logger.on_result(result(0, 4))
-        logger.on_result(result(1, 5))
-        logger.on_result(result(2, 6, score=[1, 2, 3], hello={"world": 1}))
-        logger.close()
-
-        self._validate_json_result(config)
-
     def testJSON(self):
         config = {"a": 2, "b": 5, "c": {"c": {"D": 123}, "e": None}}
         t = Trial(evaluated_params=config, trial_id="json", logdir=self.test_dir)
@@ -199,24 +175,6 @@ class LoggerSuite(unittest.TestCase):
 
         self.assertEqual(loaded_config, config)
 
-    def testLegacyTBX(self):
-        config = {
-            "a": 2,
-            "b": [1, 2],
-            "c": {"c": {"D": 123}},
-            "d": np.int64(1),
-            "e": np.bool8(True),
-            "f": None,
-        }
-        t = Trial(evaluated_params=config, trial_id="tbx", logdir=self.test_dir)
-        logger = TBXLogger(config=config, logdir=self.test_dir, trial=t)
-        logger.on_result(result(0, 4))
-        logger.on_result(result(1, 5))
-        logger.on_result(result(2, 6, score=[1, 2, 3], hello={"world": 1}))
-        logger.close()
-
-        self._validate_tbx_result()
-
     def testTBX(self):
         config = {
             "a": 2,
@@ -224,7 +182,7 @@ class LoggerSuite(unittest.TestCase):
             "c": {"c": {"D": 123}},
             "int32": np.int32(1),
             "int64": np.int64(2),
-            "bool8": np.bool8(True),
+            "bool8": np.bool_(True),
             "float32": np.float32(3),
             "float64": np.float64(4),
             "bad": np.float128(4),
@@ -272,16 +230,6 @@ class LoggerSuite(unittest.TestCase):
         self.assertEqual(len(results), 3)
         self.assertSequenceEqual([int(res) for res in results], [4, 5, 6])
 
-    def testLegacyBadTBX(self):
-        config = {"b": (1, 2, 3)}
-        t = Trial(evaluated_params=config, trial_id="tbx", logdir=self.test_dir)
-        logger = TBXLogger(config=config, logdir=self.test_dir, trial=t)
-        logger.on_result(result(0, 4))
-        logger.on_result(result(2, 4, score=[1, 2, 3], hello={"world": 1}))
-        with self.assertLogs("ray.tune.logger", level="INFO") as cm:
-            logger.close()
-        assert "INFO" in cm.output[0]
-
     def testBadTBX(self):
         config = {"b": (1, 2, 3)}
         t = Trial(evaluated_params=config, trial_id="tbx", logdir=self.test_dir)
@@ -296,6 +244,7 @@ class LoggerSuite(unittest.TestCase):
         assert "INFO" in cm.output[0]
 
 
+@pytest.mark.skipif(sys.version_info >= (3, 12), reason="Aim doesn't support py312")
 class AimLoggerSuite(unittest.TestCase):
     """Test Aim integration."""
 
@@ -321,7 +270,7 @@ class AimLoggerSuite(unittest.TestCase):
             "c": {"d": {"e": 123}},
             "int32": np.int32(1),
             "int64": np.int64(2),
-            "bool8": np.bool8(True),
+            "bool8": np.bool_(True),
             "float32": np.float32(3),
             "float64": np.float64(4),
             "bad": Dummy(),
@@ -334,7 +283,7 @@ class AimLoggerSuite(unittest.TestCase):
                 experiment_path=self.test_dir,
                 logdir=trial_logdir,
                 experiment_dir_name="aim_test",
-                remote_checkpoint_dir="s3://bucket/aim_test/trial_0_logdir",
+                path="bucket/aim_test/trial_0_logdir",
             ),
             Trial(
                 evaluated_params=self.config,
@@ -342,7 +291,7 @@ class AimLoggerSuite(unittest.TestCase):
                 experiment_path=self.test_dir,
                 logdir=trial_logdir,
                 experiment_dir_name="aim_test",
-                remote_checkpoint_dir="s3://bucket/aim_test/trial_1_logdir",
+                path="bucket/aim_test/trial_1_logdir",
             ),
         ]
 
@@ -378,7 +327,7 @@ class AimLoggerSuite(unittest.TestCase):
 
         for i, run in enumerate(runs):
             assert set(run["hparams"]) == expected_logged_hparams
-            assert run.get("trial_remote_log_dir")
+            assert run.get("trial_log_dir")
             assert run.get("trial_ip")
 
             results = None
@@ -429,7 +378,8 @@ class AimLoggerSuite(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
+
+    import pytest
 
     sys.exit(pytest.main(["-v", __file__] + sys.argv[1:]))

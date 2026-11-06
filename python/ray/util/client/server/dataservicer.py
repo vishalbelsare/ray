@@ -1,25 +1,24 @@
-from collections import defaultdict
-from ray.util.client.server.server_pickler import loads_from_client
-import ray
 import logging
-import grpc
-from queue import Queue
 import sys
-
-from typing import Any, Dict, Iterator, TYPE_CHECKING, Union
-from threading import Event, Lock, Thread
 import time
+from collections import defaultdict
+from queue import Queue
+from threading import Event, Lock, Thread
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Union
 
+import grpc
+
+import ray
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
+from ray._private.client_mode_hook import disable_client_hook
 from ray.util.client.common import (
     CLIENT_SERVER_MAX_THREADS,
-    _propagate_error_in_context,
     OrderedResponseCache,
+    _propagate_error_in_context,
 )
-from ray.util.client import CURRENT_PROTOCOL_VERSION
+from ray.util.client.server.server_pickler import loads_from_client
 from ray.util.debug import log_once
-from ray._private.client_mode_hook import disable_client_hook
 
 if TYPE_CHECKING:
     from ray.util.client.server.server import RayletServicer
@@ -30,10 +29,8 @@ QUEUE_JOIN_SECONDS = 10
 
 
 def _get_reconnecting_from_context(context: Any) -> bool:
-    """
-    Get `reconnecting` from gRPC metadata, or False if missing.
-    """
-    metadata = {k: v for k, v in context.invocation_metadata()}
+    """Get `reconnecting` from gRPC metadata, or False if missing."""
+    metadata = dict(context.invocation_metadata())
     val = metadata.get("reconnecting")
     if val is None or val not in ("True", "False"):
         logger.error(
@@ -46,8 +43,7 @@ def _get_reconnecting_from_context(context: Any) -> bool:
 
 
 def _should_cache(req: ray_client_pb2.DataRequest) -> bool:
-    """
-    Returns True if the response should to the given request should be cached,
+    """Returns True if the response should to the given request should be cached,
     false otherwise. At the moment the only requests we do not cache are:
         - asynchronous gets: These arrive out of order. Skipping caching here
             is fine, since repeating an async get is idempotent
@@ -73,9 +69,7 @@ def fill_queue(
     grpc_input_generator: Iterator[ray_client_pb2.DataRequest],
     output_queue: "Queue[Union[ray_client_pb2.DataRequest, ray_client_pb2.DataResponse]]",  # noqa: E501
 ) -> None:
-    """
-    Pushes incoming requests to a shared output_queue.
-    """
+    """Pushes incoming requests to a shared output_queue."""
     try:
         for req in grpc_input_generator:
             output_queue.put(req)
@@ -90,9 +84,7 @@ def fill_queue(
 
 
 class ChunkCollector:
-    """
-    Helper class for collecting chunks from PutObject or ClientTask messages
-    """
+    """Helper class for collecting chunks from PutObject or ClientTask messages"""
 
     def __init__(self):
         self.curr_req_id = None
@@ -156,7 +148,7 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
         start_time = time.time()
         # set to True if client shuts down gracefully
         cleanup_requested = False
-        metadata = {k: v for k, v in context.invocation_metadata()}
+        metadata = dict(context.invocation_metadata())
         client_id = metadata.get("client_id")
         if client_id is None:
             logger.error("Client connecting with no client_id")
@@ -186,6 +178,19 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
                     continue
 
                 assert isinstance(req, ray_client_pb2.DataRequest)
+                if (
+                    reconnect_enabled
+                    and req.WhichOneof("type") in ("put", "task")
+                    and not _should_cache(req)
+                    and response_cache.has_entry(req.req_id)
+                ):
+                    # The final chunk of this request already arrived before
+                    # a reconnect, so the client is replaying chunks we have
+                    # already consumed. Feeding them to the chunk collector
+                    # would leave it stuck on a finished request, and every
+                    # later chunked request would then fail. The final chunk
+                    # is still answered from the response cache below.
+                    continue
                 if _should_cache(req) and reconnect_enabled:
                     cached_resp = response_cache.check_cache(req.req_id)
                     if isinstance(cached_resp, Exception):
@@ -231,7 +236,6 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
                         self.put_request_chunk_collector.data,
                         req.put.client_ref_id,
                         client_id,
-                        req.put.owner_id,
                     )
                     self.put_request_chunk_collector.reset()
                     resp = ray_client_pb2.DataResponse(put=put_resp)
@@ -275,6 +279,8 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
                             req.task, arglist, kwargs, context
                         )
                         resp = ray_client_pb2.DataResponse(task_ticket=resp_ticket)
+                        del arglist
+                        del kwargs
                 elif req_type == "terminate":
                     with self.clients_lock:
                         response = self.basic_service.Terminate(req.terminate, context)
@@ -360,8 +366,7 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
                         ray.shutdown()
 
     def _init(self, client_id: str, context: Any, start_time: float):
-        """
-        Checks if resources allow for another client.
+        """Checks if resources allow for another client.
         Returns a boolean indicating if initialization was successful.
         """
         with self.clients_lock:
@@ -412,5 +417,4 @@ class DataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
             ),
             ray_version=ray.__version__,
             ray_commit=ray.__commit__,
-            protocol_version=CURRENT_PROTOCOL_VERSION,
         )

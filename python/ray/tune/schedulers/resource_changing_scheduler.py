@@ -1,17 +1,19 @@
-from copy import deepcopy
-import numpy as np
 import logging
-from typing import Dict, Any, List, Optional, Set, Tuple, Union, Callable
-
 import pickle
 import warnings
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+
+import numpy as np
 
 from ray.air.execution.resources.request import _sum_bundles
-from ray.util.annotations import PublicAPI
-from ray.tune.execution import trial_runner
-from ray.tune.schedulers.trial_scheduler import FIFOScheduler, TrialScheduler
-from ray.tune.experiment import Trial
 from ray.tune.execution.placement_groups import PlacementGroupFactory
+from ray.tune.experiment import Trial
+from ray.tune.schedulers.trial_scheduler import FIFOScheduler, TrialScheduler
+from ray.util.annotations import PublicAPI
+
+if TYPE_CHECKING:
+    from ray.tune.execution.tune_controller import TuneController
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +93,15 @@ class DistributeResources:
         return True
 
     def _get_total_available_resources(
-        self, trial_runner: "trial_runner.TrialRunner"
+        self, tune_controller: "TuneController"
     ) -> Tuple[float, float]:
         """Get the number of CPUs and GPUs avaialble in total (not just free)"""
         total_available_cpus = (
-            trial_runner.trial_executor._resource_updater.get_num_cpus()
+            tune_controller._resource_updater.get_num_cpus()
             - self.reserve_resources.get("CPU", 0)
         )
         total_available_gpus = (
-            trial_runner.trial_executor._resource_updater.get_num_gpus()
+            tune_controller._resource_updater.get_num_gpus()
             - self.reserve_resources.get("GPU", 0)
         )
         return total_available_cpus, total_available_gpus
@@ -379,7 +381,7 @@ class DistributeResources:
 
     def __call__(
         self,
-        trial_runner: "trial_runner.TrialRunner",
+        tune_controller: "TuneController",
         trial: Trial,
         result: Dict[str, Any],
         scheduler: "ResourceChangingScheduler",
@@ -393,12 +395,16 @@ class DistributeResources:
         internally (same with None).
 
         Args:
-            trial_runner: Trial runner for this Tune run.
+            tune_controller: Trial runner for this Tune run.
                 Can be used to obtain information about other trials.
             trial: The trial to allocate new resources to.
             result: The latest results of trial.
             scheduler: The scheduler calling
                 the function.
+
+        Returns:
+            A new ``PlacementGroupFactory`` with updated resource requirements,
+            or None if the trial's resources should be left unchanged.
         """
         # Get base trial resources as defined in
         # ``tune.run(resources_per_trial)``
@@ -427,9 +433,9 @@ class DistributeResources:
         (
             total_available_cpus,
             total_available_gpus,
-        ) = self._get_total_available_resources(trial_runner=trial_runner)
+        ) = self._get_total_available_resources(tune_controller=tune_controller)
 
-        all_trials = trial_runner.get_live_trials()
+        all_trials = tune_controller.get_live_trials()
 
         used_cpus_and_gpus = [self._get_used_cpus_and_gpus(t) for t in all_trials]
         used_cpus, used_gpus = zip(*used_cpus_and_gpus)
@@ -601,7 +607,7 @@ class ResourceChangingScheduler(TrialScheduler):
     through a user-specified ``resources_allocation_function``.
 
     An example of such a function can be found in
-    :doc:`/tune/examples/includes/xgboost_dynamic_resources_example`.
+    :doc:`/tune/examples/includes/xgboost-dynamic-resources-example`.
 
     If the functional API is used, the current trial resources can be obtained
     by calling `tune.get_trial_resources()` inside the training function.
@@ -644,7 +650,7 @@ class ResourceChangingScheduler(TrialScheduler):
 
             base_scheduler = ASHAScheduler(max_t=16)
             def my_resources_allocation_function(
-                trial_runner: "trial_runner.TrialRunner",
+                tune_controller: "TuneController",
                 trial: Trial,
                 result: Dict[str, Any],
                 scheduler: "ResourceChangingScheduler"
@@ -657,7 +663,7 @@ class ResourceChangingScheduler(TrialScheduler):
                             my_resources_allocation_function
                         )
 
-        See :doc:`/tune/examples/includes/xgboost_dynamic_resources_example` for a
+        See :doc:`/tune/examples/includes/xgboost-dynamic-resources-example` for a
         more detailed example.
     """
 
@@ -667,7 +673,7 @@ class ResourceChangingScheduler(TrialScheduler):
         resources_allocation_function: Optional[
             Callable[
                 [
-                    "trial_runner.TrialRunner",
+                    "TuneController",
                     Trial,
                     Dict[str, Any],
                     "ResourceChangingScheduler",
@@ -695,10 +701,12 @@ class ResourceChangingScheduler(TrialScheduler):
 
     @property
     def metric(self):
+        """The metric of the base scheduler."""
         return self._base_scheduler._metric
 
     @property
     def base_trial_resources(self) -> Optional[PlacementGroupFactory]:
+        """The resources of the first trial added, or ``None`` before any trial."""
         return self._base_trial_resources
 
     def set_search_properties(
@@ -708,9 +716,7 @@ class ResourceChangingScheduler(TrialScheduler):
         self._mode = mode
         return self._base_scheduler.set_search_properties(metric, mode, **spec)
 
-    def on_trial_add(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, **kwargs
-    ):
+    def on_trial_add(self, tune_controller: "TuneController", trial: Trial, **kwargs):
         # use the first trial resources as the base
         if self._base_trial_resources is None:
             self._base_trial_resources = trial.placement_group_factory
@@ -728,22 +734,20 @@ class ResourceChangingScheduler(TrialScheduler):
                     f"{trial_resources}."
                 )
 
-        return self._base_scheduler.on_trial_add(trial_runner, trial, **kwargs)
+        return self._base_scheduler.on_trial_add(tune_controller, trial, **kwargs)
 
-    def on_trial_error(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, **kwargs
-    ):
-        return self._base_scheduler.on_trial_error(trial_runner, trial, **kwargs)
+    def on_trial_error(self, tune_controller: "TuneController", trial: Trial, **kwargs):
+        return self._base_scheduler.on_trial_error(tune_controller, trial, **kwargs)
 
     def on_trial_result(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ) -> str:
         base_scheduler_decision = self._base_scheduler.on_trial_result(
-            trial_runner, trial, result
+            tune_controller, trial, result
         )
         if base_scheduler_decision == TrialScheduler.CONTINUE:
             new_resources = self.reallocate_trial_resources_if_needed(
-                trial_runner, trial, result
+                tune_controller, trial, result
             )
             if new_resources:
                 self._trials_to_reallocate[trial] = new_resources
@@ -752,24 +756,24 @@ class ResourceChangingScheduler(TrialScheduler):
 
     def on_trial_complete(
         self,
-        trial_runner: "trial_runner.TrialRunner",
+        tune_controller: "TuneController",
         trial: Trial,
         result: Dict,
         **kwargs,
     ):
         return self._base_scheduler.on_trial_complete(
-            trial_runner, trial, result, **kwargs
+            tune_controller, trial, result, **kwargs
         )
 
     def on_trial_remove(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, **kwargs
+        self, tune_controller: "TuneController", trial: Trial, **kwargs
     ):
-        return self._base_scheduler.on_trial_remove(trial_runner, trial, **kwargs)
+        return self._base_scheduler.on_trial_remove(tune_controller, trial, **kwargs)
 
     def choose_trial_to_run(
-        self, trial_runner: "trial_runner.TrialRunner", **kwargs
+        self, tune_controller: "TuneController", **kwargs
     ) -> Optional[Trial]:
-        if getattr(trial_runner.trial_executor, "_reuse_actors", False):
+        if getattr(tune_controller, "_reuse_actors", False):
             raise ValueError(
                 "ResourceChangingScheduler cannot be used with "
                 "`reuse_actors=True`. FIX THIS by setting "
@@ -789,12 +793,7 @@ class ResourceChangingScheduler(TrialScheduler):
             )
         self._trials_to_reallocate = new_trials_to_reallocate
 
-        if any_resources_changed:
-            # force reconcilation to ensure resource changes
-            # are implemented right away
-            trial_runner.trial_executor.force_reconcilation_on_next_step_end()
-
-        trial = self._base_scheduler.choose_trial_to_run(trial_runner, **kwargs)
+        trial = self._base_scheduler.choose_trial_to_run(tune_controller, **kwargs)
         return trial
 
     def debug_string(self) -> str:
@@ -813,7 +812,16 @@ class ResourceChangingScheduler(TrialScheduler):
     def set_trial_resources(
         self, trial: Trial, new_resources: Union[Dict, PlacementGroupFactory]
     ) -> bool:
-        """Returns True if new_resources were set."""
+        """Returns True if new_resources were set.
+
+        Args:
+            trial: The trial to update.
+            new_resources: The new resources for the trial. If empty, the
+                trial's resources don't change.
+
+        Returns:
+            True if the trial's resources were updated, False otherwise.
+        """
         if new_resources:
             logger.info(
                 f"Setting trial {trial} resource to {new_resources} "
@@ -850,11 +858,20 @@ class ResourceChangingScheduler(TrialScheduler):
             return False
 
     def reallocate_trial_resources_if_needed(
-        self, trial_runner: "trial_runner.TrialRunner", trial: Trial, result: Dict
+        self, tune_controller: "TuneController", trial: Trial, result: Dict
     ) -> Optional[Union[dict, PlacementGroupFactory]]:
         """Calls user defined resources_allocation_function. If the returned
         resources are not none and not the same as currently present, returns
-        them. Otherwise, returns None."""
+        them. Otherwise, returns None.
+
+        Args:
+            tune_controller: The controller running the experiment.
+            trial: The trial that reported the result.
+            result: The result the trial reported.
+
+        Returns:
+            The new resources for the trial, or ``None`` if they don't change.
+        """
         if self._resources_allocation_function is None:
             return None
 
@@ -868,7 +885,7 @@ class ResourceChangingScheduler(TrialScheduler):
             )
 
         new_resources = self._resources_allocation_function(
-            trial_runner, trial, result, self
+            tune_controller, trial, result, self
         )
 
         # if we can check if the new resources are the same,

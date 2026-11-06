@@ -84,10 +84,10 @@ bool Counter::CheckRestartInActorCreationTask() { return is_restared; }
 bool Counter::CheckRestartInActorTask() { return ray::WasCurrentActorRestarted(); }
 
 ray::ActorHandle<Counter> Counter::CreateChildActor(std::string actor_name) {
-  auto child_actor =
+  auto new_child_actor =
       ray::Actor(RAY_FUNC(Counter::FactoryCreate)).SetName(actor_name).Remote();
-  child_actor.Task(&Counter::GetCount).Remote().Get();
-  return child_actor;
+  new_child_actor.Task(&Counter::GetCount).Remote().Get();
+  return new_child_actor;
 }
 
 std::string Counter::GetNamespaceInActor() { return ray::GetNamespace(); }
@@ -100,6 +100,10 @@ std::string Counter::CreateNestedChildActor(std::string actor_name) {
 
 int Counter::Plus1ForActor(ray::ActorHandle<Counter> actor) {
   return *actor.Task(&Counter::Plus1).Remote().Get();
+}
+
+int Counter::GetIntByObjectRef(ray::ObjectRef<int> object_ref) {
+  return *object_ref.Get();
 }
 
 RAY_REMOTE(RAY_FUNC(Counter::FactoryCreate),
@@ -123,8 +127,11 @@ RAY_REMOTE(RAY_FUNC(Counter::FactoryCreate),
            &Counter::GetCount,
            &Counter::CreateNestedChildActor,
            &Counter::GetBytes,
-           &Counter::echoBytes,
-           &Counter::echoString);
+           &Counter::EchoBytes,
+           &Counter::EchoString,
+           &Counter::GetIntByObjectRef,
+           &Counter::EchoStrings,
+           &Counter::EchoAnyArray);
 
 RAY_REMOTE(ActorConcurrentCall::FactoryCreate, &ActorConcurrentCall::CountDown);
 

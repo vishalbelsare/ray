@@ -7,11 +7,7 @@ import pytest
 
 import ray
 import ray.cluster_utils
-
-try:
-    import pytest_timeout
-except ImportError:
-    pytest_timeout = None
+from ray._private.test_utils import get_gpu_visible_devices_env_var
 
 
 def test_actor_deletion_with_gpus(shutdown_only):
@@ -320,7 +316,7 @@ def test_actor_multiple_gpus_from_multiple_tasks(ray_start_cluster):
     assert ready_ids == []
 
 
-def test_actors_and_tasks_with_gpus(enable_syncer_test, ray_start_cluster):
+def test_actors_and_tasks_with_gpus(ray_start_cluster):
     cluster = ray_start_cluster
     num_nodes = 3
     num_gpus_per_raylet = 2
@@ -664,10 +660,30 @@ def test_creating_more_actors_than_resources(shutdown_only):
     ray.get(results)
 
 
-if __name__ == "__main__":
-    import pytest
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="Apple exposes a single unified GPU with no per device IDs to distinguish.",
+)
+def test_actor_visible_devices(shutdown_only):
+    """Test user can overwrite the visible devices env var
+    after the actor is created."""
+    gpu_env_var = get_gpu_visible_devices_env_var()
 
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    ray.init(num_gpus=1)
+
+    @ray.remote(num_gpus=1)
+    class Actor:
+        def set_visible_devices(self, visible_devices):
+            os.environ[gpu_env_var] = visible_devices
+
+        def get_visible_devices(self):
+            return os.environ[gpu_env_var]
+
+    actor = Actor.remote()
+    assert ray.get(actor.get_visible_devices.remote()) == "0"
+    ray.get(actor.set_visible_devices.remote("0,1"))
+    assert ray.get(actor.get_visible_devices.remote()) == "0,1"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-sv", __file__]))

@@ -1,24 +1,36 @@
-from concurrent import futures
 import contextlib
 import os
-import threading
+import random
 import sys
+import threading
+import time
+from concurrent import futures
+from typing import Any, Callable, Optional
+from unittest.mock import Mock, patch
+
 import grpc
 import numpy as np
-
-import time
-import random
 import pytest
-from typing import Any, Callable, Optional
-from unittest.mock import patch
 
 import ray
-from ray._private.utils import get_or_create_event_loop
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
+from ray._common.utils import get_or_create_event_loop
+from ray.tests.conftest import call_ray_start_context
 from ray.util.client.common import CLIENT_SERVER_MAX_THREADS, GRPC_OPTIONS
-import ray.util.client.server.server as ray_client_server
-from ray._private.client_mode_hook import disable_client_hook
+
+
+@pytest.fixture(scope="module")
+def call_ray_start_shared(request):
+    # Starts Ray with a ray client server listening on port 50051
+    request = Mock()
+    request.param = (
+        "ray start --head --min-worker-port=0 --max-worker-port=0 --port 0 "
+        "--ray-client-server-port=50051"
+    )
+    with call_ray_start_context(request) as address:
+        yield address
+
 
 # At a high level, these tests rely on an extra RPC server sitting
 # between the client and the real Ray server to inject errors, drop responses
@@ -38,10 +50,13 @@ class MiddlemanDataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
     def __init__(
         self, on_response: Optional[Hook] = None, on_request: Optional[Hook] = None
     ):
-        """
+        """Initialize the middleman data servicer.
+
         Args:
             on_response: Optional hook to inject errors before sending back a
-                response
+                response.
+            on_request: Optional hook to inject errors before forwarding a
+                request.
         """
         self.stub = None
         self.on_response = on_response
@@ -76,10 +91,11 @@ class MiddlemanLogServicer(ray_client_pb2_grpc.RayletLogStreamerServicer):
     """
 
     def __init__(self, on_response: Optional[Hook] = None):
-        """
+        """Initialize the middleman log servicer.
+
         Args:
             on_response: Optional hook to inject errors before sending back a
-                response
+                response.
         """
         self.stub = None
         self.on_response = on_response
@@ -109,12 +125,13 @@ class MiddlemanRayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
     def __init__(
         self, on_request: Optional[Hook] = None, on_response: Optional[Hook] = None
     ):
-        """
+        """Initialize the middleman raylet servicer.
+
         Args:
             on_request: Optional hook to inject errors before forwarding a
-                request
+                request.
             on_response: Optional hook to inject errors before sending back a
-                response
+                response.
         """
         self.stub = None
         self.on_request = on_request
@@ -212,25 +229,28 @@ class MiddlemanServer:
     def __init__(
         self,
         listen_addr: str,
-        real_addr,
+        real_addr: str,
         on_log_response: Optional[Hook] = None,
         on_data_request: Optional[Hook] = None,
         on_data_response: Optional[Hook] = None,
         on_task_request: Optional[Hook] = None,
         on_task_response: Optional[Hook] = None,
     ):
-        """
+        """Initialize the middleman server.
+
         Args:
-            listen_addr: The address the middleman server will listen on
-            real_addr: The address of the real ray server
+            listen_addr: The address the middleman server will listen on.
+            real_addr: The address of the real ray server.
             on_log_response: Optional hook to inject errors before sending back
-                a log response
+                a log response.
+            on_data_request: Optional hook to inject errors before forwarding
+                a data request.
             on_data_response: Optional hook to inject errors before sending
-                back a data response
+                back a data response.
             on_task_request: Optional hook to inject errors before forwarding
-                a raylet driver request
+                a raylet driver request.
             on_task_response: Optional hook to inject errors before sending
-                back a raylet driver response
+                back a raylet driver response.
         """
         self.listen_addr = listen_addr
         self.real_addr = real_addr
@@ -291,7 +311,6 @@ def start_middleman_server(
     and a ray client server on port 50051.
     """
     ray._inside_client_test = True
-    server = ray_client_server.serve("localhost:50051")
     middleman = None
     try:
         middleman = MiddlemanServer(
@@ -305,29 +324,15 @@ def start_middleman_server(
         )
         middleman.start()
         ray.init("ray://localhost:10011")
-        yield middleman, server
+        yield middleman
     finally:
         ray._inside_client_test = False
         ray.util.disconnect()
         if middleman:
             middleman.stop(0)
-        # Delete server to allow the client server to be GC'ed, which shuts
-        # down Ray. Then wait for Ray to shut down in the local process.
-        # Otherwise, the Ray cluster may stay alive until the next call to
-        # start_middleman_server(), become the backing Ray cluster to the
-        # client server, and shut down in the middle of the test case after
-        # GC finally catches up, leading to test failures.
-        server.stop(0)
-        del server
-        start = time.monotonic()
-        with disable_client_hook():
-            while ray.is_initialized():
-                time.sleep(1)
-                if time.monotonic() - start > 30:
-                    raise RuntimeError("Failed to terminate Ray")
 
 
-def test_disconnect_during_get():
+def test_disconnect_during_get(call_ray_start_shared):
     """
     Disconnect the proxy and the client in the middle of a long running get
     """
@@ -341,7 +346,7 @@ def test_disconnect_during_get():
         time.sleep(3)
         middleman.reset_channel()
 
-    with start_middleman_server() as (middleman, _):
+    with start_middleman_server() as middleman:
         disconnect_thread = threading.Thread(target=disconnect, args=(middleman,))
         disconnect_thread.start()
         result = ray.get(slow_result.remote())
@@ -349,7 +354,7 @@ def test_disconnect_during_get():
         disconnect_thread.join()
 
 
-def test_disconnects_during_large_get():
+def test_disconnects_during_large_get(call_ray_start_shared):
     """
     Disconnect repeatedly during a large (multi-chunk) get.
     """
@@ -380,7 +385,7 @@ def test_disconnects_during_large_get():
         assert result.shape == (1024, 1024, 6)
 
 
-def test_disconnects_during_large_async_get():
+def test_disconnects_during_large_async_get(call_ray_start_shared):
     """
     Disconnect repeatedly during a large (multi-chunk) async get.
     """
@@ -415,7 +420,7 @@ def test_disconnects_during_large_async_get():
         assert result.shape == (1024, 1024, 6)
 
 
-def test_disconnect_during_large_put():
+def test_disconnect_during_large_put(call_ray_start_shared):
     """
     Disconnect during a large (multi-chunk) put.
     """
@@ -439,7 +444,7 @@ def test_disconnect_during_large_put():
         assert result.shape == (1024, 1024, 6)
 
 
-def test_disconnect_during_large_schedule():
+def test_disconnect_during_large_schedule(call_ray_start_shared):
     """
     Disconnect during a remote call with a large (multi-chunk) argument.
     """
@@ -467,7 +472,55 @@ def test_disconnect_during_large_schedule():
         assert result == (1024, 1024, 6)
 
 
-def test_valid_actor_state():
+def test_disconnect_before_large_put_response(call_ray_start_shared):
+    """
+    Disconnect after the server has received every chunk of a large put,
+    but before the client gets the response. The client replays all of the
+    chunks on reconnect, and later chunked puts must still succeed.
+    """
+    dropped = False
+
+    def drop_first_put_response(resp):
+        nonlocal dropped
+        if resp.WhichOneof("type") == "put" and not dropped:
+            dropped = True
+            raise RuntimeError
+
+    with start_middleman_server(on_data_response=drop_first_put_response):
+        first = ray.put(np.random.random((1024, 1024, 6)))
+        assert dropped
+        second = ray.put(np.random.random((1024, 1024, 6)))
+        assert ray.get(first).shape == (1024, 1024, 6)
+        assert ray.get(second).shape == (1024, 1024, 6)
+
+
+def test_disconnect_before_large_schedule_response(call_ray_start_shared):
+    """
+    Same as test_disconnect_before_large_put_response, but for remote calls
+    with a large argument. Two calls are in flight at once, so the replay of
+    the first can arrive while the second is partially received.
+    """
+    dropped = False
+
+    def drop_first_task_response(resp):
+        nonlocal dropped
+        if resp.WhichOneof("type") == "task_ticket" and not dropped:
+            dropped = True
+            raise RuntimeError
+
+    @ray.remote
+    def f(a):
+        return a.shape
+
+    with start_middleman_server(on_data_response=drop_first_task_response):
+        a = np.random.random((1024, 1024, 6))
+        refs = [f.remote(a), f.remote(a)]
+        assert ray.get(refs) == [(1024, 1024, 6)] * 2
+        assert dropped
+        assert ray.get(f.remote(a)) == (1024, 1024, 6)
+
+
+def test_valid_actor_state(call_ray_start_shared):
     """
     Repeatedly inject errors in the middle of mutating actor calls. Check
     at the end that the final state of the actor is consistent with what
@@ -506,7 +559,7 @@ def test_valid_actor_state():
         assert ray.get(ref) == 100
 
 
-def test_valid_actor_state_2():
+def test_valid_actor_state_2(call_ray_start_shared):
     """
     Do a full disconnect (cancel channel) every 11 requests. Failure
     happens:
@@ -526,7 +579,7 @@ def test_valid_actor_state_2():
 
     i = 0
 
-    with start_middleman_server() as (middleman, _):
+    with start_middleman_server() as middleman:
 
         def fail_every_eleven(_):
             nonlocal i
@@ -544,14 +597,14 @@ def test_valid_actor_state_2():
         assert ray.get(ref) == 100
 
 
-def test_noisy_puts():
+def test_noisy_puts(call_ray_start_shared):
     """
     Randomly kills the data channel with 10% chance when receiving response
     (requests made it to server, responses dropped) and checks that final
     result is still consistent
     """
     random.seed(12345)
-    with start_middleman_server() as (middleman, _):
+    with start_middleman_server() as middleman:
 
         def fail_randomly(response: ray_client_pb2.DataResponse):
             if random.random() < 0.1:
@@ -565,7 +618,7 @@ def test_noisy_puts():
             assert result == i * 123
 
 
-def test_client_reconnect_grace_period():
+def test_client_reconnect_grace_period(call_ray_start_shared):
     """
     Tests that the client gives up attempting to reconnect the channel
     after the grace period expires.
@@ -573,7 +626,7 @@ def test_client_reconnect_grace_period():
     # Lower grace period to 5 seconds to save time
     with patch.dict(
         os.environ, {"RAY_CLIENT_RECONNECT_GRACE_PERIOD": "5"}
-    ), start_middleman_server() as (middleman, _):
+    ), start_middleman_server() as middleman:
         assert ray.get(ray.put(42)) == 42
         # Close channel
         middleman.channel.close()
@@ -586,8 +639,118 @@ def test_client_reconnect_grace_period():
         assert time.time() - start_time < 20
 
 
+class _UnauthenticatedError(grpc.RpcError):
+    def code(self):
+        return grpc.StatusCode.UNAUTHENTICATED
+
+    def details(self):
+        return "Invalid or missing authentication token"
+
+
+class _RejectingStub:
+    """Stands in for a restarted server that rejects the client's token."""
+
+    def __getattr__(self, method):
+        def reject(*args, **kwargs):
+            raise _UnauthenticatedError()
+
+        return reject
+
+
+@pytest.mark.parametrize(
+    "operation", ["put", "get", "pending_future", "cluster_resources"]
+)
+def test_rejected_reconnect_raises_authentication_error(
+    operation, call_ray_start_shared
+):
+    from ray.exceptions import AuthenticationError
+
+    with start_middleman_server() as middleman:
+        ref = ray.put(42)
+        assert ray.get(ref) == 42
+
+        @ray.remote
+        def slow():
+            time.sleep(30)
+
+        pending = slow.remote().future()
+        for servicer in (
+            middleman.task_servicer,
+            middleman.data_servicer,
+            middleman.logs_servicer,
+        ):
+            servicer.stub = _RejectingStub()
+        middleman.reset_channel = lambda: None
+        middleman.channel.close()
+
+        outcome = {}
+
+        run_operation = {
+            "put": lambda: ray.put(42),
+            "get": lambda: ray.get(ref),
+            "pending_future": lambda: pending.result(timeout=20),
+            "cluster_resources": ray.cluster_resources,
+        }[operation]
+
+        def get_after_rejection():
+            try:
+                run_operation()
+            except Exception as e:
+                outcome["error"] = e
+
+        get_thread = threading.Thread(target=get_after_rejection, daemon=True)
+        get_thread.start()
+        # The default reconnect grace period is 30s; a rejection must not wait it out.
+        get_thread.join(timeout=20)
+        assert (
+            not get_thread.is_alive()
+        ), f"{operation} hung after the token was rejected"
+        assert isinstance(outcome.get("error"), AuthenticationError), outcome
+
+
+class _UnavailableError(grpc.RpcError):
+    def code(self):
+        return grpc.StatusCode.UNAVAILABLE
+
+    def details(self):
+        return "Server unreachable"
+
+
+class _UnreachableStub:
+    def __getattr__(self, method):
+        def unavailable(*args, **kwargs):
+            raise _UnavailableError()
+
+        return unavailable
+
+
+def test_rejection_stops_other_retry_loops(call_ray_start_shared):
+    from ray.exceptions import AuthenticationError
+
+    with start_middleman_server() as middleman:
+        ref = ray.put(42)
+        assert ray.get(ref) == 42
+        middleman.task_servicer.stub = _RejectingStub()
+        with pytest.raises(AuthenticationError):
+            ray.cluster_resources()
+
+        # The data channel stays healthy, so only the recorded rejection can
+        # end the retry loop of a call that then finds the server unreachable.
+        middleman.task_servicer.stub = _UnreachableStub()
+        outcome = {}
+
+        def get_ref():
+            try:
+                ray.get(ref)
+            except Exception as e:
+                outcome["error"] = e
+
+        get_thread = threading.Thread(target=get_ref, daemon=True)
+        get_thread.start()
+        get_thread.join(timeout=20)
+        assert not get_thread.is_alive(), "ray.get kept retrying after a rejection"
+        assert isinstance(outcome.get("error"), AuthenticationError), outcome
+
+
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

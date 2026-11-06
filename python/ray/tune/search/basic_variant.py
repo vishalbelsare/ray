@@ -1,25 +1,26 @@
 import copy
-import glob
 import itertools
 import os
 import uuid
-from typing import Dict, List, Optional, Union, TYPE_CHECKING
 import warnings
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
 import numpy as np
 
 from ray.air._internal.usage import tag_searcher
 from ray.tune.error import TuneError
-from ray.tune.experiment.config_parser import _make_parser, _create_trial_from_spec
-from ray.tune.search.sample import np_random_generator, _BackwardsCompatibleNumpyRng
+from ray.tune.experiment.config_parser import _create_trial_from_spec, _make_parser
+from ray.tune.search.sample import _BackwardsCompatibleNumpyRng
+from ray.tune.search.search_algorithm import SearchAlgorithm
 from ray.tune.search.variant_generator import (
-    _count_variants,
     _count_spec_samples,
-    generate_variants,
-    format_vars,
+    _count_variants,
     _flatten_resolved_vars,
     _get_preset_variants,
+    format_vars,
+    generate_variants,
 )
-from ray.tune.search.search_algorithm import SearchAlgorithm
 from ray.tune.utils.util import _atomic_save, _load_newest_checkpoint
 from ray.util import PublicAPI
 
@@ -77,17 +78,15 @@ class _TrialIterator:
             that might have unresolved distributions.
         constant_grid_search: Should random variables be sampled
             first before iterating over grid variants (True) or not (False).
-        output_path: A specific output path within the local_dir.
         points_to_evaluate: Configurations that will be tried out without sampling.
         lazy_eval: Whether variants should be generated
             lazily or eagerly. This is toggled depending
             on the size of the grid search.
         start: index at which to start counting trials.
-        random_state (int | np.random.Generator | np.random.RandomState):
-            Seed or numpy random generator to use for reproducible results.
+        random_state: Seed or numpy random generator to use for reproducible results.
             If None (default), will use the global numpy random generator
             (``np.random``). Please note that full reproducibility cannot
-            be guaranteed in a distributed enviroment.
+            be guaranteed in a distributed environment.
     """
 
     def __init__(
@@ -96,12 +95,11 @@ class _TrialIterator:
         num_samples: int,
         unresolved_spec: dict,
         constant_grid_search: bool = False,
-        output_path: str = "",
         points_to_evaluate: Optional[List] = None,
         lazy_eval: bool = False,
         start: int = 0,
         random_state: Optional[
-            Union[int, "np_random_generator", np.random.RandomState]
+            Union[int, np.random.Generator, np.random.RandomState]
         ] = None,
     ):
         self.parser = _make_parser()
@@ -110,7 +108,6 @@ class _TrialIterator:
         self.num_samples_left = num_samples
         self.unresolved_spec = unresolved_spec
         self.constant_grid_search = constant_grid_search
-        self.output_path = output_path
         self.points_to_evaluate = points_to_evaluate or []
         self.num_points_to_evaluate = len(self.points_to_evaluate)
         self.counter = start
@@ -127,7 +124,6 @@ class _TrialIterator:
         self.counter += 1
         return _create_trial_from_spec(
             spec,
-            self.output_path,
             self.parser,
             evaluated_params=_flatten_resolved_vars(resolved_vars),
             trial_id=trial_id,
@@ -292,7 +288,7 @@ class BasicVariantGenerator(SearchAlgorithm):
         max_concurrent: int = 0,
         constant_grid_search: bool = False,
         random_state: Optional[
-            Union[int, "np_random_generator", np.random.RandomState]
+            Union[int, np.random.Generator, np.random.RandomState]
         ] = None,
     ):
         tag_searcher(self)
@@ -353,7 +349,6 @@ class BasicVariantGenerator(SearchAlgorithm):
                 num_samples=experiment.spec.get("num_samples", 1),
                 unresolved_spec=experiment.spec,
                 constant_grid_search=self._constant_grid_search,
-                output_path=experiment.dir_name,
                 points_to_evaluate=points_to_evaluate,
                 lazy_eval=lazy_eval,
                 start=previous_samples,
@@ -391,34 +386,72 @@ class BasicVariantGenerator(SearchAlgorithm):
             self._live_trials.remove(trial_id)
 
     def get_state(self):
+        """Returns the generator's state, for checkpointing.
+
+        Returns:
+            A copy of the generator's attributes without its trial iterators,
+            or False if any of its variants are generated lazily.
+        """
         if any(iterator.lazy_eval for iterator in self._iterators):
             return False
         state = self.__dict__.copy()
         del state["_trial_generator"]
+        del state["_trial_iter"]
         return state
 
-    def set_state(self, state):
+    def set_state(self, state: Dict):
+        """Restores the generator's state and rebuilds its trial iterators.
+
+        Args:
+            state: A state that ``get_state`` returned.
+        """
         self.__dict__.update(state)
+        self._trial_iter = None
+        self._trial_generator = []
         for iterator in self._iterators:
             self._trial_generator = itertools.chain(self._trial_generator, iterator)
 
-    def save_to_dir(self, dirpath, session_str):
+    def save_to_dir(self, dirpath: str, session_str: str) -> Optional[bool]:
+        """Saves the generator's state to a checkpoint file in ``dirpath``.
+
+        Does nothing if any of the generator's variants are generated lazily.
+
+        Args:
+            dirpath: Directory to write the checkpoint file to.
+            session_str: Unique identifier of the current run session, used
+                in the checkpoint file name.
+
+        Returns:
+            False if the generator wasn't saved, otherwise None.
+        """
         if any(iterator.lazy_eval for iterator in self._iterators):
             return False
         state_dict = self.get_state()
+        file_name = self.CKPT_FILE_TMPL.format(session_str)
         _atomic_save(
             state=state_dict,
             checkpoint_dir=dirpath,
-            file_name=self.CKPT_FILE_TMPL.format(session_str),
-            tmp_file_name=".tmp_generator",
+            file_name=file_name,
+            tmp_file_name=f"tmp-{file_name}",
         )
 
     def has_checkpoint(self, dirpath: str):
-        """Whether a checkpoint file exists within dirpath."""
-        return bool(glob.glob(os.path.join(dirpath, self.CKPT_FILE_TMPL.format("*"))))
+        """Whether a checkpoint file exists within dirpath.
+
+        Args:
+            dirpath: Directory to look for a checkpoint file in.
+
+        Returns:
+            True if ``dirpath`` holds a checkpoint file, False otherwise.
+        """
+        return any(Path(dirpath).glob(self.CKPT_FILE_TMPL.format("*")))
 
     def restore_from_dir(self, dirpath: str):
-        """Restores self + searcher + search wrappers from dirpath."""
+        """Restores the generator's state from the newest checkpoint in dirpath.
+
+        Args:
+            dirpath: Directory that holds the checkpoint file to restore from.
+        """
         state_dict = _load_newest_checkpoint(dirpath, self.CKPT_FILE_TMPL.format("*"))
         if not state_dict:
             raise RuntimeError("Unable to find checkpoint in {}.".format(dirpath))

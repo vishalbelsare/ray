@@ -1,3 +1,6 @@
+.. meta::
+   :description: Reference for Tune trial schedulers that early-stop or mutate trials: ASHA, HyperBand, Median Stopping, Population Based Training, PB2, and BOHB.
+
 .. _tune-schedulers:
 
 Tune Trial Schedulers (tune.schedulers)
@@ -13,12 +16,11 @@ Trainable and is maximized or minimized according to ``mode``.
 .. code-block:: python
 
     from ray import tune
-    from ray.air import session
-    from tune.schedulers import ASHAScheduler
+    from ray.tune.schedulers import ASHAScheduler
 
     def train_fn(config):
         # This objective function is just for demonstration purposes
-        session.report({"loss": config["param"]})
+        tune.report({"loss": config["param"]})
 
     tuner = tune.Tuner(
         train_fn,
@@ -45,7 +47,7 @@ setting the ``scheduler`` parameter of ``tune.TuneConfig``, which is taken in by
 .. code-block:: python
 
     from ray import tune
-    from tune.schedulers import ASHAScheduler
+    from ray.tune.schedulers import ASHAScheduler
 
     asha_scheduler = ASHAScheduler(
         time_attr='training_iteration',
@@ -65,13 +67,14 @@ setting the ``scheduler`` parameter of ``tune.TuneConfig``, which is taken in by
 Compared to the original version of HyperBand, this implementation provides better
 parallelism and avoids straggler issues during eliminations.
 **We recommend using this over the standard HyperBand scheduler.**
-An example of this can be found here: :doc:`/tune/examples/includes/async_hyperband_example`.
+An example of this can be found here: :doc:`/tune/examples/includes/async-hyperband-example`.
 
 Even though the original paper mentions a bracket count of 3, discussions with the authors concluded
 that the value should be left to 1 bracket.
 This is the default used if no value is provided for the ``brackets`` argument.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
     :template: autosummary/class_without_autosummary.rst
 
@@ -87,6 +90,7 @@ Tune implements the `standard version of HyperBand <https://arxiv.org/abs/1603.0
 **We recommend using the ASHA Scheduler over the standard HyperBand scheduler.**
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     HyperBandScheduler
@@ -135,6 +139,7 @@ The Median Stopping Rule implements the simple strategy of stopping a trial if i
 below the median of other trials at similar points in time.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     MedianStoppingRule
@@ -180,11 +185,12 @@ perturb them** slightly in the hopes of discovering even better hyperparameter s
 the trials to explore the new hyperparameter configuration starting from a partially
 trained model (e.g. by copying model weights from one of the top-performing trials).
 
-Take a look at :doc:`/tune/examples/pbt_visualization/pbt_visualization` to get an idea
-of how PBT operates. :doc:`/tune/examples/pbt_guide` gives more examples
+Take a look at :doc:`/tune/examples/pbt-visualization/index` to get an idea
+of how PBT operates. :doc:`/tune/examples/pbt-guide` gives more examples
 of PBT usage.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     PopulationBasedTraining
@@ -196,8 +202,8 @@ Population Based Training Replay (tune.schedulers.PopulationBasedTrainingReplay)
 --------------------------------------------------------------------------------
 
 Tune includes a utility to replay hyperparameter schedules of Population Based Training runs.
-You just specify an existing experiment directory and the ID of the trial you would
-like to replay. The scheduler accepts only one trial, and it will update its
+You just specify the policy file of the trial you would like to replay.
+The scheduler accepts only one trial, and it will update its
 config according to the obtained schedule.
 
 .. code-block:: python
@@ -206,8 +212,7 @@ config according to the obtained schedule.
     from ray.tune.schedulers import PopulationBasedTrainingReplay
 
     replay = PopulationBasedTrainingReplay(
-        experiment_dir="~/ray_results/pbt_experiment/",
-        trial_id="XXXXX_00001"
+        policy_file="~/ray_results/pbt_experiment/pbt_policy_XXXXX_00001.txt"
     )
     tuner = tune.Tuner(
         train_fn,
@@ -219,6 +224,7 @@ See :ref:`here for an example <tune-advanced-tutorial-pbt-replay>` on how to use
 replay utility in practice.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     PopulationBasedTrainingReplay
@@ -232,11 +238,11 @@ Tune includes a distributed implementation of `Population Based Bandits (PB2) <h
 This algorithm builds upon PBT, with the main difference being that instead of using random perturbations,
 PB2 selects new hyperparameter configurations using a Gaussian Process model.
 
-The Tune implementation of PB2 requires GPy and sklearn to be installed:
+The Tune implementation of PB2 requires scikit-learn to be installed:
 
 .. code-block:: bash
 
-    pip install GPy sklearn
+    pip install scikit-learn
 
 
 PB2 can be enabled by setting the ``scheduler`` parameter of ``tune.TuneConfig`` which is taken in by ``Tuner``, e.g.:
@@ -266,12 +272,13 @@ support :ref:`save and restore <tune-trial-checkpoint>`).
 Low-performing trials clone the checkpoints of top performers and perturb the configurations
 in the hope of discovering an even better variation.
 
-The primary motivation for PB2 is the ability to find promising hyperparamters with only a small population size.
-With that in mind, you can run this :doc:`PB2 PPO example </tune/examples/includes/pb2_ppo_example>` to compare PB2 vs. PBT,
+The primary motivation for PB2 is the ability to find promising hyperparameters with only a small population size.
+With that in mind, you can run this :doc:`PB2 PPO example </tune/examples/includes/pb2-ppo-example>` to compare PB2 vs. PBT,
 with a population size of ``4`` (as in the paper).
 The example uses the ``BipedalWalker`` environment so does not require any additional licenses.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     pb2.PB2
@@ -289,10 +296,11 @@ straggler mitigation.
 This is to be used in conjunction with the Tune BOHB search algorithm.
 See :ref:`TuneBOHB <suggest-TuneBOHB>` for package requirements, examples, and details.
 
-An example of this in use can be found here: :doc:`/tune/examples/includes/bohb_example`.
+An example of this in use can be found here: :doc:`/tune/examples/includes/bohb-example`.
 
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     HyperBandForBOHB
@@ -314,9 +322,10 @@ It wraps around another scheduler and uses its decisions.
     The function should be able to :ref:`load and save checkpoints <tune-function-trainable-checkpointing>`
     (the latter preferably every iteration).
 
-An example of this in use can be found here: :doc:`/tune/examples/includes/xgboost_dynamic_resources_example`.
+An example of this in use can be found here: :doc:`/tune/examples/includes/xgboost-dynamic-resources-example`.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     ResourceChangingScheduler
@@ -327,6 +336,7 @@ FIFOScheduler (Default Scheduler)
 ---------------------------------
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     FIFOScheduler
@@ -335,12 +345,13 @@ TrialScheduler Interface
 ------------------------
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     TrialScheduler
 
 .. autosummary::
-    :toctree: doc/
+    :nosignatures:
 
     TrialScheduler.choose_trial_to_run
     TrialScheduler.on_trial_result
@@ -355,6 +366,7 @@ This can be useful if the scheduler you want to use changes often (e.g., specify
 via a CLI option or config file).
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     create_scheduler

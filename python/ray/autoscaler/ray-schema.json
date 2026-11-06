@@ -23,8 +23,13 @@
             "description": "A unique identifier for the head node and workers of this cluster.",
             "type": "string"
         },
+        "auth_mode": {
+            "description": "Ray's authentication mode on every node. `ray up` ships the auth token to the cluster unless this is `disabled`, and sets RAY_AUTH_MODE in every node's start commands when it is given.",
+            "type": "string",
+            "enum": ["token", "disabled"]
+        },
         "max_workers": {
-            "description": "The maximum number of workers nodes to launch in addition to the head node. This takes precedence over min_workers.",
+            "description": "The maximum number of workers nodes to launch in addition to the head node. This should be no larger than the sum of min_workers for all available node types.",
             "type": "integer",
             "minimum": 0
         },
@@ -204,20 +209,44 @@
             "type": "object",
             "description": "How Ray will authenticate with newly launched nodes.",
             "additionalProperties": false,
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {
+                            "ssh_proxy_use_node_id": {
+                                "const": true
+                            }
+                        },
+                        "required": [
+                            "ssh_proxy_use_node_id"
+                        ]
+                    },
+                    "then": {
+                        "required": [
+                            "ssh_proxy_command"
+                        ]
+                    }
+                }
+            ],
             "properties": {
                 "ssh_user": {
                     "type": "string",
                     "default": "ubuntu"
                 },
-                "ssh_public_key": { 
+                "ssh_public_key": {
                     "type": "string"
                 },
-                "ssh_private_key": { 
+                "ssh_private_key": {
                     "type": "string"
                 },
                 "ssh_proxy_command": {
                     "description": "A value for ProxyCommand ssh option, for connecting through proxies. Example: nc -x proxy.example.com:1234 %h %p",
                     "type": "string"
+                },
+                "ssh_proxy_use_node_id": {
+                    "description": "Whether to use the provider node ID instead of the node IP as the SSH target. This is useful for proxy commands that require a node ID.",
+                    "type": "boolean",
+                    "default": false
                 }
             }
         },
@@ -239,7 +268,7 @@
                     "type": "boolean",
                     "description": "run `docker pull` first"
                 },
-                "run_options": { 
+                "run_options": {
                     "type": "array",
                     "description": "shared options for starting head/worker docker"
                 },
@@ -258,7 +287,7 @@
                 "worker_run_options": {
                     "type": "array",
                     "description": "analogous to head_run_options"
-                }, 
+                },
                 "disable_automatic_runtime_detection" : {
                     "type": "boolean",
                     "description": "disable Ray from automatically using the NVIDIA runtime if available",
@@ -269,10 +298,10 @@
                     "description": "disable Ray from automatically detecting /dev/shm size for the container",
                     "default": false
                 },
-              "use_podman"  :  {
-                "type": "boolean",
-                "description": "Use 'podman' command in place of 'docker'",
-                "default": false
+                "use_podman"  :  {
+                    "type": "boolean",
+                    "description": "Use 'podman' command in place of 'docker'",
+                    "default": false
                 }
             }
         },
@@ -345,12 +374,22 @@
                        },
                        "min_workers": {"type": "integer"},
                        "max_workers": {"type": "integer"},
+                       "idle_timeout_s": {"type": "number", "nullable": true},
+                       "priority": {"type": "integer"},
                        "resources": {
 						   "type": "object",
 						   "patternProperties": {
 							   ".*":{
 								   "type": "integer",
 								   "minimum": 0
+							   }
+						   }
+                       },
+                       "labels": {
+						   "type": "object",
+						   "patternProperties": {
+							   ".*":{
+								   "type": "string"
 							   }
 						   }
                        },

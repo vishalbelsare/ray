@@ -1,5 +1,4 @@
-from collections import defaultdict, Counter
-
+from collections import Counter, defaultdict
 from typing import Dict, Generator, List, Optional, TypeVar
 
 # Grouping key - must be hashable
@@ -152,7 +151,7 @@ class _ObjectCache:
                 over ``keep_one``.
 
         Yields:
-            Evicted objects to be cleaned up by caller.
+            U: Evicted objects to be cleaned up by caller.
 
         """
         # If force_all=True, don't keep one.

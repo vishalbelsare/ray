@@ -1,14 +1,11 @@
 import logging
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import numpy as np
-from typing import TYPE_CHECKING, Dict, Optional, List, Union
 
+from ray.air.constants import TRAINING_ITERATION
 from ray.tune.logger.logger import LoggerCallback
-from ray.tune.result import (
-    TRAINING_ITERATION,
-    TIME_TOTAL_S,
-    TIMESTEPS_TOTAL,
-)
+from ray.tune.result import TIME_TOTAL_S, TIMESTEPS_TOTAL
 from ray.tune.utils import flatten_dict
 from ray.util.annotations import PublicAPI
 
@@ -34,27 +31,10 @@ class AimLoggerCallback(LoggerCallback):
     compare them with a performant and well-designed UI.
 
     Source: https://github.com/aimhubio/aim
-
-    Args:
-        repo: Aim repository directory or a `Repo` object that the Run object will
-            log results to. If not provided, a default repo will be set up in the
-            experiment directory (one level above trial directories).
-        experiment: Sets the `experiment` property of each Run object, which is the
-            experiment name associated with it. Can be used later to query
-            runs/sequences.
-            If not provided, the default will be the Tune experiment name set
-            by `RunConfig(name=...)`.
-        metrics: List of metric names (out of the metrics reported by Tune) to
-            track in Aim. If no metric are specified, log everything that
-            is reported.
-        aim_run_kwargs: Additional arguments that will be passed when creating the
-            individual `Run` objects for each trial. For the full list of arguments,
-            please see the Aim documentation:
-            https://aimstack.readthedocs.io/en/latest/refs/sdk.html
     """
 
     VALID_HPARAMS = (str, bool, int, float, list, type(None))
-    VALID_NP_HPARAMS = (np.bool8, np.float32, np.float64, np.int32, np.int64)
+    VALID_NP_HPARAMS = (np.bool_, np.float32, np.float64, np.int32, np.int64)
 
     def __init__(
         self,
@@ -63,8 +43,23 @@ class AimLoggerCallback(LoggerCallback):
         metrics: Optional[List[str]] = None,
         **aim_run_kwargs,
     ):
-        """
-        See help(AimLoggerCallback) for more information about parameters.
+        """Initialize the Aim logger callback.
+
+        Args:
+            repo: Aim repository directory or a `Repo` object that the Run object
+                will log results to. If not provided, a default repo will be set
+                up in the experiment directory (one level above trial directories).
+            experiment_name: Sets the `experiment` property of each Run object,
+                which is the experiment name associated with it. Can be used
+                later to query runs/sequences. If not provided, the default
+                will be the Tune experiment name set by `RunConfig(name=...)`.
+            metrics: List of metric names (out of the metrics reported by Tune)
+                to track in Aim. If no metric are specified, log everything
+                that is reported.
+            **aim_run_kwargs: Additional arguments that will be passed when
+                creating the individual `Run` objects for each trial. For the
+                full list of arguments, please see the Aim documentation:
+                https://aimstack.readthedocs.io/en/latest/refs/sdk.html
         """
         assert Run is not None, (
             "aim must be installed!. You can install aim with"
@@ -98,10 +93,8 @@ class AimLoggerCallback(LoggerCallback):
         )
         # Attach a few useful trial properties
         run["trial_id"] = trial.trial_id
-        run["trial_log_dir"] = trial.local_path
-        if trial.remote_path:
-            run["trial_remote_log_dir"] = trial.remote_path
-        trial_ip = trial.get_runner_ip()
+        run["trial_log_dir"] = trial.path
+        trial_ip = trial.get_ray_actor_ip()
         if trial_ip:
             run["trial_ip"] = trial_ip
         return run

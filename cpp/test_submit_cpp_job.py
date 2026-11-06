@@ -1,13 +1,20 @@
 import os
+import secrets
 import shutil
 import sys
 import tempfile
 
+# RayConfig reads the auth mode once at import, so set the mode before importing
+# ray. A per-process random token, inherited by subprocesses (the head and the
+# submitted C++ job), lets them agree without a hard-coded secret.
+os.environ["RAY_AUTH_MODE"] = "token"
+os.environ.setdefault("RAY_AUTH_TOKEN", secrets.token_hex(32))
+
 import pytest
 
+from ray._common.test_utils import wait_for_condition
 from ray._private.test_utils import (
     format_web_url,
-    wait_for_condition,
     wait_until_server_available,
 )
 from ray.job_submission import JobStatus, JobSubmissionClient
@@ -16,14 +23,12 @@ from ray.tests.conftest import _ray_start
 
 @pytest.fixture(scope="module")
 def headers():
-    return {"Connection": "keep-alive", "Authorization": "TOK:<MY_TOKEN>"}
+    return {"Connection": "keep-alive"}
 
 
 @pytest.fixture(scope="module")
 def job_sdk_client(headers):
-    with _ray_start(
-        include_dashboard=True, num_cpus=1, _node_ip_address="0.0.0.0"
-    ) as ctx:
+    with _ray_start(include_dashboard=True, num_cpus=1) as ctx:
         address = ctx.address_info["webui_url"]
         assert wait_until_server_available(address)
         yield JobSubmissionClient(format_web_url(address), headers=headers)

@@ -1,7 +1,8 @@
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ray import JobID, NodeID
+    from ray import JobID, NodeID, WorkerID
     from ray.runtime_context import RuntimeContext
 
 
@@ -45,6 +46,13 @@ class _ClientWorkerPropertyAPI:
         return NodeID(self._fetch_runtime_context().node_id)
 
     @property
+    def worker_id(self) -> "WorkerID":
+        """Binary worker id for the Ray Client server process (cluster driver worker)."""
+        from ray import WorkerID
+
+        return WorkerID(self._fetch_runtime_context().worker_id)
+
+    @property
     def namespace(self) -> str:
         return self._fetch_runtime_context().namespace
 
@@ -55,3 +63,15 @@ class _ClientWorkerPropertyAPI:
     @property
     def runtime_env(self) -> str:
         return self._fetch_runtime_context().runtime_env
+
+    def check_connected(self) -> bool:
+        return self.worker.ping_server()
+
+    @property
+    def gcs_client(self) -> str:
+        return SimpleNamespace(address=self._fetch_runtime_context().gcs_address)
+
+    @property
+    def node(self):
+        """Emulates the worker.node property for client mode"""
+        return SimpleNamespace(session_name=self._fetch_runtime_context().session_name)

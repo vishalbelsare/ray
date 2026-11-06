@@ -15,37 +15,36 @@
 				"working_dir": {
 					"type": "string"
 				},
+				"repeated_run": {
+					"type": "integer"
+				},
 				"env": {
 					"type": "string"
 				},
 				"stable": {
 					"type": "boolean"
 				},
-				"jailed": {
-					"type": "boolean"
-				},
 				"python": {
 					"type": "string",
 					"enum": [
-						"3.7",
-						"3.8",
-						"3.9"
+						"3.10",
+						"3.11",
+						"3.12",
+						"3.13",
+						"3.14"
 					]
 				},
 				"frequency": {
 					"type": "string",
 					"enum": [
 						"manual",
-						"multi",
 						"nightly",
 						"nightly-3x",
-						"weekly"
+						"weekly",
+						"monthly"
 					]
 				},
 				"team": {
-					"type": "string"
-				},
-				"driver_setup": {
 					"type": "string"
 				},
 				"cluster": {
@@ -75,7 +74,7 @@
 			"type": "object",
 			"additionalProperties": false,
 			"properties": {
-				"cluster_env": {
+				"ray_version": {
 					"type": "string"
 				},
 				"cluster_compute": {
@@ -88,15 +87,43 @@
 				"cloud_id": {
 					"type": "string"
 				},
-				"cloud_name": {
+				"cloud": {
 					"type": "string"
+				},
+				"project_id": {
+					"type": "string"
+				},
+				"byod": {
+					"$ref": "#/definitions/Byod"
+				},
+				"anyscale_sdk_2026": {
+					"type": "boolean"
 				}
 			},
 			"required": [
-				"cluster_compute",
-				"cluster_env"
+				"cluster_compute"
 			],
 			"title": "Cluster"
+		},
+		"Byod": {
+			"type": "object",
+			"additionalProperties": false,
+			"properties": {
+				"type": {
+					"type": "string"
+				},
+				"post_build_script": {
+					"type": "string"
+				},
+				"python_depset": {
+					"type": "string"
+				},
+				"runtime_env": {
+					"type": "object"
+				}
+			},
+			"required": [],
+			"title": "Byod"
 		},
 		"Run": {
 			"type": "object",
@@ -132,6 +159,9 @@
 				},
 				"artifact_path": {
 					"type": "string"
+				},
+				"num_retries": {
+					"type": "integer"
 				}
 			},
 			"required": [
@@ -167,9 +197,6 @@
 				"env": {
 					"type": "string"
 				},
-				"driver_setup": {
-					"type": "string"
-				},
 				"cluster": {
 					"type": "object"
 				},
@@ -183,10 +210,10 @@
 					"type": "string",
 					"enum": [
 						"manual",
-						"multi",
 						"nightly",
 						"nightly-3x",
-						"weekly"
+						"weekly",
+						"monthly"
 					]
 				}
 			},

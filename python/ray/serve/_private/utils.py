@@ -1,41 +1,184 @@
+import asyncio
+import collections
 import copy
+import errno
 import importlib
 import inspect
-import os
-import pickle
+import logging
 import random
-import string
+import re
 import time
-import traceback
+import uuid
+import zlib
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from functools import wraps
-from typing import Dict, Iterable, List, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar, Union, cast
 
-import fastapi.encoders
-import numpy as np
-import pydantic
-import pydantic.json
-import requests
+import requests  # type: ignore[import-untyped]
 
 import ray
 import ray.util.serialization_addons
+from ray import cloudpickle
+from ray._common.constants import HEAD_NODE_RESOURCE_NAME
+from ray._common.utils import get_random_alphanumeric_string, import_attr
+from ray._raylet import MessagePackSerializer  # type: ignore[attr-defined]
 from ray.actor import ActorHandle
-from ray.exceptions import RayTaskError
-from ray.serve._private.constants import HTTP_PROXY_TIMEOUT, RAY_GCS_RPC_TIMEOUT_S
-from ray.serve._private.http_util import HTTPRequestWrapper, build_starlette_request
+from ray.serve._private.common import DeploymentID, RequestMetadata, ServeComponentType
+from ray.serve._private.constants import (
+    HTTP_PROXY_TIMEOUT,
+    SERVE_DEPLOYMENT_ACTOR_PREFIX,
+    SERVE_LOGGER_NAME,
+    SERVE_NAMESPACE,
+)
+from ray.types import ObjectRef
 from ray.util.serialization import StandaloneSerializationContext
-from ray._raylet import MessagePackSerializer
-from ray._private.usage.usage_lib import TagKey, record_extra_usage_tag
-
-import __main__
 
 try:
     import pandas as pd
 except ImportError:
-    pd = None
+    pd = cast(Any, None)
 
-ACTOR_FAILURE_RETRY_TIMEOUT_S = 60
+try:
+    import numpy as np
+except ImportError:
+    np = cast(Any, None)
+
+FILE_NAME_REGEX = r"[^\x20-\x7E]|[<>:\"/\\|?*]"
+
 MESSAGE_PACK_OFFSET = 9
+
+# Attribute set on functions/methods decorated with `@serve.multiplexed`. The
+# `__serve_multiplex_wrapper` is only created lazily on the first call, so this
+# marker is used to detect multiplexing statically (e.g. at replica startup)
+# without invoking user code.
+MULTIPLEXED_FUNCTION_MARKER_ATTR = "_serve_multiplexed_function"
+
+
+def _callable_uses_multiplexing(callable_obj: Any) -> bool:
+    """Whether `callable_obj` is or defines an `@serve.multiplexed` function.
+
+    Accepts a standalone function, a class, or a class instance, so it can be used
+    both at build time (where the deployment's `func_or_class` is available) and at
+    runtime (where an initialized instance is available).
+
+    For an instance it also inspects instance attributes, so multiplexing that is
+    wired up dynamically at init time (e.g. ``self._load_model =
+    serve.multiplexed(...)(fn)``) is detected. This case can only be caught at
+    runtime, since it is not visible on the class statically.
+    """
+    # Static: a plain `getattr` on a `DeploymentHandle` runs `__getattr__`, which
+    # eagerly initializes its Router. `is True` guards against truthy impostors.
+    def _has_marker(obj: Any) -> bool:
+        try:
+            return (
+                inspect.getattr_static(obj, MULTIPLEXED_FUNCTION_MARKER_ATTR, False)
+                is True
+            )
+        except Exception:
+            return False
+
+    # Standalone function deployment decorated with `@serve.multiplexed`.
+    if _has_marker(callable_obj):
+        return True
+
+    # A class (or instance of one) with a method decorated with `@serve.multiplexed`.
+    klass = callable_obj if isinstance(callable_obj, type) else type(callable_obj)
+    for base in klass.__mro__:
+        for attr in base.__dict__.values():
+            if _has_marker(attr):
+                return True
+
+    # An instance that stored a multiplexed wrapper as an instance attribute.
+    if not isinstance(callable_obj, type):
+        # `getattr` falls back to `__getattr__` on a `__slots__` class;
+        # `getattr_static` returns the descriptor rather than the instance mapping.
+        try:
+            instance_vars = object.__getattribute__(callable_obj, "__dict__")
+        except AttributeError:
+            instance_vars = {}
+        for attr in instance_vars.values():
+            if _has_marker(attr):
+                return True
+
+    return False
+
+
+# Set by `serve._router_application`.
+ROUTER_APPLICATION_MARKER_ATTR = "_serve_router_application"
+
+
+def _is_router_application_class(obj: Any) -> bool:
+    """Whether `obj` is a class marked with `@serve._router_application`."""
+    if not isinstance(obj, type):
+        return False
+    # Walks the MRO, so the marker survives `@serve.ingress`'s wrapper subclass.
+    try:
+        return (
+            inspect.getattr_static(obj, ROUTER_APPLICATION_MARKER_ATTR, False) is True
+        )
+    except Exception:
+        return False
+
+
+def asyncio_grpc_exception_handler(loop, context):
+    """Exception handler to filter out false positive BlockingIOErrors from gRPC."""
+    exc = context.get("exception")
+    msg = context.get("message")
+    if (
+        exc
+        and isinstance(exc, BlockingIOError)
+        and exc.errno == errno.EAGAIN
+        and "PollerCompletionQueue._handle_events" in msg
+    ):
+        return
+
+    loop.default_exception_handler(context)
+
+
+def validate_ssl_config(
+    ssl_certfile: Optional[str], ssl_keyfile: Optional[str]
+) -> None:
+    """Validate SSL configuration for HTTPS support.
+
+    Args:
+        ssl_certfile: Path to SSL certificate file
+        ssl_keyfile: Path to SSL private key file
+
+    Raises:
+        ValueError: If only one of ssl_certfile or ssl_keyfile is provided
+    """
+    if (ssl_certfile and not ssl_keyfile) or (ssl_keyfile and not ssl_certfile):
+        raise ValueError(
+            "Both ssl_keyfile and ssl_certfile must be provided together "
+            "to enable HTTPS."
+        )
+
+
+def get_deployment_actor_name(
+    deployment_id: DeploymentID,
+    actor_name: str,
+    code_version: str,
+) -> str:
+    """Return the deterministic Ray actor name for a deployment-scoped actor.
+
+    The name is versioned by code_version to allow old and new replicas to
+    coexist during rollout (each uses its version's actors). Actors serve as
+    central state for replicas, so we version by code_version to ensure fresh
+    actors when a new code version is deployed.
+    """
+    base = (
+        f"{SERVE_DEPLOYMENT_ACTOR_PREFIX}{deployment_id.app_name}"
+        f"::{deployment_id.name}"
+    )
+    return f"{base}::{code_version}::{actor_name}"
+
+
+GENERATOR_COMPOSITION_NOT_SUPPORTED_ERROR = RuntimeError(
+    "Streaming deployment handle results cannot be passed to "
+    "downstream handle calls. If you have a use case requiring "
+    "this feature, please file a feature request on GitHub."
+)
 
 
 # Use a global singleton enum to emulate default options. We cannot use None
@@ -61,16 +204,10 @@ class DeploymentOptionUpdateType(str, Enum):
 T = TypeVar("T")
 Default = Union[DEFAULT, T]
 
+logger = logging.getLogger(SERVE_LOGGER_NAME)
 
-def parse_request_item(request_item):
-    if len(request_item.args) == 1:
-        arg = request_item.args[0]
-        if request_item.metadata.http_arg_is_pickled:
-            assert isinstance(arg, bytes)
-            arg: HTTPRequestWrapper = pickle.loads(arg)
-            return (build_starlette_request(arg.scope, arg.body),), {}
-
-    return request_item.args, request_item.kwargs
+# Format for component files
+FILE_FMT = "{component_name}_{component_id}{suffix}"
 
 
 class _ServeCustomEncoders:
@@ -101,26 +238,14 @@ class _ServeCustomEncoders:
         return obj.to_dict(orient="records")
 
 
-serve_encoders = {
-    np.ndarray: _ServeCustomEncoders.encode_np_array,
-    np.generic: _ServeCustomEncoders.encode_np_scaler,
-    Exception: _ServeCustomEncoders.encode_exception,
-}
+serve_encoders = {Exception: _ServeCustomEncoders.encode_exception}
+
+if np is not None:
+    serve_encoders[np.ndarray] = _ServeCustomEncoders.encode_np_array
+    serve_encoders[np.generic] = _ServeCustomEncoders.encode_np_scaler
 
 if pd is not None:
     serve_encoders[pd.DataFrame] = _ServeCustomEncoders.encode_pandas_dataframe
-
-
-def install_serve_encoders_to_fastapi():
-    """Inject Serve's encoders so FastAPI's jsonable_encoder can pick it up."""
-    # https://stackoverflow.com/questions/62311401/override-default-encoders-for-jsonable-encoder-in-fastapi # noqa
-    pydantic.json.ENCODERS_BY_TYPE.update(serve_encoders)
-    # FastAPI cache these encoders at import time, so we also needs to refresh it.
-    fastapi.encoders.encoders_by_class_tuples = (
-        fastapi.encoders.generate_encoders_by_class_tuples(
-            pydantic.json.ENCODERS_BY_TYPE
-        )
-    )
 
 
 @ray.remote(num_cpus=0)
@@ -150,75 +275,104 @@ def block_until_http_ready(
         time.sleep(backoff_time_s)
 
 
-def get_random_letters(length=6):
-    return "".join(random.choices(string.ascii_letters, k=length))
+def get_random_string(length: int = 8):
+    return get_random_alphanumeric_string(length)
 
 
-def format_actor_name(actor_name, controller_name=None, *modifiers):
-    if controller_name is None:
-        name = actor_name
-    else:
-        name = "{}:{}".format(controller_name, actor_name)
-
+def format_actor_name(actor_name, *modifiers):
+    name = actor_name
     for modifier in modifiers:
         name += "-{}".format(modifier)
 
     return name
 
 
-def get_all_node_ids(gcs_client) -> List[Tuple[str, str]]:
-    """Get IDs for all live nodes in the cluster.
+CLASS_WRAPPER_METADATA_ATTRS = (
+    "__name__",
+    "__qualname__",
+    "__module__",
+    "__doc__",
+    "__annotations__",
+)
 
-    Returns a list of (node_id: str, ip_address: str). The node_id can be
-    passed into the Ray SchedulingPolicy API.
+
+def copy_class_metadata(wrapper_cls, target_cls) -> None:
+    """Copy common class-level metadata onto a wrapper class."""
+    for attr in CLASS_WRAPPER_METADATA_ATTRS:
+        if attr == "__annotations__":
+            target_annotations = getattr(target_cls, "__annotations__", None)
+            if target_annotations:
+                merged_annotations = dict(
+                    wrapper_cls.__dict__.get("__annotations__", {})
+                )
+                for key, value in target_annotations.items():
+                    merged_annotations.setdefault(key, value)
+                wrapper_cls.__annotations__ = merged_annotations
+            continue
+
+        if hasattr(target_cls, attr):
+            setattr(wrapper_cls, attr, getattr(target_cls, attr))
+    wrapper_cls.__wrapped__ = target_cls
+
+
+def _register_thread_lock_serializer(serialization_context):
+    """Make threading locks cloudpickle-serializable.
+
+    FastAPI >= 0.137 embeds a threading.Lock in the ASGI app object, which cloudpickle
+    cannot serialize ("cannot pickle '_thread.lock' object"). serve.ingress(app) pickles
+    the app to freeze it (and again to ship it to replicas), so both fail. A lock carries
+    no transferable state and the app is frozen/shipped before it serves any request, so
+    reconstruct a fresh, unlocked lock on deserialization.
     """
-    nodes = gcs_client.get_all_node_info(timeout=RAY_GCS_RPC_TIMEOUT_S)
-    node_ids = [
-        (ray.NodeID.from_binary(node_id).hex(), node["node_name"].decode("utf-8"))
-        for (node_id, node) in nodes.items()
-        if node["state"] == ray.core.generated.gcs_pb2.GcsNodeInfo.ALIVE
-    ]
+    import threading
 
-    # Sort on NodeID to ensure the ordering is deterministic across the cluster.
-    sorted(node_ids)
-    return node_ids
+    for lock_factory in (threading.Lock, threading.RLock):
+        serialization_context._register_cloudpickle_serializer(
+            type(lock_factory()),
+            custom_serializer=lambda lock: None,
+            custom_deserializer=lambda _serialized, factory=lock_factory: factory(),
+        )
 
 
-def compute_iterable_delta(old: Iterable, new: Iterable) -> Tuple[set, set, set]:
-    """Given two iterables, return the entries that's (added, removed, updated).
+def _register_pydantic_mock_serializer(serialization_context):
+    """Restore pydantic's MockValSer (an unbuilt model's placeholder) from its slots.
 
-    Usage:
-        >>> from ray.serve.utils import compute_iterable_delta
-        >>> old = {"a", "b"}
-        >>> new = {"a", "d"}
-        >>> compute_iterable_delta(old, new)
-        ({"d"}, {"b"}, {"a"})
+    Its __getattr__ reads a slot that is still unset mid-unpickle, so unpickling recursed.
     """
-    old_keys, new_keys = set(old), set(new)
-    added_keys = new_keys - old_keys
-    removed_keys = old_keys - new_keys
-    updated_keys = old_keys.intersection(new_keys)
-    return added_keys, removed_keys, updated_keys
+    try:
+        from pydantic import BaseModel
+        from pydantic._internal._mock_val_ser import MockValSer
+    except ImportError:
+        return
 
+    # Nested so cloudpickle ships it by value and loading never imports ray.serve.
+    def restore(mock, state):
+        for name, value in state.items():
+            object.__setattr__(mock, name, value)
+        # cloudpickle restores a by-value model onto a built, field-less skeleton and
+        # omits its `__pydantic_complete__ = False` (BaseModel's object); undo both.
+        for cell in getattr(state["_attempt_rebuild"], "__closure__", None) or ():
+            owner = cell.cell_contents
+            if isinstance(owner, type) and issubclass(owner, BaseModel):
+                owner.__pydantic_complete__ = False
+                if "__pydantic_core_schema__" in owner.__dict__:
+                    del owner.__pydantic_core_schema__
 
-def compute_dict_delta(old_dict, new_dict) -> Tuple[dict, dict, dict]:
-    """Given two dicts, return the entries that's (added, removed, updated).
-
-    Usage:
-        >>> from ray.serve.utils import compute_dict_delta
-        >>> old = {"a": 1, "b": 2}
-        >>> new = {"a": 3, "d": 4}
-        >>> compute_dict_delta(old, new)
-        ({"d": 4}, {"b": 2}, {"a": 3})
-    """
-    added_keys, removed_keys, updated_keys = compute_iterable_delta(
-        old_dict.keys(), new_dict.keys()
+    serialization_context._register_cloudpickle_reducer(
+        MockValSer,
+        lambda mock: (
+            object.__new__,
+            (MockValSer,),
+            {name: getattr(mock, name) for name in MockValSer.__slots__},
+            None,
+            None,
+            restore,
+        ),
     )
-    return (
-        {k: new_dict[k] for k in added_keys},
-        {k: old_dict[k] for k in removed_keys},
-        {k: new_dict[k] for k in updated_keys},
-    )
+
+
+# Serve pickles user code in many places, some before Ray starts, so register on import.
+_register_pydantic_mock_serializer(StandaloneSerializationContext())
 
 
 def ensure_serialization_context():
@@ -226,17 +380,7 @@ def ensure_serialization_context():
     been started."""
     ctx = StandaloneSerializationContext()
     ray.util.serialization_addons.apply(ctx)
-
-
-def wrap_to_ray_error(function_name: str, exception: Exception) -> RayTaskError:
-    """Utility method to wrap exceptions in user code."""
-
-    try:
-        # Raise and catch so we can access traceback.format_exc()
-        raise exception
-    except Exception as e:
-        traceback_str = ray._private.utils.format_error_message(traceback.format_exc())
-        return ray.exceptions.RayTaskError(function_name, traceback_str, e)
+    _register_thread_lock_serializer(ctx)
 
 
 def msgpack_serialize(obj):
@@ -268,53 +412,8 @@ def merge_dict(dict1, dict2):
     return result
 
 
-def get_deployment_import_path(
-    deployment, replace_main=False, enforce_importable=False
-):
-    """
-    Gets the import path for deployment's func_or_class.
-
-    deployment: A deployment object whose import path should be returned
-    replace_main: If this is True, the function will try to replace __main__
-        with __main__'s file name if the deployment's module is __main__
-    """
-
-    body = deployment._func_or_class
-
-    if isinstance(body, str):
-        # deployment's func_or_class is already an import path
-        return body
-    elif hasattr(body, "__ray_actor_class__"):
-        # If ActorClass, get the class or function inside
-        body = body.__ray_actor_class__
-
-    import_path = f"{body.__module__}.{body.__qualname__}"
-
-    if enforce_importable and "<locals>" in body.__qualname__:
-        raise RuntimeError(
-            "Deployment definitions must be importable to build the Serve app, "
-            f"but deployment '{deployment.name}' is inline defined or returned "
-            "from another function. Please restructure your code so that "
-            f"'{import_path}' can be imported (i.e., put it in a module)."
-        )
-
-    if replace_main:
-        # Replaces __main__ with its file name. E.g. suppose the import path
-        # is __main__.classname and classname is defined in filename.py.
-        # Its import path becomes filename.classname.
-
-        if import_path.split(".")[0] == "__main__" and hasattr(__main__, "__file__"):
-            file_name = os.path.basename(__main__.__file__)
-            extensionless_file_name = file_name.split(".")[0]
-            attribute_name = import_path.split(".")[-1]
-            import_path = f"{extensionless_file_name}.{attribute_name}"
-
-    return import_path
-
-
 def parse_import_path(import_path: str):
-    """
-    Takes in an import_path of form:
+    """Takes in an import_path of form:
 
     [subdirectory 1].[subdir 2]...[subdir n].[file name].[attribute name]
 
@@ -350,7 +449,8 @@ def override_runtime_envs_except_env_vars(parent_env: Dict, child_env: Dict) -> 
         parent_env: The environment to inherit settings from.
         child_env: The environment with override settings.
 
-    Returns: A new dictionary containing the merged runtime_env settings.
+    Returns:
+        A new dictionary containing the merged runtime_env settings.
 
     Raises:
         TypeError: If a dictionary is not passed in for parent_env or child_env.
@@ -401,7 +501,7 @@ def require_packages(packages: List[str]):
     """Decorator making sure function run in specified environments
 
     Examples:
-        >>> from ray.serve.utils import require_packages
+        >>> from ray.serve._private.utils import require_packages
         >>> @require_packages(["numpy", "package_a"]) # doctest: +SKIP
         ... def func(): # doctest: +SKIP
         ...     import numpy as np # doctest: +SKIP
@@ -409,6 +509,13 @@ def require_packages(packages: List[str]):
         >>> func() # doctest: +SKIP
         ImportError: func requires ["numpy", "package_a"] but
         ["package_a"] are not available, please pip install them.
+
+    Args:
+        packages: The list of package names that must be importable when the
+            decorated function is invoked.
+
+    Returns:
+        A decorator that wraps the target function with the package check.
     """
 
     def decorator(func):
@@ -427,7 +534,7 @@ def require_packages(packages: List[str]):
                         "`pip install` them or add them to "
                         "`runtime_env`."
                     )
-                setattr(func, "_require_packages_checked", True)
+                func._require_packages_checked = True
 
         if inspect.iscoroutinefunction(func):
 
@@ -459,20 +566,6 @@ def in_interactive_shell():
     return not hasattr(main, "__file__")
 
 
-def guarded_deprecation_warning(*args, **kwargs):
-    """Wrapper for deprecation warnings, guarded by a flag."""
-    if os.environ.get("SERVE_WARN_V1_DEPRECATIONS", "0") == "1":
-        from ray._private.utils import deprecated
-
-        return deprecated(*args, **kwargs)
-    else:
-
-        def noop_decorator(func):
-            return func
-
-        return noop_decorator
-
-
 def snake_to_camel_case(snake_str: str) -> str:
     """Convert a snake case string to camel case."""
 
@@ -480,58 +573,408 @@ def snake_to_camel_case(snake_str: str) -> str:
     return words[0] + "".join(word[:1].upper() + word[1:] for word in words[1:])
 
 
-def dict_keys_snake_to_camel_case(snake_dict: dict) -> dict:
-    """Converts dictionary's keys from snake case to camel case.
+def check_obj_ref_ready_nowait(obj_ref: ObjectRef) -> bool:
+    """Check if ray object reference is ready without waiting for it."""
+    finished, _ = ray.wait([obj_ref], timeout=0)
+    return len(finished) == 1
 
-    Does not modify original dictionary.
+
+def compress_metric_report(report: Any) -> bytes:
+    """Compress a metric report (HandleMetricReport or ReplicaMetricReport) for RPC.
+
+    Uses zlib level 9 (stdlib, no extra deps). ~75KB uncompressed -> ~5KB for 1000 replicas.
+    """
+    return zlib.compress(cloudpickle.dumps(report), level=9)
+
+
+def decompress_metric_report(compressed: bytes) -> Any:
+    """Decompress a metric report from RPC."""
+    return cloudpickle.loads(zlib.decompress(compressed))
+
+
+def extract_self_if_method_call(args: List[Any], func: Callable) -> Optional[object]:
+    """Check if this is a method rather than a function.
+
+    Does this by checking to see if `func` is the attribute of the first
+    (`self`) argument under `func.__name__`. Unfortunately, this is the most
+    robust solution to this I was able to find. It would also be preferable
+    to do this check when the decorator runs, rather than when the method is.
+
+    Arguments:
+        args: arguments to the function/method call.
+        func: the unbound function that was called.
+
+    Returns:
+        The ``self`` object if it's a method call, else ``None``.
+    """
+    if len(args) > 0:
+        method = getattr(args[0], func.__name__, False)
+        if method:
+            wrapped = getattr(method, "__wrapped__", False)
+            if wrapped and wrapped == func:
+                return args[0]
+
+    return None
+
+
+def call_function_from_import_path(import_path: str) -> Any:
+    """Call the function given import path.
+
+    Args:
+        import_path: The import path of the function to call.
+    Raises:
+        ValueError: If the import path is invalid.
+        TypeError: If the import path is not callable.
+        RuntimeError: if the function raise exeception during execution.
+    Returns:
+        The result of the function call.
+    """
+    try:
+        callback_func = import_attr(import_path)
+    except Exception as e:
+        raise ValueError(f"The import path {import_path} cannot be imported: {e}")
+
+    if not callable(callback_func):
+        raise TypeError(f"The import path {import_path} is not callable.")
+
+    try:
+        return callback_func()
+    except Exception as e:
+        raise RuntimeError(f"The function {import_path} raised an exception: {e}")
+
+
+def get_head_node_id() -> str:
+    """Get the head node id.
+
+    Iterate through all nodes in the ray cluster and return the node id of the first
+    alive node with head node resource.
+    """
+    head_node_id = None
+    for node in ray.nodes():
+        if HEAD_NODE_RESOURCE_NAME in node["Resources"] and node["Alive"]:
+            head_node_id = node["NodeID"]
+            break
+    assert head_node_id is not None, "Cannot find alive head node."
+
+    return head_node_id
+
+
+def calculate_remaining_timeout(
+    *,
+    timeout_s: Optional[float],
+    start_time_s: float,
+    curr_time_s: float,
+) -> Optional[float]:
+    """Get the timeout remaining given an overall timeout, start time, and curr time.
+
+    If the timeout passed in was `None` or negative, will always return that timeout
+    directly.
+
+    If the timeout is >= 0, the returned remaining timeout always be >= 0.
+    """
+    if timeout_s is None or timeout_s < 0:
+        return timeout_s
+
+    time_since_start_s = curr_time_s - start_time_s
+    return max(0, timeout_s - time_since_start_s)
+
+
+def get_all_live_placement_group_names() -> List[str]:
+    """Fetch and parse the Ray placement group table for live placement group names.
+
+    Placement groups are filtered based on their `scheduling_state`; any placement
+    group not in the "REMOVED" state is considered live.
+    """
+    placement_group_table = ray.util.placement_group_table()
+
+    live_pg_names = []
+    for entry in placement_group_table.values():
+        pg_name = entry.get("name", "")
+        if (
+            pg_name
+            and entry.get("stats", {}).get("scheduling_state", "UNKNOWN") != "REMOVED"
+        ):
+            live_pg_names.append(pg_name)
+
+    return live_pg_names
+
+
+def get_active_placement_group_ids() -> Set[str]:
+    """Retrieve the set of placement group IDs referenced by alive Serve actors.
+
+    Returns:
+        The set of placement group IDs referenced by alive Serve actors.
+    """
+    # TODO (jeffreywang): Move the imports to the top of the file.
+    # https://github.com/ray-project/ray/issues/61330
+    from ray.util.state import list_actors
+    from ray.util.state.common import RAY_MAX_LIMIT_FROM_API_SERVER
+
+    actors = list_actors(
+        filters=[
+            ("ray_namespace", "=", SERVE_NAMESPACE),
+            ("state", "=", "ALIVE"),
+        ],
+        limit=RAY_MAX_LIMIT_FROM_API_SERVER,
+        detail=True,
+        raise_on_missing_output=False,
+    )
+
+    return {
+        actor.placement_group_id
+        for actor in actors
+        if actor.placement_group_id is not None
+    }
+
+
+def get_current_actor_id() -> str:
+    """Gets the ID of the calling actor.
+
+    If this is called in a driver, returns "DRIVER."
+
+    If otherwise called outside of an actor, returns an empty string.
+
+    This function hangs when GCS is down due to the `ray.get_runtime_context()`
+    call.
     """
 
-    camel_dict = dict()
-
-    for key, val in snake_dict.items():
-        if isinstance(key, str):
-            camel_dict[snake_to_camel_case(key)] = val
-        else:
-            camel_dict[key] = val
-
-    return camel_dict
-
-
-serve_telemetry_tag_map = {
-    "SERVE_API_VERSION": TagKey.SERVE_API_VERSION,
-    "SERVE_NUM_DEPLOYMENTS": TagKey.SERVE_NUM_DEPLOYMENTS,
-    "GCS_STORAGE": TagKey.GCS_STORAGE,
-    "SERVE_NUM_GPU_DEPLOYMENTS": TagKey.SERVE_NUM_GPU_DEPLOYMENTS,
-    "SERVE_FASTAPI_USED": TagKey.SERVE_FASTAPI_USED,
-    "SERVE_DAG_DRIVER_USED": TagKey.SERVE_DAG_DRIVER_USED,
-    "SERVE_HTTP_ADAPTER_USED": TagKey.SERVE_HTTP_ADAPTER_USED,
-    "SERVE_GRPC_INGRESS_USED": TagKey.SERVE_GRPC_INGRESS_USED,
-    "SERVE_REST_API_VERSION": TagKey.SERVE_REST_API_VERSION,
-    "SERVE_NUM_APPS": TagKey.SERVE_NUM_APPS,
-    "SERVE_NUM_REPLICAS_LIGHTWEIGHT_UPDATED": (
-        TagKey.SERVE_NUM_REPLICAS_LIGHTWEIGHT_UPDATED
-    ),
-    "SERVE_USER_CONFIG_LIGHTWEIGHT_UPDATED": (
-        TagKey.SERVE_USER_CONFIG_LIGHTWEIGHT_UPDATED
-    ),
-    "SERVE_AUTOSCALING_CONFIG_LIGHTWEIGHT_UPDATED": (
-        TagKey.SERVE_AUTOSCALING_CONFIG_LIGHTWEIGHT_UPDATED
-    ),
-}
+    worker_mode = ray.get_runtime_context().worker.mode
+    if worker_mode == ray.SCRIPT_MODE:
+        return "DRIVER"
+    else:
+        try:
+            actor_id = ray.get_runtime_context().get_actor_id()
+            if actor_id is None:
+                return ""
+            else:
+                return actor_id
+        except Exception:
+            return ""
 
 
-def record_serve_tag(key: str, value: str):
-    """Record telemetry.
+def is_running_in_asyncio_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
 
-    TagKey objects cannot be pickled, so deployments can't directly record
-    telemetry using record_extra_usage_tag. They can instead call this function
-    which records telemetry for them.
+
+def get_capacity_adjusted_num_replicas(
+    num_replicas: int, target_capacity: Optional[float]
+) -> int:
+    """Return the `num_replicas` adjusted by the `target_capacity`.
+
+    The output will only ever be 0 if `target_capacity` is 0 or `num_replicas` is
+    0 (to support autoscaling deployments using scale-to-zero).
+
+    Rather than using the default `round` behavior in Python, which rounds half to
+    even, uses the `decimal` module to round half up (standard rounding behavior).
     """
+    if target_capacity is None or target_capacity == 100:
+        return num_replicas
 
-    if key not in serve_telemetry_tag_map:
+    if target_capacity == 0 or num_replicas == 0:
+        return 0
+
+    adjusted_num_replicas = Decimal(num_replicas * target_capacity) / Decimal(100.0)
+    rounded_adjusted_num_replicas = adjusted_num_replicas.to_integral_value(
+        rounding=ROUND_HALF_UP
+    )
+    return max(1, int(rounded_adjusted_num_replicas))
+
+
+def generate_request_id() -> str:
+    # NOTE(edoakes): we use random.getrandbits because it reduces CPU overhead
+    # significantly. This is less cryptographically secure but should be ok for
+    # request ID generation.
+    # See https://bugs.python.org/issue45556 for discussion.
+    return str(uuid.UUID(int=random.getrandbits(128), version=4))
+
+
+def inside_ray_client_context() -> bool:
+    return ray.util.client.ray.is_connected()
+
+
+def get_component_file_name(
+    component_name: str,
+    component_id: str,
+    component_type: Optional[ServeComponentType],
+    suffix: str = "",
+) -> str:
+    """Get the component's file name. Replaces special characters with underscores."""
+    component_name = re.sub(FILE_NAME_REGEX, "_", component_name)
+
+    # For DEPLOYMENT component type, we want to log the deployment name
+    # instead of adding the component type to the component name.
+    component_log_file_name = component_name
+    if component_type is not None:
+        component_log_file_name = f"{component_type.value}_{component_name}"
+        if component_type != ServeComponentType.REPLICA:
+            component_name = f"{component_type}_{component_name}"
+    file_name = FILE_FMT.format(
+        component_name=component_log_file_name,
+        component_id=component_id,
+        suffix=suffix,
+    )
+    return file_name
+
+
+def validate_route_prefix(route_prefix: Union[DEFAULT, None, str]):
+    if route_prefix is DEFAULT.VALUE or route_prefix is None:
+        return
+
+    if not route_prefix.startswith("/"):
         raise ValueError(
-            f'The TagKey "{key}" does not exist. Expected a key from: '
-            f"{list(serve_telemetry_tag_map.keys())}."
+            f"Invalid route_prefix '{route_prefix}', "
+            "must start with a forward slash ('/')."
         )
 
-    record_extra_usage_tag(serve_telemetry_tag_map[key], value)
+    if route_prefix != "/" and route_prefix.endswith("/"):
+        raise ValueError(
+            f"Invalid route_prefix '{route_prefix}', "
+            "may not end with a trailing '/'."
+        )
+
+    if "{" in route_prefix or "}" in route_prefix:
+        raise ValueError(
+            f"Invalid route_prefix '{route_prefix}', may not contain wildcards."
+        )
+
+
+async def await_deployment_response(deployment_response):
+    return await deployment_response
+
+
+async def resolve_deployment_response(obj: Any, request_metadata: RequestMetadata):
+    """Resolve `DeploymentResponse` objects to underlying object references.
+
+    This enables composition without explicitly calling `_to_object_ref`.
+    """
+    from ray.serve.handle import DeploymentResponse, DeploymentResponseGenerator
+
+    if isinstance(obj, DeploymentResponseGenerator):
+        raise GENERATOR_COMPOSITION_NOT_SUPPORTED_ERROR
+    elif isinstance(obj, DeploymentResponse):
+        if request_metadata._by_reference and obj.by_reference:
+
+            # Peek, then wait for presence only. Downstream fetches the value.
+            async def to_ready_ref():
+                return await (await obj._to_object_ref())._ready()
+
+            return asyncio.create_task(to_ready_ref())
+        else:
+            # Otherwise, resolve DeploymentResponse directly to result
+            return asyncio.create_task(await_deployment_response(obj))
+    elif not request_metadata._by_reference and isinstance(obj, ray.ObjectRef):
+        # If the router is sending requests by value (i.e. using gRPC),
+        # resolve all Ray objects to mirror Ray behavior
+        return asyncio.wrap_future(obj.future())
+
+
+def wait_for_interrupt() -> None:
+    try:
+        while True:
+            # Block, letting Ray print logs to the terminal.
+            time.sleep(10)
+    except KeyboardInterrupt:
+        logger.warning("Got KeyboardInterrupt, exiting...")
+        # We need to re-raise KeyboardInterrupt, so serve components can be shutdown
+        # from the main script.
+        raise
+
+
+def is_grpc_enabled(grpc_config) -> bool:
+    return grpc_config.port > 0 and len(grpc_config.grpc_servicer_functions) > 0
+
+
+class Semaphore:
+    """Based on asyncio.Semaphore.
+
+    This is a semaphore that can be used to limit the number of concurrent requests.
+    Its maximum value is dynamic and is determined by the `get_value_fn` function.
+    """
+
+    def __init__(self, get_value_fn: Callable[[], int]):
+        self._waiters = None
+        self._value = 0
+        self._get_value_fn = get_value_fn
+
+    def __repr__(self):
+        res = super().__repr__()
+        extra = "locked" if self.locked() else f"unlocked, value:{self._value}"
+        if self._waiters:
+            extra = f"{extra}, waiters:{len(self._waiters)}"
+        return f"<{res[1:-1]} [{extra}]>"
+
+    async def __aenter__(self):
+        await self.acquire()
+        # We have no use for the "as ..."  clause in the with
+        # statement for locks.
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.release()
+
+    def get_max_value(self):
+        return self._get_value_fn()
+
+    def locked(self):
+        """Returns True if semaphore cannot be acquired immediately."""
+        return self._value >= self.get_max_value() or (
+            any(not w.cancelled() for w in (self._waiters or ()))
+        )
+
+    async def acquire(self):
+        """Acquire a semaphore.
+        If the internal counter is larger than zero on entry,
+        decrement it by one and return True immediately.  If it is
+        zero on entry, block, waiting until some other coroutine has
+        called release() to make it larger than 0, and then return
+        True.
+        """
+        if not self.locked():
+            self._value += 1
+            return True
+
+        if self._waiters is None:
+            self._waiters = collections.deque()
+        fut = asyncio.Future()
+        self._waiters.append(fut)
+
+        # Finally block should be called before the CancelledError
+        # handling as we don't want CancelledError to call
+        # _wake_up_first() and attempt to wake up itself.
+        try:
+            try:
+                await fut
+            finally:
+                self._waiters.remove(fut)
+        except asyncio.CancelledError:
+            if not fut.cancelled():
+                self._value -= 1
+                self._wake_up_next()
+            raise
+
+        if self._value < self.get_max_value():
+            self._wake_up_next()
+        return True
+
+    def release(self):
+        """Release a semaphore, incrementing the internal counter by one.
+        When it was zero on entry and another coroutine is waiting for it to
+        become larger than zero again, wake up that coroutine.
+        """
+        self._value -= 1
+        self._wake_up_next()
+
+    def _wake_up_next(self):
+        """Wake up the first waiter that isn't done."""
+        if not self._waiters:
+            return
+
+        for fut in self._waiters:
+            if not fut.done():
+                self._value += 1
+                fut.set_result(True)
+                return

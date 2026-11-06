@@ -1,10 +1,10 @@
+import hashlib
+import json
 import logging
 import os
 import shutil
 import subprocess
-import hashlib
-import json
-from typing import Optional, List, Union, Tuple
+from typing import List, Optional, Tuple, Union
 
 """Utilities for conda.  Adapted from https://github.com/mlflow/mlflow."""
 
@@ -16,9 +16,7 @@ _WIN32 = os.name == "nt"
 
 
 def get_conda_activate_commands(conda_env_name: str) -> List[str]:
-    """
-    Get a list of commands to run to silently activate the given conda env.
-    """
+    """Get a list of commands to run to silently activate the given conda env."""
     #  Checking for newer conda versions
     if not _WIN32 and ("CONDA_EXE" in os.environ or RAY_CONDA_HOME in os.environ):
         conda_path = get_conda_bin_executable("conda")
@@ -35,13 +33,13 @@ def get_conda_activate_commands(conda_env_name: str) -> List[str]:
             # Use bash command syntax
             activate_conda_env = ["source", activate_path, conda_env_name]
         else:
-            activate_conda_env = ["conda", "activate", conda_env_name]
+            conda_path = get_conda_bin_executable("conda")
+            activate_conda_env = [conda_path, "activate", conda_env_name]
     return activate_conda_env + ["1>&2", "&&"]
 
 
 def get_conda_bin_executable(executable_name: str) -> str:
-    """
-    Return path to the specified executable, assumed to be discoverable within
+    """Return path to the specified executable, assumed to be discoverable within
     a conda installation.
 
     The conda home directory (expected to contain a 'bin' subdirectory on
@@ -88,8 +86,7 @@ def _get_conda_env_name(conda_env_path: str) -> str:
 def create_conda_env_if_needed(
     conda_yaml_file: str, prefix: str, logger: Optional[logging.Logger] = None
 ) -> None:
-    """
-    Given a conda YAML, creates a conda environment containing the required
+    """Given a conda YAML, creates a conda environment containing the required
     dependencies if such a conda environment doesn't already exist.
     Args:
         conda_yaml_file: The path to a conda `environment.yml` file.
@@ -97,9 +94,12 @@ def create_conda_env_if_needed(
             the `--prefix` option to conda create.  This also becomes the name
             of the conda env; i.e. it can be passed into `conda activate` and
             `conda remove`
+        logger: Logger used to surface progress and errors; defaults to the
+            module logger when not provided.
     """
     if logger is None:
         logger = logging.getLogger(__name__)
+
     conda_path = get_conda_bin_executable("conda")
     try:
         exec_cmd([conda_path, "--help"], throw_on_error=False)
@@ -115,7 +115,7 @@ def create_conda_env_if_needed(
         )
 
     _, stdout, _ = exec_cmd([conda_path, "env", "list", "--json"])
-    envs = json.loads(stdout)["envs"]
+    envs = json.loads(stdout[stdout.index("{") :])["envs"]
 
     if prefix in envs:
         logger.info(f"Conda environment {prefix} already exists.")
@@ -159,9 +159,7 @@ def delete_conda_env(prefix: str, logger: Optional[logging.Logger] = None) -> bo
 
 
 def get_conda_env_list() -> list:
-    """
-    Get conda env list.
-    """
+    """Get conda env list in full paths."""
     conda_path = get_conda_bin_executable("conda")
     try:
         exec_cmd([conda_path, "--help"], throw_on_error=False)
@@ -172,6 +170,38 @@ def get_conda_env_list() -> list:
     return envs
 
 
+def get_conda_info_json() -> dict:
+    """Get `conda info --json` output.
+
+    Returns dict of conda info. See [1] for more details. We mostly care about these
+    keys:
+
+    - `conda_prefix`: str The path to the conda installation.
+    - `envs`: List[str] absolute paths to conda environments.
+
+    [1] https://github.com/conda/conda/blob/main/conda/cli/main_info.py
+    """
+    conda_path = get_conda_bin_executable("conda")
+    try:
+        exec_cmd([conda_path, "--help"], throw_on_error=False)
+    except EnvironmentError:
+        raise ValueError(f"Could not find Conda executable at {conda_path}.")
+    _, stdout, _ = exec_cmd([conda_path, "info", "--json"])
+    return json.loads(stdout)
+
+
+def get_conda_envs(conda_info: dict) -> List[Tuple[str, str]]:
+    """Gets the conda environments, as a list of (name, path) tuples."""
+    prefix = conda_info["conda_prefix"]
+    ret = []
+    for env in conda_info["envs"]:
+        if env == prefix:
+            ret.append(("base", env))
+        else:
+            ret.append((os.path.basename(env), env))
+    return ret
+
+
 class ShellCommandException(Exception):
     pass
 
@@ -179,8 +209,7 @@ class ShellCommandException(Exception):
 def exec_cmd(
     cmd: List[str], throw_on_error: bool = True, logger: Optional[logging.Logger] = None
 ) -> Union[int, Tuple[int, str, str]]:
-    """
-    Runs a command as a child process.
+    """Runs a command as a child process.
 
     A convenience wrapper for running a command from a Python script.
 
@@ -191,6 +220,10 @@ def exec_cmd(
         cmd: the command to run, as a list of strings
         throw_on_error: if true, raises an Exception if the exit code of the
             program is nonzero
+        logger: Unused; retained for API compatibility.
+
+    Returns:
+        A tuple of (exit_code, stdout, stderr) from the child process.
     """
     child = subprocess.Popen(
         cmd,

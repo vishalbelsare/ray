@@ -1,70 +1,77 @@
-import random
 import subprocess
 import sys
 import time
 
+import httpx
 import pytest
-import requests
 
 import ray
-from ray._private.test_utils import run_string_as_driver
 from ray import serve
+from ray._common.test_utils import run_string_as_driver
+from ray.serve._private.utils import inside_ray_client_context
+from ray.tests.conftest import hold_test_auth_mode
 
-# https://tools.ietf.org/html/rfc6335#section-6
-MIN_DYNAMIC_PORT = 49152
-MAX_DYNAMIC_PORT = 65535
+
+@pytest.fixture(scope="module")
+def ray_client_instance():
+    # A killed local run can leave its cluster up, and `ray start --head` would then
+    # fail against that stale GCS.
+    subprocess.check_output(["ray", "stop", "--force"])
+    # ray start's default; outside the ephemeral range, so nothing grabs it mid-start.
+    port = 10001
+    with hold_test_auth_mode():
+        subprocess.check_output(
+            [
+                "ray",
+                "start",
+                "--head",
+                "--num-cpus",
+                "16",
+                "--ray-client-server-port",
+                f"{port}",
+                # Bazel points usage reports at 127.0.0.1:8000, so the first one, sent
+                # 60s after start, would hit whichever test app holds route "/".
+                "--disable-usage-stats",
+            ]
+        )
+        try:
+            yield f"localhost:{port}"
+        finally:
+            subprocess.check_output(["ray", "stop", "--force"])
 
 
 @pytest.fixture
-def ray_client_instance(scope="module"):
-    port = random.randint(MIN_DYNAMIC_PORT, MAX_DYNAMIC_PORT)
-    subprocess.check_output(
-        [
-            "ray",
-            "start",
-            "--head",
-            "--num-cpus",
-            "16",
-            "--ray-client-server-port",
-            f"{port}",
-        ]
-    )
-    try:
-        yield f"localhost:{port}"
-    finally:
-        subprocess.check_output(["ray", "stop", "--force"])
-
-
-@pytest.fixture
-def serve_with_client(ray_client_instance, ray_init_kwargs=None):
-    if ray_init_kwargs is None:
-        ray_init_kwargs = dict()
+def serve_with_client(request, ray_client_instance):
     ray.init(
         f"ray://{ray_client_instance}",
         namespace="default_test_namespace",
-        **ray_init_kwargs,
+        **getattr(request, "param", {}),
     )
-    assert ray.util.client.ray.is_connected()
+    assert inside_ray_client_context()
 
     yield
 
-    serve.shutdown()
-    ray.util.disconnect()
+    # After a test disconnects itself, serve.shutdown() would start a new local Ray
+    # instance; reconnect as a client so Serve stops before the next test.
+    try:
+        if not ray.is_initialized():
+            ray.init(f"ray://{ray_client_instance}", namespace="default_test_namespace")
+        serve.shutdown()
+    finally:
+        ray.util.disconnect()
 
 
 @pytest.mark.skipif(
     sys.platform != "linux" and sys.platform != "win32", reason="Buggy on MacOS"
 )
-def test_ray_client(ray_client_instance):
-    ray.util.connect(ray_client_instance, namespace="default_test_namespace")
-
+def test_ray_client(ray_client_instance, serve_with_client):
     start = """
 import ray
 ray.util.connect("{}", namespace="default_test_namespace")
 
 from ray import serve
 
-serve.start(detached=True)
+serve.start()
 """.format(
         ray_client_instance
     )
@@ -76,18 +83,18 @@ ray.util.connect("{}", namespace="default_test_namespace")
 
 from ray import serve
 
-@serve.deployment(name="test1", route_prefix="/hello")
+@serve.deployment
 def f(*args):
     return "hello"
 
-f.deploy()
+serve.run(f.bind(), name="test1", route_prefix="/hello")
 """.format(
         ray_client_instance
     )
     run_string_as_driver(deploy)
 
-    assert "test1" in serve.list_deployments()
-    assert requests.get("http://localhost:8000/hello").text == "hello"
+    assert "test1" in serve.status().applications
+    assert httpx.get("http://localhost:8000/hello").text == "hello"
 
     delete = """
 import ray
@@ -95,13 +102,13 @@ ray.util.connect("{}", namespace="default_test_namespace")
 
 from ray import serve
 
-serve.get_deployment("test1").delete()
+serve.delete("test1")
 """.format(
         ray_client_instance
     )
     run_string_as_driver(delete)
 
-    assert "test1" not in serve.list_deployments()
+    assert "test1" not in serve.status().applications
 
     fastapi = """
 import ray
@@ -121,21 +128,16 @@ def hello():
 class A:
     pass
 
-A.deploy()
+serve.run(A.bind(), route_prefix="/A")
 """.format(
         ray_client_instance
     )
     run_string_as_driver(fastapi)
 
-    assert requests.get("http://localhost:8000/A").json() == "hello"
-
-    serve.shutdown()
-    ray.util.disconnect()
+    assert httpx.get("http://localhost:8000/A", follow_redirects=True).json() == "hello"
 
 
 def test_quickstart_class(serve_with_client):
-    serve.start()
-
     @serve.deployment
     def hello(request):
         name = request.query_params["name"]
@@ -144,7 +146,7 @@ def test_quickstart_class(serve_with_client):
     serve.run(hello.bind())
 
     # Query our endpoint over HTTP.
-    response = requests.get("http://127.0.0.1:8000/hello?name=serve").text
+    response = httpx.get("http://127.0.0.1:8000/hello?name=serve").text
     assert response == "Hello serve!"
 
 
@@ -163,9 +165,9 @@ def test_quickstart_counter(serve_with_client):
     print("deploy finished")
 
     # Query our endpoint in two different ways: from HTTP and from Python.
-    assert requests.get("http://127.0.0.1:8000/Counter").json() == {"count": 1}
+    assert httpx.get("http://127.0.0.1:8000/Counter").json() == {"count": 1}
     print("query 1 finished")
-    assert ray.get(handle.remote()) == {"count": 2}
+    assert handle.remote().result() == {"count": 2}
     print("query 2 finished")
 
 
@@ -194,13 +196,32 @@ def test_handle_hanging(serve_with_client):
     handle = serve.run(f.bind())
 
     for _ in range(5):
-        assert ray.get(handle.remote()) == 1
+        assert handle.remote().result() == 1
         time.sleep(0.5)
 
     ray.shutdown()
 
 
-if __name__ == "__main__":
-    import sys
+def test_streaming_handle(serve_with_client):
+    """stream=True is not supported, check that there's a good error message."""
 
+    @serve.deployment
+    def f():
+        return 1
+
+    h = serve.run(f.bind())
+    h = h.options(stream=False)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "Streaming DeploymentHandles are not currently supported when "
+            "connected to a remote Ray cluster using Ray Client."
+        ),
+    ):
+        h = h.options(stream=True)
+
+    assert h.remote().result() == 1
+
+
+if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))

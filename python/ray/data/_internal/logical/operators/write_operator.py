@@ -1,29 +1,53 @@
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Union
 
-from ray.data._internal.logical.interfaces import LogicalOperator
+from ray.data._internal.compute import ComputeStrategy
+from ray.data._internal.logical.interfaces import (
+    LogicalOperator,
+    LogicalOperatorPreservesSchema,
+)
 from ray.data._internal.logical.operators.map_operator import AbstractMap
-from ray.data._internal.compute import TaskPoolStrategy
+from ray.data.datasource.datasink import Datasink
 from ray.data.datasource.datasource import Datasource
 
+__all__ = [
+    "Write",
+]
 
-class Write(AbstractMap):
+
+@dataclass(frozen=True, repr=False, eq=False)
+class Write(AbstractMap, LogicalOperatorPreservesSchema):
     """Logical operator for write."""
 
-    def __init__(
-        self,
-        input_op: LogicalOperator,
-        datasource: Datasource,
-        ray_remote_args: Optional[Dict[str, Any]] = None,
-        **write_args,
-    ):
-        super().__init__(
-            "Write",
-            input_op,
-            ray_remote_args,
+    datasink_or_legacy_datasource: Union[Datasink, Datasource]
+    input_dependencies: list[LogicalOperator] = field(repr=False, kw_only=True)
+    ray_remote_args: Dict[str, Any] = field(default_factory=dict)
+    compute: Optional[ComputeStrategy] = None
+    write_args: Dict[str, Any] = field(default_factory=dict)
+    can_modify_num_rows: bool = field(init=False, default=True)
+    min_rows_per_bundled_input: Optional[int] = field(init=False)
+    ray_remote_args_fn: None = field(init=False, default=None)
+    per_block_limit: Optional[int] = None
+
+    def __post_init__(self):
+        assert len(self.input_dependencies) == 1, len(self.input_dependencies)
+        if isinstance(self.datasink_or_legacy_datasource, Datasink):
+            datasink = self.datasink_or_legacy_datasource
+            min_rows_per_bundled_input = datasink.min_rows_per_write
+            if (
+                min_rows_per_bundled_input is not None
+                and datasink.min_bytes_per_write is not None
+            ):
+                raise ValueError(
+                    "Datasink cannot specify both min_rows_per_write and "
+                    "min_bytes_per_write. Set only one write bundling target."
+                )
+        else:
+            min_rows_per_bundled_input = None
+        if self.compute is None:
+            from ray.data._internal.compute import TaskPoolStrategy
+
+            object.__setattr__(self, "compute", TaskPoolStrategy())
+        object.__setattr__(
+            self, "min_rows_per_bundled_input", min_rows_per_bundled_input
         )
-        self._datasource = datasource
-        self._write_args = write_args
-        # Always use task to write.
-        self._compute = TaskPoolStrategy()
-        # Take the input blocks unchanged while writing.
-        self._target_block_size = float("inf")

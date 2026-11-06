@@ -3,12 +3,11 @@ from __future__ import print_function
 import collections
 import datetime
 import numbers
-
-import os
 import sys
 import textwrap
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -17,9 +16,11 @@ import pandas as pd
 import ray
 from ray._private.dict import flatten_dict
 from ray._private.thirdparty.tabulate.tabulate import tabulate
-from ray.experimental.tqdm_ray import safe_print
+from ray.air.constants import EXPR_ERROR_FILE, TRAINING_ITERATION
 from ray.air.util.node import _force_on_current_node
+from ray.experimental.tqdm_ray import safe_print
 from ray.tune.callback import Callback
+from ray.tune.experiment.trial import DEBUG_PRINT_INTERVAL, Trial, _Location
 from ray.tune.logger import pretty_print
 from ray.tune.result import (
     AUTO_RESULT_KEYS,
@@ -33,16 +34,13 @@ from ray.tune.result import (
     PID,
     TIME_TOTAL_S,
     TIMESTEPS_TOTAL,
-    TRAINING_ITERATION,
     TRIAL_ID,
 )
-from ray.tune.experiment.trial import DEBUG_PRINT_INTERVAL, Trial, _Location
 from ray.tune.trainable import Trainable
 from ray.tune.utils import unflattened_lookup
 from ray.tune.utils.log import Verbosity, has_verbosity, set_verbosity
 from ray.util.annotations import DeveloperAPI, PublicAPI
 from ray.util.queue import Empty, Queue
-
 from ray.widgets import Template
 
 try:
@@ -99,13 +97,13 @@ class ProgressReporter:
         """
         raise NotImplementedError
 
-    def report(self, trials: List[Trial], done: bool, *sys_info: Dict):
+    def report(self, trials: List[Trial], done: bool, *sys_info: str):
         """Reports progress across trials.
 
         Args:
             trials: Trials to report on.
             done: Whether this is the last progress report attempt.
-            sys_info: System info.
+            *sys_info: System info strings to include in the report.
         """
         raise NotImplementedError
 
@@ -128,6 +126,8 @@ class TuneReporterBase(ProgressReporter):
             be parameter names and the values should be the displayed names.
             If this is a list, the parameter name is used directly. If empty,
             defaults to all available parameters.
+        total_samples: Total number of samples expected for the tuning run,
+            used to render progress totals. Defaults to None.
         max_progress_rows: Maximum number of rows to print
             in the progress table. The progress table describes the
             progress of each trial. Defaults to 20.
@@ -316,7 +316,7 @@ class TuneReporterBase(ProgressReporter):
         self,
         trials: List[Trial],
         done: bool,
-        *sys_info: Dict,
+        *sys_info: str,
         fmt: str = "psql",
         delim: str = "\n",
     ):
@@ -330,8 +330,12 @@ class TuneReporterBase(ProgressReporter):
         Args:
             trials: Trials to report on.
             done: Whether this is the last progress report attempt.
+            *sys_info: System info strings appended below the status header.
             fmt: Table format. See `tablefmt` in tabulate API.
             delim: Delimiter between messages.
+
+        Returns:
+            The rendered progress string.
         """
         if self._sort_by_metric and (self._metric is None or self._mode is None):
             self._sort_by_metric = False
@@ -468,6 +472,8 @@ class JupyterNotebookReporter(TuneReporterBase, RemoteReporterMixin):
             be parameter names and the values should be the displayed names.
             If this is a list, the parameter name is used directly. If empty,
             defaults to all available parameters.
+        total_samples: Total number of samples expected for the tuning run,
+            used to render progress totals. Defaults to None.
         max_progress_rows: Maximum number of rows to print
             in the progress table. The progress table describes the
             progress of each trial. Defaults to 20.
@@ -532,14 +538,14 @@ class JupyterNotebookReporter(TuneReporterBase, RemoteReporterMixin):
                 "If this leads to unformatted output (e.g. like "
                 "<IPython.core.display.HTML object>), consider passing "
                 "a `CLIReporter` as the `progress_reporter` argument "
-                "to `air.RunConfig()` instead."
+                "to `tune.RunConfig()` instead."
             )
 
         self._overwrite = overwrite
         self._display_handle = None
         self.display("")  # initialize empty display to update later
 
-    def report(self, trials: List[Trial], done: bool, *sys_info: Dict):
+    def report(self, trials: List[Trial], done: bool, *sys_info: str):
         progress = self._progress_html(trials, done, *sys_info)
 
         if self.output_queue is not None:
@@ -639,6 +645,8 @@ class CLIReporter(TuneReporterBase):
             be parameter names and the values should be the displayed names.
             If this is a list, the parameter name is used directly. If empty,
             defaults to all available parameters.
+        total_samples: Total number of samples expected for the tuning run,
+            used to render progress totals. Defaults to None.
         max_progress_rows: Maximum number of rows to print
             in the progress table. The progress table describes the
             progress of each trial. Defaults to 20.
@@ -698,7 +706,7 @@ class CLIReporter(TuneReporterBase):
     def _print(self, msg: str):
         safe_print(msg)
 
-    def report(self, trials: List[Trial], done: bool, *sys_info: Dict):
+    def report(self, trials: List[Trial], done: bool, *sys_info: str):
         self._print(self._progress_str(trials, done, *sys_info))
 
 
@@ -839,6 +847,9 @@ def _trial_progress_str(
             minimizing or maximizing the metric attribute.
         sort_by_metric: Sort terminated trials by metric in the
             intermediate table. Defaults to False.
+
+    Returns:
+        Human-readable progress message describing the trials.
     """
     messages = []
     delim = "<br>" if fmt == "html" else "\n"
@@ -897,6 +908,12 @@ def _max_len(
         add_addr: If True, will add part of the object address to the end of the
             string, e.g. to identify different instances of the same class. If
             False, three dots (``...``) will be used instead.
+        wrap: If True, wrap long strings across up to two rows of ``max_len``
+            characters instead of truncating with an ellipsis.
+
+    Returns:
+        The original value if it is numeric/bool/None, otherwise an abbreviated
+        or wrapped string representation.
     """
     if value is None or isinstance(value, (int, float, numbers.Number, bool)):
         return value
@@ -1111,8 +1128,10 @@ def _trial_progress_table(
     return messages
 
 
-def _generate_sys_info_str(*sys_info) -> str:
+def _generate_sys_info_str(*sys_info: str) -> str:
     """Format system info into a string.
+
+    Args:
         *sys_info: System info strings to be included.
 
     Returns:
@@ -1133,6 +1152,10 @@ def _trial_errors_str(
         fmt: Output format (see tablefmt in tabulate API).
         max_rows: Maximum number of rows in the error table. Defaults to
             unlimited.
+
+    Returns:
+        A delimited string describing errored trials, or an empty string if
+        no trials have errored.
     """
     messages = []
     failed = [t for t in trials if t.error_file]
@@ -1145,14 +1168,29 @@ def _trial_errors_str(
                     max_rows, num_failed - max_rows
                 )
             )
-        error_table = []
-        for trial in failed[:max_rows]:
-            row = [str(trial), trial.num_failures, trial.error_file]
-            error_table.append(row)
-        columns = ["Trial name", "# failures", "error file"]
+
+        fail_header = ["Trial name", "# failures", "error file"]
+        fail_table_data = [
+            [
+                str(trial),
+                str(trial.run_metadata.num_failures)
+                + ("" if trial.status == Trial.ERROR else "*"),
+                trial.error_file,
+            ]
+            for trial in failed[:max_rows]
+        ]
         messages.append(
-            tabulate(error_table, headers=columns, tablefmt=fmt, showindex=False)
+            tabulate(
+                fail_table_data,
+                headers=fail_header,
+                tablefmt=fmt,
+                showindex=False,
+                colalign=("left", "right", "left"),
+            )
         )
+        if any(trial.status == Trial.TERMINATED for trial in failed[:max_rows]):
+            messages.append("* The trial terminated successfully after retrying.")
+
     delim = "<br>" if fmt == "html" else "\n"
     return delim.join(messages)
 
@@ -1185,7 +1223,11 @@ def _fair_filter_trials(
     The oldest trials are truncated if necessary.
 
     Args:
-        trials_by_state: Maximum number of trials to return.
+        trials_by_state: Mapping from trial state to the trials in that state.
+        max_trials: Maximum total number of trials to return across all states.
+        sort_by_metric: If True, preserve the existing order of terminated
+            trials (assumed pre-sorted by metric); otherwise sort by trial id.
+
     Returns:
         Dict mapping state to List of fairly represented trials.
     """
@@ -1224,7 +1266,7 @@ def _get_trial_location(trial: Trial, result: dict) -> _Location:
         location = _Location(node_ip, pid)
     else:
         # fallback to trial location if there hasn't been a report yet
-        location = trial.location
+        location = trial.temporary_state.location
     return location
 
 
@@ -1240,6 +1282,10 @@ def _get_trial_info(
         parameters: Names of trial parameters to include.
         metrics: Names of metrics to include.
         max_column_length: Maximum column length (in characters).
+
+    Returns:
+        A list with the trial name, status, location, parameter values, and
+        metric values (in that order), abbreviated to ``max_column_length``.
     """
     result = trial.last_result
     config = trial.config
@@ -1373,7 +1419,7 @@ class TrialProgressCallback(Callback):
         elif has_verbosity(Verbosity.V2_TRIAL_NORM):
             metric_name = self._metric or "_metric"
             metric_value = result.get(metric_name, -99.0)
-            error_file = os.path.join(trial.local_path, "error.txt")
+            error_file = Path(trial.local_path, EXPR_ERROR_FILE).as_posix()
 
             info = ""
             if done:
@@ -1435,7 +1481,9 @@ class TrialProgressCallback(Callback):
             )
         )
 
-    def display_result(self, trial: Trial, result: Dict, error: bool, done: bool):
+    def display_result(
+        self, trial: Trial, result: Dict, error: bool, done: bool
+    ) -> None:
         """Display a formatted HTML table of trial progress results.
 
         Trial progress is only shown if verbosity is set to level 2 or 3.
@@ -1446,7 +1494,7 @@ class TrialProgressCallback(Callback):
             error: True if an error has occurred, False otherwise
             done: True if the trial is finished, False otherwise
         """
-        from IPython.display import display, HTML
+        from IPython.display import HTML, display
 
         self._last_result[trial] = result
         if has_verbosity(Verbosity.V3_TRIAL_DETAILS):
@@ -1499,7 +1547,7 @@ class TrialProgressCallback(Callback):
         return print_result_str
 
 
-def _detect_reporter(**kwargs) -> TuneReporterBase:
+def _detect_reporter(_trainer_api: bool = False, **kwargs) -> TuneReporterBase:
     """Detect progress reporter class.
 
     Will return a :class:`JupyterNotebookReporter` if a IPython/Jupyter-like
@@ -1507,7 +1555,7 @@ def _detect_reporter(**kwargs) -> TuneReporterBase:
 
     Keyword arguments are passed on to the reporter class.
     """
-    if IS_NOTEBOOK:
+    if IS_NOTEBOOK and not _trainer_api:
         kwargs.setdefault("overwrite", not has_verbosity(Verbosity.V2_TRIAL_NORM))
         progress_reporter = JupyterNotebookReporter(**kwargs)
     else:
@@ -1555,9 +1603,7 @@ def _stream_client_output(
     progress_reporter: ProgressReporter,
     string_queue: Queue,
 ) -> Any:
-    """
-    Stream items from string queue to progress_reporter until remote_future resolves
-    """
+    """Stream items from string queue to progress_reporter until remote_future resolves"""
     if string_queue is None:
         return
 

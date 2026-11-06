@@ -8,15 +8,14 @@ from ray.util.annotations import PublicAPI
 class Stopper(abc.ABC):
     """Base class for implementing a Tune experiment stopper.
 
-    Allows users to implement experiment-level stopping via ``stop_all``. By
-    default, this class does not stop any trials. Subclasses need to
-    implement ``__call__`` and ``stop_all``.
+    Allows users to implement experiment-level stopping via ``stop_all``.
+    Subclasses need to implement ``__call__`` and ``stop_all``. The base
+    class raises ``NotImplementedError`` for both.
 
     Examples:
 
         >>> import time
-        >>> from ray import air, tune
-        >>> from ray.air import session
+        >>> from ray import tune
         >>> from ray.tune import Stopper
         >>>
         >>> class TimeStopper(Stopper):
@@ -33,12 +32,12 @@ class Stopper(abc.ABC):
         >>> def train_fn(config):
         ...     for i in range(100):
         ...         time.sleep(1)
-        ...         session.report({"iter": i})
+        ...         tune.report({"iter": i})
         ...
         >>> tuner = tune.Tuner(
         ...     train_fn,
         ...     tune_config=tune.TuneConfig(num_samples=2),
-        ...     run_config=air.RunConfig(stop=TimeStopper()),
+        ...     run_config=tune.RunConfig(stop=TimeStopper()),
         ... )
         >>> print("[ignore]"); result_grid = tuner.fit()  # doctest: +ELLIPSIS
         [ignore]...
@@ -46,11 +45,23 @@ class Stopper(abc.ABC):
     """
 
     def __call__(self, trial_id: str, result: Dict[str, Any]) -> bool:
-        """Returns true if the trial should be terminated given the result."""
+        """Returns true if the trial should be terminated given the result.
+
+        Args:
+            trial_id: The ID of the trial that reported the result.
+            result: The result the trial reported.
+
+        Returns:
+            True to stop the trial, False to let it continue.
+        """
         raise NotImplementedError
 
     def stop_all(self) -> bool:
-        """Returns true if the experiment should be terminated."""
+        """Returns true if the experiment should be terminated.
+
+        Returns:
+            True to stop all trials, False otherwise.
+        """
         raise NotImplementedError
 
 
@@ -64,8 +75,7 @@ class CombinedStopper(Stopper):
     Examples:
 
         >>> import numpy as np
-        >>> from ray import air, tune
-        >>> from ray.air import session
+        >>> from ray import tune
         >>> from ray.tune.stopper import (
         ...     CombinedStopper,
         ...     MaximumIterationStopper,
@@ -78,11 +88,11 @@ class CombinedStopper(Stopper):
         ... )
         >>> def train_fn(config):
         ...     for i in range(15):
-        ...         session.report({"my_metric": np.random.normal(0, 1 - i / 15)})
+        ...         tune.report({"my_metric": np.random.normal(0, 1 - i / 15)})
         ...
         >>> tuner = tune.Tuner(
         ...     train_fn,
-        ...     run_config=air.RunConfig(stop=stopper),
+        ...     run_config=tune.RunConfig(stop=stopper),
         ... )
         >>> print("[ignore]"); result_grid = tuner.fit()  # doctest: +ELLIPSIS
         [ignore]...

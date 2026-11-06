@@ -1,16 +1,16 @@
+import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from operator import getitem
-import uuid
+from typing import Any
+
+from dask.core import get as get_sync, quote
+from dask.utils import apply
 
 import ray
 
-from dask.base import quote
-from dask.core import get as get_sync
-from dask.utils import apply
-
 try:
-    from dataclasses import is_dataclass, fields as dataclass_fields
+    from dataclasses import fields as dataclass_fields, is_dataclass
 except ImportError:
     # Python < 3.7
     def is_dataclass(x):
@@ -20,9 +20,8 @@ except ImportError:
         return []
 
 
-def unpack_object_refs(*args):
-    """
-    Extract Ray object refs from a set of potentially arbitrarily nested
+def unpack_object_refs(*args: Any):
+    """Extract Ray object refs from a set of potentially arbitrarily nested
     Python objects.
 
     Intended use is to find all Ray object references in a set of (possibly

@@ -1,4 +1,5 @@
 import copy
+import sys
 from unittest.mock import Mock, patch
 
 import pytest
@@ -8,6 +9,7 @@ import ray.tests.aws.utils.helpers as helpers
 import ray.tests.aws.utils.stubs as stubs
 from ray.autoscaler._private.aws.config import (
     DEFAULT_AMI,
+    _configure_key_pair,
     _configure_subnet,
     _get_subnets_or_die,
     bootstrap_aws,
@@ -32,6 +34,66 @@ from ray.tests.aws.utils.constants import (
     DEFAULT_SG_WITH_RULES_AUX_SUBNET,
     DEFAULT_SUBNET,
 )
+
+
+def test_key_pair_creation_retries_after_duplicate(ec2_client_stub, tmp_path):
+    key_name = "ray-test-key"
+    next_key_name = f"{key_name}_key-1"
+    key_path = tmp_path / f"{key_name}.pem"
+    next_key_path = tmp_path / f"{next_key_name}.pem"
+    config = {
+        "provider": {
+            "region": "us-west-2",
+            "key_pair": {"key_name": key_name},
+        },
+        "auth": {},
+        "available_node_types": {
+            "ray.head.default": {"node_config": {}},
+            "ray.worker.default": {"node_config": {}},
+        },
+    }
+
+    ec2_client_stub.add_response(
+        "describe_key_pairs",
+        service_response={"KeyPairs": []},
+        expected_params={"Filters": [{"Name": "key-name", "Values": [key_name]}]},
+    )
+    ec2_client_stub.add_client_error(
+        "create_key_pair",
+        service_error_code="InvalidKeyPair.Duplicate",
+        service_message="The key pair already exists.",
+        http_status_code=400,
+        expected_params={"KeyName": key_name},
+    )
+    ec2_client_stub.add_response(
+        "describe_key_pairs",
+        service_response={"KeyPairs": []},
+        expected_params={"Filters": [{"Name": "key-name", "Values": [next_key_name]}]},
+    )
+    ec2_client_stub.add_response(
+        "create_key_pair",
+        service_response={
+            "KeyName": next_key_name,
+            "KeyMaterial": "private-key-material",
+            "KeyFingerprint": "00:11:22:33:44:55:66:77",
+        },
+        expected_params={"KeyName": next_key_name},
+    )
+
+    with patch(
+        "ray.autoscaler._private.aws.config.key_pair",
+        side_effect=[
+            (key_name, str(key_path)),
+            (next_key_name, str(next_key_path)),
+        ],
+    ):
+        result = _configure_key_pair(config)
+
+    assert result["auth"]["ssh_private_key"] == str(next_key_path)
+    assert not key_path.exists()
+    assert next_key_path.read_text() == "private-key-material"
+    for node_type in result["available_node_types"].values():
+        assert node_type["node_config"]["KeyName"] == next_key_name
 
 
 def test_use_subnets_in_only_one_vpc(iam_client_stub, ec2_client_stub):
@@ -769,6 +831,36 @@ def test_terminate_nodes(num_on_demand_nodes, num_spot_nodes, stop):
         assert nodes_to_include_in_call == nodes_included_in_call
 
 
+def test_retry_get_node():
+    """
+    This tests _get_node() retries `ec2.instances.filter` if the first call returns an empty list.
+    This is important because the EC2 API is eventually consistent, and it may take some time for the
+    instance to be available after it has been launched.
+    """
+
+    with patch("ray.autoscaler._private.aws.node_provider.make_ec2_resource"):
+        provider = AWSNodeProvider(
+            provider_config={"region": "nowhere"},
+            cluster_name="default",
+        )
+
+    attempts = 0
+    fake_instance = {"id": "i-1234567890abcdef0"}
+
+    def mock_filter(*args, **kwargs):
+        nonlocal attempts
+        if kwargs.get("InstanceIds") == [fake_instance["id"]]:
+            attempts += 1
+            if attempts > 1:
+                return [fake_instance]
+        return []
+
+    provider.ec2.instances.filter.side_effect = mock_filter
+
+    assert provider._get_node(fake_instance["id"]) == fake_instance
+    assert attempts == 2
+
+
 def test_use_subnets_ordered_by_az(ec2_client_stub):
     """
     This test validates that when bootstrap_aws populates the SubnetIds field,
@@ -1155,6 +1247,4 @@ def test_cloudwatch_alarm_update_worker_node(
 
 
 if __name__ == "__main__":
-    import sys
-
     sys.exit(pytest.main(["-v", __file__]))

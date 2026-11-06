@@ -1,3 +1,6 @@
+.. meta::
+   :description: Reference for Tune's LoggerCallback interface and built-in loggers, plus the MLflow, Weights & Biases, Comet, and Aim integrations.
+
 .. _loggers-docstring:
 
 Tune Loggers (tune.logger)
@@ -11,8 +14,7 @@ see :ref:`Trainable Logging <trainable-logging>`.
 
 .. note::
 
-    Tune's per-trial ``Logger`` classes have been deprecated. They can still be used, but we encourage you
-    to use the ``LoggerCallback`` interface instead.
+    Tune's per-trial ``Logger`` classes have been deprecated. Use the ``LoggerCallback`` interface instead.
 
 
 .. currentmodule:: ray
@@ -23,12 +25,13 @@ LoggerCallback Interface (tune.logger.LoggerCallback)
 -----------------------------------------------------
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     ~tune.logger.LoggerCallback
 
 .. autosummary::
-    :toctree: doc/
+    :nosignatures:
 
     ~tune.logger.LoggerCallback.log_trial_start
     ~tune.logger.LoggerCallback.log_trial_restore
@@ -41,6 +44,7 @@ Tune Built-in Loggers
 ---------------------
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     tune.logger.JsonLoggerCallback
@@ -56,9 +60,11 @@ You can install MLflow via ``pip install mlflow``.
 See the :doc:`tutorial here </tune/examples/tune-mlflow>`.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
-    air.integrations.mlflow.MLflowLoggerCallback
+    ~air.integrations.mlflow.MLflowLoggerCallback
+    ~air.integrations.mlflow.setup_mlflow
 
 Wandb Integration
 -----------------
@@ -68,18 +74,35 @@ You can install Wandb via ``pip install wandb``.
 See the :doc:`tutorial here </tune/examples/tune-wandb>`.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
-    air.integrations.wandb.WandbLoggerCallback
+    ~air.integrations.wandb.WandbLoggerCallback
+    ~air.integrations.wandb.setup_wandb
+
+
+Comet Integration
+------------------------------
+
+Tune also provides a logger for `Comet <https://www.comet.com/>`_.
+You can install Comet via ``pip install comet-ml``.
+See the :doc:`tutorial here </tune/examples/tune-comet>`.
+
+.. autosummary::
+    :nosignatures:
+    :toctree: doc/
+
+    ~air.integrations.comet.CometLoggerCallback
 
 Aim Integration
 ---------------
 
-Tune also provides a logger for the `Aim <https://aimstack.io/>`_ experiment tracker.
+Tune also provides a logger for the `Aim <https://aimstack.readthedocs.io/>`_ experiment tracker.
 You can install Aim via ``pip install aim``.
-See the :doc:`tutorial here </tune/examples/tune-aim>`
+See the :doc:`tutorial here </tune/examples/tune-aim>`.
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     ~tune.logger.aim.AimLoggerCallback
@@ -96,11 +119,10 @@ To use VisKit (you may have to install some dependencies), run:
 
 .. code-block:: bash
 
-    $ git clone https://github.com/rll/rllab.git
-    $ python rllab/rllab/viskit/frontend.py ~/ray_results/my_experiment
+    $ git clone https://github.com/vitchyr/viskit.git
+    $ python viskit/viskit/frontend.py ~/ray_results/my_experiment
 
 The non-relevant metrics (like timing stats) can be disabled on the left to show only the
 relevant ones (like accuracy, loss, etc.).
 
 .. image:: ../images/ray-tune-viskit.png
-

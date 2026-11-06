@@ -1,16 +1,63 @@
-from typing import List
+from typing import TYPE_CHECKING, List, Tuple
 
+from ray.data._internal.planner import create_planner
+
+if TYPE_CHECKING:
+    from ray.data._internal.execution.execution_callback import ExecutionCallback
+
+from .ruleset import Ruleset
 from ray.data._internal.logical.interfaces import (
-    Rule,
-    Optimizer,
     LogicalPlan,
+    Optimizer,
     PhysicalPlan,
+    Rule,
 )
 from ray.data._internal.logical.rules import (
-    OperatorFusionRule,
-    ReorderRandomizeBlocksRule,
+    BindGeneratedIdColumn,
+    CombineDownloads,
+    CombineShuffles,
+    CommonSubExprElimination,
+    ConfigureMapTaskMemoryUsingOutputSize,
+    DeriveListFilesPushdown,
+    FuseOperators,
+    InheritTargetMaxBlockSizeRule,
+    LimitPushdownRule,
+    PredicatePushdown,
+    ProjectionPushdown,
+    PushdownCountFiles,
+    SetReadParallelismRule,
 )
-from ray.data._internal.planner.planner import Planner
+from ray.util.annotations import DeveloperAPI
+
+_LOGICAL_RULESET = Ruleset(
+    [
+        LimitPushdownRule,
+        ProjectionPushdown,
+        PredicatePushdown,
+        CombineShuffles,
+        CombineDownloads,
+        PushdownCountFiles,
+    ]
+)
+
+_PHYSICAL_RULESET = Ruleset(
+    [
+        InheritTargetMaxBlockSizeRule,
+        SetReadParallelismRule,
+        FuseOperators,
+        ConfigureMapTaskMemoryUsingOutputSize,
+    ]
+)
+
+
+@DeveloperAPI
+def get_logical_ruleset() -> Ruleset:
+    return _LOGICAL_RULESET
+
+
+@DeveloperAPI
+def get_physical_ruleset() -> Ruleset:
+    return _PHYSICAL_RULESET
 
 
 class LogicalOptimizer(Optimizer):
@@ -18,18 +65,35 @@ class LogicalOptimizer(Optimizer):
 
     @property
     def rules(self) -> List[Rule]:
-        return [ReorderRandomizeBlocksRule()]
+        return [rule_cls() for rule_cls in get_logical_ruleset()]
+
+    def _post_optimize(self, plan: LogicalPlan) -> LogicalPlan:
+        # CommonSubExprElimination is only supposed to run once
+        # isolated from the optimizer rule loop as it applies to
+        # a single Projection operator not a chain of operators.
+        plan = CommonSubExprElimination().apply(plan)
+        # Runs after the rule loop so no ruleset rule, including ones callers
+        # add, can project the generated ID column away again.
+        plan = BindGeneratedIdColumn().apply(plan)
+        # Must run last, over the final plan: it derives each ``ListFiles``'
+        # listing-time constraints from the scanner of the ``ReadFiles`` that
+        # consumes it. Running it earlier (or as a ruleset entry, which a
+        # caller-added rule could follow) would let a later rewrite leave
+        # ``ListFiles`` pruning by a predicate the reader no longer applies.
+        return DeriveListFilesPushdown().apply(plan)
 
 
 class PhysicalOptimizer(Optimizer):
     """The optimizer for physical operators."""
 
     @property
-    def rules(self) -> List["Rule"]:
-        return [OperatorFusionRule()]
+    def rules(self) -> List[Rule]:
+        return [rule_cls() for rule_cls in get_physical_ruleset()]
 
 
-def get_execution_plan(logical_plan: LogicalPlan) -> PhysicalPlan:
+def get_execution_plan(
+    logical_plan: LogicalPlan,
+) -> Tuple[PhysicalPlan, List["ExecutionCallback"]]:
     """Get the physical execution plan for the provided logical plan.
 
     This process has 3 steps:
@@ -37,6 +101,14 @@ def get_execution_plan(logical_plan: LogicalPlan) -> PhysicalPlan:
     (2) planning: convert logical to physical operators.
     (3) physical optimization: optimize physical operators.
     """
-    logical_plan = LogicalOptimizer().optimize(logical_plan)
-    physical_plan = Planner().plan(logical_plan)
-    return PhysicalOptimizer().optimize(physical_plan)
+    # 1. Logical -> Logical (Optimized)
+    optimized_logical_plan = LogicalOptimizer().optimize(logical_plan)
+
+    # 2. Rewire Logical -> Logical (Optimized)
+    logical_plan._dag = optimized_logical_plan.dag
+
+    # 3. Logical (Optimized) -> Physical
+    physical_plan, callbacks = create_planner().plan(optimized_logical_plan)
+
+    # 4. Physical (Optimized) -> Physical
+    return PhysicalOptimizer().optimize(physical_plan), callbacks

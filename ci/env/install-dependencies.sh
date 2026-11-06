@@ -8,6 +8,9 @@ set -euxo pipefail
 SCRIPT_DIR=$(builtin cd "$(dirname "${BASH_SOURCE:-$0}")"; pwd)
 WORKSPACE_DIR="${SCRIPT_DIR}/../.."
 
+# importing install_miniforge function
+source "${SCRIPT_DIR}/install-miniforge.sh"
+
 pkg_install_helper() {
   case "${OSTYPE}" in
     darwin*)
@@ -24,11 +27,11 @@ pkg_install_helper() {
 
 install_bazel() {
   if command -v bazel; then
-    if [[ -n "${BUILDKITE-}" ]] && [ "${OSTYPE}" != msys ]; then
+    if [[ -n "${BUILDKITE-}" && "${OSTYPE}" != "msys" ]]; then
       # Only reinstall Bazel if we need to upgrade to a different version.
       python="$(command -v python3 || command -v python || echo python)"
       current_version="$(bazel --version | grep -o "[0-9]\+.[0-9]\+.[0-9]\+")"
-      new_version="$("${python}" -s -c "import runpy, sys; runpy.run_path(sys.argv.pop(), run_name='__api__')" bazel_version "${SCRIPT_DIR}/../../python/setup.py")"
+      new_version="$(cat "${WORKSPACE_DIR}/.bazelversion")"
       if [[ "$current_version" == "$new_version" ]]; then
         echo "Bazel of the same version already exists, skipping the install"
         export BAZEL_CONFIG_ONLY=1
@@ -37,13 +40,10 @@ install_bazel() {
   fi
 
   "${SCRIPT_DIR}"/install-bazel.sh
-  if [ -f /etc/profile.d/bazel.sh ]; then
-    . /etc/profile.d/bazel.sh
-  fi
 }
 
 install_base() {
-  if [ -n "${BUILDKITE-}" ]; then
+  if [[ -n "${BUILDKITE-}" ]]; then
     echo "Skipping install_base in Buildkite"
     return
   fi
@@ -55,136 +55,36 @@ install_base() {
       sudo apt-get update -qq
       pkg_install_helper build-essential curl unzip libunwind-dev python3-pip python3-setuptools \
         tmux gdb
-      if [ "${LINUX_WHEELS-}" = 1 ]; then
+      if [[ "${LINUX_WHEELS-}" == 1 ]]; then
         pkg_install_helper docker
-        if [ -n "${TRAVIS-}" ]; then
+        if [[ -n "${TRAVIS-}" ]]; then
           sudo usermod -a -G docker travis
         fi
       fi
-      if [ -n "${PYTHON-}" ]; then
+      if [[ -n "${PYTHON-}" ]]; then
         "${SCRIPT_DIR}/install-strace.sh" || true
       fi
       ;;
   esac
 }
 
-install_miniconda() {
-  if [ "${OSTYPE}" = msys ]; then
-    # Windows is on GitHub Actions, whose built-in Python installations we added direct support for.
-    python --version
-    return 0
-  fi
-
-  local conda="${CONDA_EXE-}"  # Try to get the activated conda executable
-  if [ -z "${conda}" ]; then  # If no conda is found, try to find it in PATH
-    conda="$(command -v conda || true)"
-  fi
-
-  if [ ! -x "${conda}" ] || [ "${MINIMAL_INSTALL-}" = 1 ]; then  # If no conda is found, install it
-    local miniconda_dir  # Keep directories user-independent, to help with Bazel caching
-    local miniconda_version="Miniconda3-py37_4.9.2"
-    local miniconda_platform=""
-    local exe_suffix=".sh"
-
-    case "${OSTYPE}" in
-      linux*)
-        miniconda_dir="/opt/miniconda"
-        miniconda_platform=Linux
-        ;;
-      darwin*)
-        if [ "$(uname -m)" = "arm64" ]; then
-          HOSTTYPE="arm64"
-          miniconda_version="Miniconda3-py38_23.1.0-1"
-          miniconda_dir="/opt/homebrew/opt/miniconda"
-        else
-          HOSTTYPE="x86_64"
-          miniconda_dir="/usr/local/opt/miniconda"
-        fi
-        miniconda_platform=MacOSX
-        ;;
-      msys*)
-        miniconda_dir="${ALLUSERSPROFILE}\Miniconda3" # Avoid spaces; prefer the default path
-        miniconda_platform=Windows
-        exe_suffix=".exe"
-        ;;
-    esac
-
-    local miniconda_url="https://repo.continuum.io/miniconda/${miniconda_version}-${miniconda_platform}-${HOSTTYPE}${exe_suffix}"
-    local miniconda_target="${HOME}/${miniconda_url##*/}"
-    curl -f -s -L -o "${miniconda_target}" "${miniconda_url}"
-    chmod +x "${miniconda_target}"
-
-    case "${OSTYPE}" in
-      msys*)
-        # We set /AddToPath=0 because
-        # (1) it doesn't take care of the current shell, and
-        # (2) it's consistent with -b in the UNIX installers.
-        MSYS2_ARG_CONV_EXCL="*" "${miniconda_target}" \
-          /RegisterPython=0 /AddToPath=0 /InstallationType=AllUsers /S /D="${miniconda_dir}"
-        conda="${miniconda_dir}\Scripts\conda.exe"
-        ;;
-      *)
-        if [ "${MINIMAL_INSTALL-}" = 1 ]; then
-          rm -rf "${miniconda_dir}"
-        fi
-        mkdir -p -- "${miniconda_dir}"
-        # We're forced to pass -b for non-interactive mode.
-        # Unfortunately it inhibits PATH modifications as a side effect.
-        "${WORKSPACE_DIR}"/ci/suppress_output "${miniconda_target}" -f -b -p "${miniconda_dir}"
-        conda="${miniconda_dir}/bin/conda"
-        ;;
-    esac
-  fi
-
-  if [ ! -x "${CONDA_PYTHON_EXE-}" ]; then  # If conda isn't activated, activate it
-    local restore_shell_state=""
-    if [ -o xtrace ]; then set +x && restore_shell_state="set -x"; fi  # Disable set -x (noisy here)
-
-    # TODO(mehrdadn): conda activation is buggy on MSYS2; it adds C:/... to PATH,
-    # which gets split on a colon. Is it necessary to work around this?
-    eval "$("${conda}" shell."${SHELL##*/}" hook)"  # Activate conda
-    conda init "${SHELL##*/}"  # Add to future shells
-
-    ${restore_shell_state}  # Restore set -x
-  fi
-
-  local python_version
-  python_version="$(python -s -c "import sys; print('%s.%s' % sys.version_info[:2])")"
-  if [ -n "${PYTHON-}" ] && [ "${PYTHON}" != "${python_version}" ]; then  # Update Python version
-    (
-      set +x
-      echo "Updating Anaconda Python ${python_version} to ${PYTHON}..."
-      "${WORKSPACE_DIR}"/ci/suppress_output conda install -q -y python="${PYTHON}"
-    )
-  elif [ "${MINIMAL_INSTALL-}" = "1" ]; then  # Reset environment
-    (
-      set +x
-      echo "Resetting Anaconda Python ${python_version}..."
-      "${WORKSPACE_DIR}"/ci/suppress_output conda install -q -y --rev 0
-    )
-  fi
-
-  command -V python
-  test -x "${CONDA_PYTHON_EXE}"  # make sure conda is activated
-}
-
 install_shellcheck() {
   local shellcheck_version="0.7.1"
-  if [ "${shellcheck_version}" != "$(command -v shellcheck > /dev/null && shellcheck --version | sed -n "s/version: //p")" ]; then
+  if [[ "${shellcheck_version}" != "$(command -v shellcheck > /dev/null && shellcheck --version | sed -n "s/version: //p")" ]]; then
     local osname=""
     case "${OSTYPE}" in
       linux*) osname="linux";;
       darwin*) osname="darwin";;
     esac
     local name="shellcheck-v${shellcheck_version}"
-    if [ "${osname}" = linux ] || [ "${osname}" = darwin ]; then
+    if [[ "${osname}" == "linux" || "${osname}" == "darwin" ]]; then
       sudo mkdir -p /usr/local/bin || true
-      curl -f -s -L "https://github.com/koalaman/shellcheck/releases/download/v${shellcheck_version}/${name}.${osname}.x86_64.tar.xz" | {
+      curl -sSfL "https://github.com/koalaman/shellcheck/releases/download/v${shellcheck_version}/${name}.${osname}.x86_64.tar.xz" | {
         sudo tar -C /usr/local/bin -x -v -J --strip-components=1 "${name}/shellcheck"
       }
     else
       mkdir -p /usr/local/bin
-      curl -f -s -L -o "${name}.zip" "https://github.com/koalaman/shellcheck/releases/download/v${shellcheck_version}/${name}.zip"
+      curl -sSfL -o "${name}.zip" "https://github.com/koalaman/shellcheck/releases/download/v${shellcheck_version}/${name}.zip"
       unzip "${name}.zip" "${name}.exe"
       mv -f "${name}.exe" "/usr/local/bin/shellcheck.exe"
     fi
@@ -193,22 +93,22 @@ install_shellcheck() {
 }
 
 install_linters() {
-  pip install -r "${WORKSPACE_DIR}"/python/requirements_linters.txt
+  pip install -r "${WORKSPACE_DIR}"/python/requirements/lint-requirements.txt
 
   install_shellcheck
 }
 
 install_nvm() {
   local NVM_HOME="${HOME}/.nvm"
-  if [ "${OSTYPE}" = msys ]; then
+  if [[ "${OSTYPE}" == msys ]]; then
     local ver="1.1.7"
-    if [ ! -f "${NVM_HOME}/nvm.sh" ]; then
+    if [[ ! -f "${NVM_HOME}/nvm.sh" ]]; then
       mkdir -p -- "${NVM_HOME}"
       export NVM_SYMLINK="${PROGRAMFILES}\nodejs"
       (
         cd "${NVM_HOME}"
         local target="./nvm-${ver}.zip"
-        curl -f -s -L -o "${target}" \
+        curl -sSfL -o "${target}" \
           "https://github.com/coreybutler/nvm-windows/releases/download/${ver}/nvm-noinstall.zip"
         unzip -q -- "${target}"
         rm -f -- "${target}"
@@ -219,7 +119,7 @@ install_nvm() {
         "nvm() { \"\${NVM_HOME}/nvm.exe\" \"\$@\"; }" \
         > "${NVM_HOME}/nvm.sh"
     fi
-  elif [ -n "${BUILDKITE-}" ]; then
+  elif [[ -n "${BUILDKITE-}" ]]; then
     echo "Skipping nvm on Buildkite because we will use apt-get."
   else
     test -f "${NVM_HOME}/nvm.sh"  # double-check NVM is already available on other platforms
@@ -233,10 +133,12 @@ install_upgrade_pip() {
   fi
 
   if "${python}" -m pip --version || "${python}" -m ensurepip; then  # Configure pip if present
-    "${python}" -m pip install --upgrade "pip<23.1"
+    # 25.3 has breaking change where other Python packages like "click" does not work
+    # with it anymore. pip-compile will fail to work with the package's setup code.
+    "${python}" -m pip install pip==25.2
 
     # If we're in a CI environment, do some configuration
-    if [ "${CI-}" = true ]; then
+    if [[ "${CI-}" == "true" ]]; then
       "${python}" -W ignore -m pip config -q --user set global.disable-pip-version-check True
       "${python}" -W ignore -m pip config -q --user set global.progress_bar off
     fi
@@ -246,39 +148,62 @@ install_upgrade_pip() {
 }
 
 install_node() {
-  if [ "${OSTYPE}" = msys ] ; then
+  if [[ "${OSTYPE}" == "msys" ]]; then
     { echo "WARNING: Skipping running Node.js due to incompatibilities with Windows"; } 2> /dev/null
     return
   fi
 
-  if [ -n "${BUILDKITE-}" ] ; then
-    if [[ "${OSTYPE}" = darwin* ]]; then
-      if [ "$(uname -m)" = "arm64" ]; then
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-      else
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | bash
-      fi
-    else
-      # https://github.com/nodesource/distributions/blob/master/README.md#installation-instructions
-      curl -sL https://deb.nodesource.com/setup_14.x | sudo -E bash -
-      sudo apt-get install -y nodejs
-      return
-    fi
+  if [[ "${BUILDKITE-}" == "" ]] ; then
+    echo "Skipping install_node in non-Buildkite environment is not supported" > /dev/stderr
+    return
   fi
 
-  # Install the latest version of Node.js in order to build the dashboard.
-  (
-    set +x # suppress set -x since it'll get very noisy here.
-    . "${HOME}/.nvm/nvm.sh"
-    NODE_VERSION="14"
-    nvm install $NODE_VERSION
-    nvm use --silent $NODE_VERSION
-    npm config set loglevel warn  # make NPM quieter
-  )
+  if [[ "${OSTYPE}" = darwin* ]]; then
+    curl -sSfL -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+
+    (
+      set +x # suppress set -x since it'll get very noisy here.
+      # nvm's error-recovery path in nvm.sh references $TMPDIR. The caller
+      # runs with `set -u`, so an unset TMPDIR (launchd-spawned shells don't
+      # inherit one) crashes nvm with "TMPDIR: unbound variable" whenever a
+      # binary download fails and nvm falls back to source.
+      export TMPDIR="${TMPDIR:-/tmp}"
+      . "${HOME}/.nvm/nvm.sh"
+      # Node 14 EOL'd April 2023; nodejs.org removed the darwin-arm64
+      # prebuilt and the URL now 404s. 20 is the current LTS line.
+      NODE_VERSION="20"
+      nvm install $NODE_VERSION
+      nvm use --silent $NODE_VERSION
+      npm config set loglevel warn  # make NPM quieter
+    )
+  else
+    # Linux
+
+    NODE_VERSION_FULL="14.21.3"
+
+    if [[ "$(uname -m)" == "x86_64" ]]; then
+      NODE_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/node-v${NODE_VERSION_FULL}-linux-x64.tar.xz"
+      NODE_SHA256="05c08a107c50572ab39ce9e8663a2a2d696b5d262d5bd6f98d84b997ce932d9a"
+    else # aarch64
+      NODE_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/node-v${NODE_VERSION_FULL}-linux-arm64.tar.xz"
+      NODE_SHA256="f06642bfcf0b8cc50231624629bec58b183954641b638e38ed6f94cd39e8a6ef"
+    fi
+
+    NODE_DIR="/usr/local/node"
+    curl -fsSL "${NODE_URL}" -o /tmp/node.tar.xz
+    echo "$NODE_SHA256  /tmp/node.tar.xz" | sha256sum -c -
+    sudo mkdir -p "$NODE_DIR"
+    sudo tar -xf /tmp/node.tar.xz -C "$NODE_DIR" --strip-components=1
+    rm /tmp/node.tar.xz
+    sudo ln -sf /usr/local/node/bin/node /usr/local/bin/node
+    sudo ln -sf /usr/local/node/bin/npm /usr/local/bin/npm
+    sudo ln -sf /usr/local/node/bin/npx /usr/local/bin/npx
+
+  fi
 }
 
 install_toolchains() {
-  if [ -z "${BUILDKITE-}" ]; then
+  if [[ -z "${BUILDKITE-}" ]]; then
     "${SCRIPT_DIR}"/install-toolchains.sh
   fi
   if [[ "${OSTYPE}" = linux* ]]; then
@@ -289,7 +214,7 @@ install_toolchains() {
 }
 
 download_mnist() {
-  if [ -d "${HOME}/data/MNIST" ]; then
+  if [[ -d "${HOME}/data/MNIST" ]]; then
     return
   fi
   mkdir -p "${HOME}/data"
@@ -298,7 +223,6 @@ download_mnist() {
 }
 
 retry_pip_install() {
-  local pip_command=$1
   local status="0"
   local errmsg=""
 
@@ -306,10 +230,10 @@ retry_pip_install() {
   # that break the entire CI job: Simply retry installation in this case
   # after n seconds.
   for _ in {1..3}; do
-    errmsg=$(eval "${pip_command}" 2>&1) && break
+    errmsg="$("$@" 2>&1)" && break
     status=$errmsg && echo "'pip install ...' failed, will retry after n seconds!" && sleep 30
   done
-  if [ "$status" != "0" ]; then
+  if [[ "$status" != "0" ]]; then
     echo "${status}" && return 1
   fi
 }
@@ -329,79 +253,56 @@ install_pip_packages() {
   # files.
   delayed_packages=()
 
-  requirements_files+=("${WORKSPACE_DIR}/python/requirements_test.txt")
+  requirements_files+=("${WORKSPACE_DIR}/python/requirements/test-requirements.txt")
 
-  if [ "${LINT-}" = 1 ]; then
+  if [[ "${LINT-}" == 1 ]]; then
     install_linters
 
     requirements_files+=("${WORKSPACE_DIR}/doc/requirements-doc.txt")
   fi
 
   # Additional default doc testing dependencies.
-  if [ "${DOC_TESTING-}" = 1 ]; then
+  if [[ "${DOC_TESTING-}" == 1 ]]; then
     # For Ray Core and Ray Serve DAG visualization docs test + dataset examples
     sudo apt-get install -y graphviz tesseract-ocr
 
     # For DAG visualization
     requirements_packages+=("pydot")
-    requirements_packages+=("pytesseract")
-    requirements_packages+=("spacy>=3")
-    requirements_packages+=("spacy_langdetect")
+    requirements_packages+=("pytesseract==0.3.13")
   fi
 
   # Additional RLlib test dependencies.
-  if [ "${RLLIB_TESTING-}" = 1 ] || [ "${DOC_TESTING-}" = 1 ]; then
-    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/requirements_rllib.txt")
-    #TODO(amogkam): Add this back to requirements_rllib.txt once mlagents no longer pins torch<1.9.0 version.
-    pip install --no-dependencies mlagents==0.28.0
+  if [[ "${RLLIB_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/rllib-requirements.txt")
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/rllib-test-requirements.txt")
+
+    # System libraries required for gymnasium rendering (MuJoCo, OpenGL, GLFW).
+    # The MuJoCo library itself ships with the `mujoco` pip package, which is
+    # pinned in rllib-test-requirements.txt.
+    sudo apt-get update
+    sudo apt-get install -y libosmesa6-dev libgl1 libglfw3
   fi
 
-  # Some Ray Train dependencies have to be installed with --no-deps,
-  # as sub-dependencies conflict. The packages still work for our workflows.
-  # Todo(krfricke): Try to remove once we move to Python 3.8 in CI.
-  local install_ml_no_deps=0
-
   # Additional Train test dependencies.
-  if [ "${TRAIN_TESTING-}" = 1 ] || [ "${DOC_TESTING-}" = 1 ]; then
-    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/requirements_train.txt")
-    install_ml_no_deps=1
+  if [[ "${TRAIN_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/train-requirements.txt")
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/train-test-requirements.txt")
   fi
 
   # Additional Tune/Doc test dependencies.
-  if [ "${TUNE_TESTING-}" = 1 ] || [ "${DOC_TESTING-}" = 1 ]; then
-    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/requirements_tune.txt")
-  fi
-
-  # For Tune, install upstream dependencies.
-  if [ "${TUNE_TESTING-}" = 1 ] ||  [ "${DOC_TESTING-}" = 1 ]; then
-    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/requirements_upstream.txt")
-  fi
-
-  # Additional dependency for Ludwig.
-  # This cannot be included in requirements_upstream.txt as it has conflicting
-  # dependencies with Modin.
-  if [ "${INSTALL_LUDWIG-}" = 1 ]; then
-    # TODO: eventually pin this to master.
-    requirements_packages+=("ludwig[test]>=0.4")
-    requirements_packages+=("jsonschema>=4")
-  fi
-
-  # Additional dependency for time series libraries.
-  # This cannot be included in requirements_tune.txt as it has conflicting
-  # dependencies.
-  if [ "${INSTALL_TIMESERIES_LIBS-}" = 1 ]; then
-    requirements_packages+=("statsforecast==1.5.0")
-    requirements_packages+=("prophet==1.1.1")
+  if [[ "${TUNE_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/tune-requirements.txt")
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/tune-test-requirements.txt")
   fi
 
   # Data processing test dependencies.
-  if [ "${DATA_PROCESSING_TESTING-}" = 1 ] || [ "${DOC_TESTING-}" = 1 ]; then
-    requirements_files+=("${WORKSPACE_DIR}/python/requirements/data_processing/requirements.txt")
+  if [[ "${DATA_PROCESSING_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/data-requirements.txt")
   fi
-  if [ "${DATA_PROCESSING_TESTING-}" = 1 ]; then
-    requirements_files+=("${WORKSPACE_DIR}/python/requirements/data_processing/requirements_dataset.txt")
-    if [ -n "${ARROW_VERSION-}" ]; then
-      if [ "${ARROW_VERSION-}" = nightly ]; then
+  if [[ "${DATA_PROCESSING_TESTING-}" == 1 ]]; then
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/data-test-requirements.txt")
+    if [[ -n "${ARROW_VERSION-}" ]]; then
+      if [[ "${ARROW_VERSION-}" == "nightly" ]]; then
         delayed_packages+=("--extra-index-url")
         delayed_packages+=("https://pypi.fury.io/arrow-nightlies/")
         delayed_packages+=("--prefer-binary")
@@ -411,55 +312,48 @@ install_pip_packages() {
         delayed_packages+=("pyarrow==${ARROW_VERSION}")
       fi
     fi
-    if [ -n "${ARROW_MONGO_VERSION-}" ]; then
+    if [[ -n "${ARROW_MONGO_VERSION-}" ]]; then
       delayed_packages+=("pymongoarrow==${ARROW_MONGO_VERSION}")
     fi
   fi
 
-  if [ "${install_ml_no_deps}" = 1 ]; then
-    # Install these requirements first. Their dependencies may be overwritten later
-    # by the main install.
-    pip install -r "${WORKSPACE_DIR}/python/requirements/ml/requirements_no_deps.txt"
-  fi
-
-  retry_pip_install "CC=gcc pip install -Ur ${WORKSPACE_DIR}/python/requirements.txt"
+  # TODO(ray-ci): pin the dependencies.
+  CC=gcc retry_pip_install pip install -Ur "${WORKSPACE_DIR}/python/requirements.txt" -c "${WORKSPACE_DIR}/python/requirements_compiled.txt"
 
   # Install deeplearning libraries (Torch + TensorFlow)
-  if [ -n "${TORCH_VERSION-}" ] || [ "${DL-}" = "1" ] || [ "${RLLIB_TESTING-}" = 1 ] || [ "${TRAIN_TESTING-}" = 1 ] || [ "${TUNE_TESTING-}" = 1 ]; then
+  if [[ -n "${TORCH_VERSION-}" || "${DL-}" == "1" || "${RLLIB_TESTING-}" == 1 || "${TRAIN_TESTING-}" == 1 || "${TUNE_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
       # If we require a custom torch version, use that
-      if [ -n "${TORCH_VERSION-}" ]; then
-        case "${TORCH_VERSION-1.9.0}" in
-          1.9.0) TORCHVISION_VERSION=0.10.0;;
-          1.8.1) TORCHVISION_VERSION=0.9.1;;
-          1.6) TORCHVISION_VERSION=0.7.0;;
-          1.5) TORCHVISION_VERSION=0.6.0;;
-          *) TORCHVISION_VERSION=0.5.0;;
-        esac
-        # Install right away, as some dependencies (e.g. torch-spline-conv) need
+      if [[ -n "${TORCH_VERSION-}" ]]; then
+        # Install right away, as some dependencies (e.g. torch-scatter) need
         # torch to be installed for their own install.
-        pip install -U "torch==${TORCH_VERSION-1.9.0}" "torchvision==${TORCHVISION_VERSION}"
-        # We won't add requirements_dl.txt as it would otherwise overwrite our custom
+        pip install -U "torch==${TORCH_VERSION-1.9.0}" "torchvision==${TORCHVISION_VERSION-0.10.0}"
+        # We won't add dl-cpu-requirements.txt as it would otherwise overwrite our custom
         # torch. Thus we have also have to install tensorflow manually.
-        TF_PACKAGE=$(grep "tensorflow==" "${WORKSPACE_DIR}/python/requirements/ml/requirements_dl.txt")
-        TFPROB_PACKAGE=$(grep "tensorflow-probability==" "${WORKSPACE_DIR}/python/requirements/ml/requirements_dl.txt")
+        TF_PACKAGE=$(grep -ohE "tensorflow==[^ ;]+" "${WORKSPACE_DIR}/python/requirements/ml/dl-cpu-requirements.txt" | head -n 1)
+        TFPROB_PACKAGE=$(grep -ohE "tensorflow-probability==[^ ;]+" "${WORKSPACE_DIR}/python/requirements/ml/dl-cpu-requirements.txt" | head -n 1)
 
         # %%;* deletes everything after ; to get rid of e.g. python version specifiers
         pip install -U "${TF_PACKAGE%%;*}" "${TFPROB_PACKAGE%%;*}"
       else
         # Otherwise, use pinned default torch version.
-        # Again, install right away, as some dependencies (e.g. torch-spline-conv) need
+        # Again, install right away, as some dependencies (e.g. torch-scatter) need
         # torch to be installed for their own install.
-        TORCH_PACKAGE=$(grep "torch==" "${WORKSPACE_DIR}/python/requirements/ml/requirements_dl.txt")
-        TORCHVISION_PACKAGE=$(grep "torchvision==" "${WORKSPACE_DIR}/python/requirements/ml/requirements_dl.txt")
+        TORCH_PACKAGE=$(grep -ohE "torch==[^ ;]+" "${WORKSPACE_DIR}/python/requirements/ml/dl-cpu-requirements.txt" | head -n 1)
+        TORCHVISION_PACKAGE=$(grep -ohE "torchvision==[^ ;]+" "${WORKSPACE_DIR}/python/requirements/ml/dl-cpu-requirements.txt" | head -n 1)
 
         # %%;* deletes everything after ; to get rid of e.g. python version specifiers
         pip install "${TORCH_PACKAGE%%;*}" "${TORCHVISION_PACKAGE%%;*}"
-        requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/requirements_dl.txt")
+        requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/dl-cpu-requirements.txt")
       fi
   fi
 
+  # AIR core dependencies
+  if [[ "${RLLIB_TESTING-}" = 1 || "${TRAIN_TESTING-}" == 1 || "${TUNE_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
+    requirements_files+=("${WORKSPACE_DIR}/python/requirements/ml/core-requirements.txt")
+  fi
+
   # Inject our own mirror for the CIFAR10 dataset
-  if [ "${TRAIN_TESTING-}" = 1 ] || [ "${TUNE_TESTING-}" = 1 ] ||  [ "${DOC_TESTING-}" = 1 ]; then
+  if [[ "${TRAIN_TESTING-}" = 1 || "${TUNE_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
     SITE_PACKAGES=$(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')
 
     TF_CIFAR="${SITE_PACKAGES}/tensorflow/python/keras/datasets/cifar10.py"
@@ -473,12 +367,19 @@ install_pip_packages() {
 
   # Generate the pip command with collected requirements files
   pip_cmd="pip install -U -c ${WORKSPACE_DIR}/python/requirements.txt"
+
+  if [[ -f "${WORKSPACE_DIR}/python/requirements_compiled.txt" && "${OSTYPE}" != "msys" ]]; then
+    # On Windows, some pinned dependencies are not built for win, so we
+    # skip this until we have a good wy to resolve cross-platform dependencies.
+    pip_cmd+=" -c ${WORKSPACE_DIR}/python/requirements_compiled.txt"
+  fi
+
   for file in "${requirements_files[@]}"; do
      pip_cmd+=" -r ${file}"
   done
 
   # Expand single requirements
-  if [ "${#requirements_packages[@]}" -gt 0 ]; then
+  if [[ "${#requirements_packages[@]}" -gt 0 ]]; then
     pip_cmd+=" ${requirements_packages[*]}"
   fi
 
@@ -486,70 +387,71 @@ install_pip_packages() {
   eval "${pip_cmd}"
 
   # Install delayed packages
-  if [ "${#delayed_packages[@]}" -gt 0 ]; then
+  if [[ "${#delayed_packages[@]}" -gt 0 ]]; then
     pip install -U -c "${WORKSPACE_DIR}/python/requirements.txt" "${delayed_packages[@]}"
   fi
 
   # Additional Tune dependency for Horovod.
   # This must be run last (i.e., torch cannot be re-installed after this)
-  if [ "${INSTALL_HOROVOD-}" = 1 ]; then
+  if [[ "${INSTALL_HOROVOD-}" == 1 ]]; then
     "${SCRIPT_DIR}"/install-horovod.sh
   fi
 
-  if [ "${TUNE_TESTING-}" = 1 ] || [ "${DOC_TESTING-}" = 1 ]; then
+  if [[ "${TUNE_TESTING-}" == 1 || "${DOC_TESTING-}" == 1 ]]; then
     download_mnist
-  fi
-
-  if [ "${DOC_TESTING-}" = 1 ]; then
-    # Todo: This downgrades spacy and related dependencies because
-    # `en_core_web_sm` is only compatible with spacy < 3.6.
-    # We should move to a model that does not depend on a stale version.
-    python -m spacy download en_core_web_sm
   fi
 }
 
 install_thirdparty_packages() {
-  # shellcheck disable=SC2262
-  alias pip="python -m pip"
-  CC=gcc pip install psutil setproctitle==1.2.2 colorama --target="${WORKSPACE_DIR}/python/ray/thirdparty_files"
+  if [[ "${OSTYPE}" = darwin* ]]; then
+    # Currently do not work on macOS
+    return
+  fi
+  mkdir -p "${WORKSPACE_DIR}/python/ray/thirdparty_files"
+  RAY_THIRDPARTY_FILES="$(realpath "${WORKSPACE_DIR}/python/ray/thirdparty_files")"
+  CC=gcc python -m pip install psutil==5.9.6 colorama==0.4.6 --target="${RAY_THIRDPARTY_FILES}"
 }
 
 install_dependencies() {
   install_bazel
 
   # Only install on buildkite if requested
-  if [ -z "${BUILDKITE-}" ] || [ "${BUILD-}" = "1" ]; then
+  if [[ -z "${BUILDKITE-}" || "${BUILD-}" == "1" ]]; then
     install_base
     install_toolchains
   fi
 
-  if [ -n "${PYTHON-}" ] || [ "${LINT-}" = 1 ] || [ "${MINIMAL_INSTALL-}" = "1" ]; then
-    install_miniconda
+  if [[ -n "${PYTHON-}" || "${LINT-}" == 1 || "${MINIMAL_INSTALL-}" == "1" ]]; then
+    install_miniforge
   fi
 
   install_upgrade_pip
 
   # Only install on buildkite if requested
-  if [ -z "${BUILDKITE-}" ] || [ "${BUILD-}" = "1" ]; then
+  if [[ -z "${BUILDKITE-}" || "${BUILD-}" == "1" ]]; then
     install_nvm
-    if [ -n "${PYTHON-}" ] || [ -n "${LINT-}" ] || [ "${MAC_WHEELS-}" = 1 ]; then
+    if [[ -n "${PYTHON-}" || -n "${LINT-}" || "${MAC_WHEELS-}" == 1 ]]; then
       install_node
     fi
   fi
 
   # install hdfs if needed.
-  if [ "${INSTALL_HDFS-}" = 1 ]; then
+  if [[ "${INSTALL_HDFS-}" == 1 ]]; then
     "${SCRIPT_DIR}"/install-hdfs.sh
   fi
 
-  if [ "${MINIMAL_INSTALL-}" != "1" ]; then
+  if [[ "${MINIMAL_INSTALL:-}" != "1" && "${SKIP_PYTHON_PACKAGES:-}" != "1" && "${SKIP_PIP_INSTALL:-}" != "1" ]]; then
     install_pip_packages
   fi
 
   install_thirdparty_packages
 }
 
-install_dependencies "$@"
+if [[ $# -eq 0 ]]; then
+  install_dependencies
+else
+  "$@"
+fi
 
 # Pop caller's shell options (quietly)
 { set -vx; eval "${SHELLOPTS_STACK##*|}"; SHELLOPTS_STACK="${SHELLOPTS_STACK%|*}"; } 2> /dev/null

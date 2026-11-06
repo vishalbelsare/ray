@@ -1,74 +1,17 @@
 import csv
 import logging
-import os
-
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, TextIO
 
-from ray.tune.logger.logger import _LOGGER_DEPRECATION_WARNING, Logger, LoggerCallback
-from ray.tune.result import EXPR_PROGRESS_FILE
+from ray.air.constants import EXPR_PROGRESS_FILE
+from ray.tune.logger.logger import LoggerCallback
 from ray.tune.utils import flatten_dict
-from ray.util.annotations import Deprecated, PublicAPI
+from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
     from ray.tune.experiment.trial import Trial  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-
-@Deprecated(
-    message=_LOGGER_DEPRECATION_WARNING.format(
-        old="CSVLogger", new="ray.tune.csv.CSVLoggerCallback"
-    ),
-    warning=True,
-)
-@PublicAPI
-class CSVLogger(Logger):
-    """Logs results to progress.csv under the trial directory.
-
-    Automatically flattens nested dicts in the result dict before writing
-    to csv:
-
-        {"a": {"b": 1, "c": 2}} -> {"a/b": 1, "a/c": 2}
-
-    """
-
-    def _init(self):
-        self._initialized = False
-
-    def _maybe_init(self):
-        """CSV outputted with Headers as first set of results."""
-        if not self._initialized:
-            progress_file = os.path.join(self.logdir, EXPR_PROGRESS_FILE)
-            self._continuing = (
-                os.path.exists(progress_file) and os.path.getsize(progress_file) > 0
-            )
-            self._file = open(progress_file, "a")
-            self._csv_out = None
-            self._initialized = True
-
-    def on_result(self, result: Dict):
-        self._maybe_init()
-
-        tmp = result.copy()
-        if "config" in tmp:
-            del tmp["config"]
-        result = flatten_dict(tmp, delimiter="/")
-        if self._csv_out is None:
-            self._csv_out = csv.DictWriter(self._file, result.keys())
-            if not self._continuing:
-                self._csv_out.writeheader()
-        self._csv_out.writerow(
-            {k: v for k, v in result.items() if k in self._csv_out.fieldnames}
-        )
-        self._file.flush()
-
-    def flush(self):
-        if self._initialized and not self._file.closed:
-            self._file.flush()
-
-    def close(self):
-        if self._initialized:
-            self._file.close()
 
 
 @PublicAPI
@@ -95,11 +38,16 @@ class CSVLoggerCallback(LoggerCallback):
 
         # Make sure logdir exists
         trial.init_local_path()
-        local_file = os.path.join(trial.local_path, EXPR_PROGRESS_FILE)
+        local_file_path = Path(trial.local_path, EXPR_PROGRESS_FILE)
+
+        # Resume the file from remote storage.
+        self._restore_from_remote(EXPR_PROGRESS_FILE, trial)
+
         self._trial_continue[trial] = (
-            os.path.exists(local_file) and os.path.getsize(local_file) > 0
+            local_file_path.exists() and local_file_path.stat().st_size > 0
         )
-        self._trial_files[trial] = open(local_file, "at")
+
+        self._trial_files[trial] = local_file_path.open("at")
         self._trial_csv[trial] = None
 
     def log_trial_result(self, iteration: int, trial: "Trial", result: Dict):

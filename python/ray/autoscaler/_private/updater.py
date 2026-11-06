@@ -2,20 +2,26 @@ import logging
 import os
 import subprocess
 import time
+import traceback
 from threading import Thread
+from typing import Any, Dict, List, Optional
 
 import click
 
-from ray._private.usage import usage_constants, usage_lib
+from ray._common.usage import usage_constants, usage_lib
 from ray.autoscaler._private import subprocess_output_util as cmd_output_util
 from ray.autoscaler._private.cli_logger import cf, cli_logger
 from ray.autoscaler._private.command_runner import (
     AUTOSCALER_NODE_START_WAIT_S,
     ProcessRunnerError,
 )
-from ray.autoscaler._private.constants import RESOURCES_ENVIRONMENT_VARIABLE
+from ray.autoscaler._private.constants import (
+    LABELS_ENVIRONMENT_VARIABLE,
+    RESOURCES_ENVIRONMENT_VARIABLE,
+)
 from ray.autoscaler._private.event_system import CreateClusterEvent, global_event_system
 from ray.autoscaler._private.log_timer import LogTimer
+from ray.autoscaler._private.util import with_envs
 from ray.autoscaler.tags import (
     STATUS_SETTING_UP,
     STATUS_SYNCING_FILES,
@@ -49,6 +55,11 @@ class NodeUpdater:
         runtime_hash: Used to check for config changes
         file_mounts_contents_hash: Used to check for changes to file mounts
         is_head_node: Whether to use head start/setup commands
+        node_resources: Optional resources string that the raylet should
+            advertise on startup.
+        node_labels: Optional labels for the node.
+        cluster_synced_files: Files synced from the head to worker nodes after
+            the head node finishes its setup.
         rsync_options: Extra options related to the rsync command.
         process_runner: the module to use to run the commands
             in the CommandRunner. E.g., subprocess.
@@ -58,35 +69,46 @@ class NodeUpdater:
         restart_only: Whether to skip setup commands & just restart ray
         for_recovery: True if updater is for a recovering node. Only used for
             metric tracking.
+        auth_mode: The cluster YAML's `auth_mode`. When given, the start
+            commands run with RAY_AUTH_MODE set to it.
     """
 
     def __init__(
         self,
-        node_id,
-        provider_config,
-        provider,
-        auth_config,
-        cluster_name,
-        file_mounts,
-        initialization_commands,
-        setup_commands,
-        ray_start_commands,
-        runtime_hash,
-        file_mounts_contents_hash,
-        is_head_node,
-        node_resources=None,
-        cluster_synced_files=None,
-        rsync_options=None,
-        process_runner=subprocess,
-        use_internal_ip=False,
-        docker_config=None,
-        restart_only=False,
-        for_recovery=False,
+        node_id: str,
+        provider_config: dict,
+        provider: Any,
+        auth_config: dict,
+        cluster_name: str,
+        file_mounts: dict,
+        initialization_commands: list,
+        setup_commands: list,
+        ray_start_commands: list,
+        runtime_hash: str,
+        file_mounts_contents_hash: str,
+        is_head_node: bool,
+        node_resources: Optional[str] = None,
+        node_labels: Optional[Dict[str, str]] = None,
+        cluster_synced_files: Optional[List[str]] = None,
+        rsync_options: Optional[Dict[str, Any]] = None,
+        process_runner: Any = subprocess,
+        use_internal_ip: bool = False,
+        docker_config: Optional[Dict[str, Any]] = None,
+        restart_only: bool = False,
+        for_recovery: bool = False,
+        auth_mode: Optional[str] = None,
     ):
-
         self.log_prefix = "NodeUpdater: {}: ".format(node_id)
-        use_internal_ip = use_internal_ip or provider_config.get(
-            "use_internal_ips", False
+        # Three cases:
+        # 1) use_internal_ip arg is True -> use_internal_ip is True
+        # 2) worker node -> use value of provider_config["use_internal_ips"]
+        # 3) head node -> use value of provider_config["use_internal_ips"] unless
+        #                 overridden by provider_config["use_external_head_ip"]
+        use_internal_ip = use_internal_ip or (
+            provider_config.get("use_internal_ips", False)
+            and not (
+                is_head_node and provider_config.get("use_external_head_ip", False)
+            )
         )
         self.cmd_runner = provider.get_command_runner(
             self.log_prefix,
@@ -111,8 +133,13 @@ class NodeUpdater:
 
         self.initialization_commands = initialization_commands
         self.setup_commands = setup_commands
+        if auth_mode:
+            ray_start_commands = with_envs(
+                ray_start_commands, {"RAY_AUTH_MODE": auth_mode}
+            )
         self.ray_start_commands = ray_start_commands
         self.node_resources = node_resources
+        self.node_labels = node_labels
         self.runtime_hash = runtime_hash
         self.file_mounts_contents_hash = file_mounts_contents_hash
         # TODO (Alex): This makes the assumption that $HOME on the head and
@@ -159,16 +186,19 @@ class NodeUpdater:
 
             cli_logger.error("!!!")
             if hasattr(e, "cmd"):
+                stderr_output = getattr(e, "stderr", "No stderr available")
                 cli_logger.error(
-                    "Setup command `{}` failed with exit code {}. stderr:",
+                    "Setup command `{}` failed with exit code {}. stderr: {}",
                     cf.bold(e.cmd),
                     e.returncode,
+                    stderr_output,
                 )
             else:
-                cli_logger.verbose_error("{}", str(vars(e)))
+                cli_logger.verbose_error("Exception details: {}", str(vars(e)))
+                full_traceback = traceback.format_exc()
+                cli_logger.error("Full traceback: {}", full_traceback)
                 # todo: handle this better somehow?
-                cli_logger.error("{}", str(e))
-            # todo: print stderr here
+                cli_logger.error("Error message: {}", str(e))
             cli_logger.error("!!!")
             cli_logger.newline()
 
@@ -262,7 +292,6 @@ class NodeUpdater:
             "Waiting for SSH to become available", _numbered=("[]", 1, NUM_SETUP_STEPS)
         ):
             with LogTimer(self.log_prefix + "Got remote shell"):
-
                 cli_logger.print("Running `{}` as a test.", cf.bold("uptime"))
                 first_conn_refused_time = None
                 while True:
@@ -456,7 +485,6 @@ class NodeUpdater:
                         with LogTimer(
                             self.log_prefix + "Setup commands", show_status=True
                         ):
-
                             total = len(self.setup_commands)
                             for i, cmd in enumerate(self.setup_commands):
                                 global_event_system.execute_callback(
@@ -492,7 +520,6 @@ class NodeUpdater:
             global_event_system.execute_callback(CreateClusterEvent.start_ray_runtime)
             with LogTimer(self.log_prefix + "Ray start commands", show_status=True):
                 for cmd in self.ray_start_commands:
-
                     env_vars = {}
                     if self.is_head_node:
                         if usage_lib.usage_stats_enabled():
@@ -500,14 +527,16 @@ class NodeUpdater:
                         else:
                             # Disable usage stats collection in the cluster.
                             env_vars[usage_constants.USAGE_STATS_ENABLED_ENV_VAR] = 0
-                    # Add a resource override env variable if needed:
-                    if self.provider_type == "local":
-                        # Local NodeProvider doesn't need resource override.
-                        pass
-                    elif self.node_resources:
-                        env_vars[RESOURCES_ENVIRONMENT_VARIABLE] = self.node_resources
-                    else:
-                        pass
+
+                    # Add a resource override env variable if needed.
+                    # Local NodeProvider doesn't need resource and label override.
+                    if self.provider_type != "local":
+                        if self.node_resources:
+                            env_vars[
+                                RESOURCES_ENVIRONMENT_VARIABLE
+                            ] = self.node_resources
+                        if self.node_labels:
+                            env_vars[LABELS_ENVIRONMENT_VARIABLE] = self.node_labels
 
                     try:
                         old_redirected = cmd_output_util.is_output_redirected()

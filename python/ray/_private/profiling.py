@@ -1,8 +1,8 @@
-import os
 import json
+import os
 from collections import defaultdict
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Union
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Optional, Union
 
 import ray
 
@@ -81,18 +81,19 @@ class ChromeTracingMetadataEvent:
     ph: str = "M"
 
 
-def profile(event_type, extra_data=None):
+def profile(event_type: str, extra_data: Optional[Dict[str, str]] = None):
     """Profile a span of time so that it appears in the timeline visualization.
 
     Note that this only works in the raylet code path.
 
     This function can be used as follows (both on the driver or within a task).
 
-    .. code-block:: python
+    .. testcode::
         import ray._private.profiling as profiling
 
         with profiling.profile("custom event", extra_data={'key': 'val'}):
             # Do some computation here.
+            x = 1 * 2
 
     Optionally, a dictionary can be passed as the "extra_data" argument, and
     it can have keys "name" and "cname" if you want to override the default
@@ -115,8 +116,6 @@ def profile(event_type, extra_data=None):
     if not PROFILING_ENABLED:
         return NULL_LOG_SPAN
     worker = ray._private.worker.global_worker
-    if worker.mode == ray._private.worker.LOCAL_MODE:
-        return NULL_LOG_SPAN
     return worker.core_worker.profile_event(event_type.encode("ascii"), extra_data)
 
 

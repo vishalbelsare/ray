@@ -2,11 +2,13 @@
 
 import asyncio
 import logging
-from ray._private.ray_microbenchmark_helpers import timeit
-from ray._private.ray_client_microbenchmark import main as client_microbenchmark_main
-import numpy as np
 import multiprocessing
+
+import numpy as np
+
 import ray
+from ray._private.ray_client_microbenchmark import main as client_microbenchmark_main
+from ray._private.ray_microbenchmark_helpers import timeit
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +83,7 @@ def check_optimized_build():
         msg = (
             "WARNING: Unoptimized build! "
             "To benchmark an optimized build, try:\n"
-            "\tbazel build -c opt //:ray_pkg\n"
+            "\tbazel run -c opt //:gen_ray_pkg\n"
             "You can also make this permanent by adding\n"
             "\tbuild --compilation_mode=opt\n"
             "to your user-wide ~/.bazelrc file. "
@@ -157,8 +159,14 @@ def main(results=None):
     def wait_multiple_refs():
         num_objs = 1000
         not_ready = [small_value.remote() for _ in range(num_objs)]
+        # We only need to trigger the fetch_local once for each object,
+        # raylet will persist these fetch requests even after ray.wait returns.
+        # See https://github.com/ray-project/ray/issues/30375.
+        fetch_local = True
         for _ in range(num_objs):
-            _ready, not_ready = ray.wait(not_ready)
+            _ready, not_ready = ray.wait(not_ready, fetch_local=fetch_local)
+            if fetch_local:
+                fetch_local = False
 
     results += timeit("single client wait 1k refs", wait_multiple_refs)
 
@@ -281,6 +289,10 @@ def main(results=None):
 
     results += timeit("n:n async-actor calls async", async_actor_multi, m * n)
     ray.shutdown()
+
+    ############################
+    # End of channel perf tests.
+    ############################
 
     NUM_PGS = 100
     NUM_BUNDLES = 1

@@ -1,5 +1,7 @@
-import pytest
+import sys
+
 import grpc
+import pytest
 
 from ray.util.client.worker import Worker
 
@@ -9,7 +11,7 @@ class Credentials(grpc.ChannelCredentials):
         self.name = name
 
 
-def test_grpc_client_credentials_are_passed_to_channel(monkeypatch):
+def test_grpc_client_credentials_are_passed_to_channel(monkeypatch, create_auth_token):
     class Stop(Exception):
         def __init__(self, credentials):
             self.credentials = credentials
@@ -18,7 +20,7 @@ def test_grpc_client_credentials_are_passed_to_channel(monkeypatch):
         def __init__(self, conn_str, credentials, options, compression):
             self.credentials = credentials
 
-        def subscribe(self, f):
+        def subscribe(self, f, try_to_connect=False):
             raise Stop(self.credentials)
 
     def mock_secure_channel(conn_str, credentials, options=None, compression=None):
@@ -37,7 +39,7 @@ def test_grpc_client_credentials_are_passed_to_channel(monkeypatch):
     assert stop.value.credentials.name == "test"
 
 
-def test_grpc_client_credentials_are_generated(monkeypatch):
+def test_grpc_client_credentials_are_generated(monkeypatch, create_auth_token):
     # Test that credentials are generated when secure is True, but _credentials
     # isn't passed.
     class Stop(Exception):
@@ -55,10 +57,4 @@ def test_grpc_client_credentials_are_generated(monkeypatch):
 
 
 if __name__ == "__main__":
-    import os
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

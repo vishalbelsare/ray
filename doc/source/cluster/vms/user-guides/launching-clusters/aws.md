@@ -1,3 +1,9 @@
+---
+myst:
+  html_meta:
+    description: "Launch a Ray cluster on AWS with the cluster launcher, covering Boto3 setup, EFS, IAM roles, S3 access, and CloudWatch."
+---
+
 
 # Launching Ray Clusters on AWS
 
@@ -36,7 +42,7 @@ aws_session_token=baz" >> ~/.aws/credentials
 
 ## Start Ray with the Ray cluster launcher
 
-Once Boto3 is configured to manage resources in your AWS account, you should be ready to launch your cluster using the cluster launcher. The provided [cluster config file](https://github.com/ray-project/ray/tree/master/python/ray/autoscaler/aws/example-full.yaml) will create a small cluster with an m5.large head node (on-demand) configured to autoscale to up to two m5.large [spot-instance](https://aws.amazon.com/ec2/spot/) workers.
+Once Boto3 is configured to manage resources in your AWS account, you should be ready to launch your cluster using the cluster launcher. The provided [cluster config file](https://github.com/ray-project/ray/blob/master/python/ray/autoscaler/aws/example-full.yaml) will create a small cluster with an m5.large head node (on-demand) configured to autoscale to up to two m5.large [spot-instance](https://aws.amazon.com/ec2/spot/) workers.
 
 Test that it works by running the following commands from your local machine:
 
@@ -154,7 +160,7 @@ CloudWatch integration with Ray requires an AMI (or Docker image) with the Unifi
 AMIs with the Unified CloudWatch Agent pre-installed are provided by the Amazon Ray Team, and are currently available in the us-east-1, us-east-2, us-west-1, and us-west-2 regions.
 Please direct any questions, comments, or issues to the `Amazon Ray Team <https://github.com/amzn/amazon-ray/issues/new/choose>`_.
 
-The table below lists AMIs with the Unified CloudWatch Agent pre-installed in each region, and you can also find AMIs at `amazon-ray README <https://github.com/amzn/amazon-ray>`_.
+The table below lists AMIs with the Unified CloudWatch Agent pre-installed in each region, and you can also find AMIs at `DLAMI Release Notes <https://docs.aws.amazon.com/dlami/latest/devguide/appendix-ami-release-notes.html>`_. Each DLAMI (Deep Learning AMI) is pre-installed with the Unified CloudWatch Agent, and its corresponding release notes include AWS CLI commands to query the latest AMI ID.
 
 .. list-table:: All available unified CloudWatch agent images
 
@@ -162,22 +168,22 @@ The table below lists AMIs with the Unified CloudWatch Agent pre-installed in ea
       - AMI ID
       - Region
       - Unified CloudWatch Agent Version
-    * - AWS Deep Learning AMI (Ubuntu 18.04, 64-bit)
-      - ami-069f2811478f86c20
+    * - AWS Deep Learning AMI (Ubuntu 24.04, 64-bit)
+      - ami-087feac195f30e722
       - us-east-1
-      - v1.247348.0b251302
-    * - AWS Deep Learning AMI (Ubuntu 18.04, 64-bit)
-      - ami-058cc0932940c2b8b
+      - v1.300057.1b1167
+    * - AWS Deep Learning AMI (Ubuntu 24.04, 64-bit)
+      - ami-0ed6c422a7c93278a
       - us-east-2
-      - v1.247348.0b251302
-    * - AWS Deep Learning AMI (Ubuntu 18.04, 64-bit)
-      - ami-044f95c9ef12883ef
+      - v1.300057.1b1167
+    * - AWS Deep Learning AMI (Ubuntu 24.04, 64-bit)
+      - ami-0c5ddf2c101267018
       - us-west-1
-      - v1.247348.0b251302
-    * - AWS Deep Learning AMI (Ubuntu 18.04, 64-bit)
-      - ami-0d88d9cbe28fac870
+      - v1.300057.1b1167
+    * - AWS Deep Learning AMI (Ubuntu 24.04, 64-bit)
+      - ami-0cfd95c6c87d00570
       - us-west-2
-      - v1.247348.0b251302
+      - v1.300057.1b1167
 
 .. note::
 
@@ -213,12 +219,12 @@ Getting started
         ray.head.default:
             node_config:
             InstanceType: c5a.large
-            ImageId: ami-0d88d9cbe28fac870  # Unified CloudWatch agent pre-installed AMI, us-west-2
+            ImageId: ami-0cfd95c6c87d00570  # Unified CloudWatch agent pre-installed AMI, us-west-2
             resources: {}
         ray.worker.default:
             node_config:
                 InstanceType: c5a.large
-                ImageId: ami-0d88d9cbe28fac870  # Unified CloudWatch agent pre-installed AMI, us-west-2
+                ImageId: ami-0cfd95c6c87d00570  # Unified CloudWatch agent pre-installed AMI, us-west-2
                 IamInstanceProfile:
                     Name: ray-autoscaler-cloudwatch-v1
             resources: {}
@@ -275,11 +281,11 @@ The following CLI command returns the latest available Unified CloudWatch Agent 
         ray.head.default:
             node_config:
             InstanceType: c5a.large
-            ImageId: ami-0d88d9cbe28fac870
+            ImageId: ami-0cfd95c6c87d00570
         ray.worker.default:
             node_config:
             InstanceType: c5a.large
-            ImageId: ami-0d88d9cbe28fac870
+            ImageId: ami-0cfd95c6c87d00570
 
 To build your own AMI with the Unified CloudWatch Agent installed:
 
@@ -358,7 +364,7 @@ Ensure that all worker nodes are configured to use the ``ray-autoscaler-cloudwat
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 To export Ray's Prometheus system metrics to CloudWatch, first ensure that your cluster has the
-Ray Dashboard installed, then uncomment the ``head_setup_commands`` section in `example-cloudwatch.yaml file <https://github.com/ray-project/ray/blob/master/python/ray/autoscaler/aws/example-cloudwatch.yaml>`_ file.
+Ray dashboard installed, then uncomment the ``head_setup_commands`` section in `example-cloudwatch.yaml file <https://github.com/ray-project/ray/blob/master/python/ray/autoscaler/aws/example-cloudwatch.yaml>`_ file.
 You can find Ray Prometheus metrics in the ``{cluster_name}-ray-prometheus`` metric namespace.
 
 .. code-block:: yaml
@@ -378,9 +384,51 @@ You can find Ray Prometheus metrics in the ``{cluster_name}-ray-prometheus`` met
     `cat ~/ray_bootstrap_config.yaml | jq '.cluster_name'`
     >> '/opt/aws/amazon-cloudwatch-agent/logs/ray_prometheus_waiter.out' 2>> '/opt/aws/amazon-cloudwatch-agent/logs/ray_prometheus_waiter.err'" &
 
+With :ref:`token authentication <token-auth>` on, Ray's metrics endpoints reject any scrape that doesn't carry the cluster's token, and no Ray metrics reach CloudWatch.
+To send the token, add the following command to ``head_setup_commands``, after the command that copies ``prometheus.yml``.
+The command adds an ``authorization`` block to the ``ray`` scrape job:
+
+.. code-block:: yaml
+
+  # Send the Ray auth token with every scrape of Ray's metrics endpoints.
+  - >-
+    printf '  authorization:\n    type: Bearer\n    credentials_file: /home/ubuntu/.ray/auth_token\n'
+    | sudo tee -a /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yml
+
+Set ``credentials_file`` to the absolute path of the token file in the home directory of the user that runs Ray, such as ``/home/ubuntu/.ray/auth_token`` for ``ssh_user: ubuntu``.
+The CloudWatch agent runs as root, so ``~/.ray/auth_token`` doesn't point at that file.
+
 6. Update CloudWatch Agent, Dashboard and Alarm config files.
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 You can apply changes to the CloudWatch Logs, Metrics, Dashboard, and Alarms for your cluster by simply modifying the CloudWatch config files referenced by your Ray cluster config YAML and re-running ``ray up example-cloudwatch.yaml``.
 The Unified CloudWatch Agent will be automatically restarted on all cluster nodes, and your config changes will be applied.
 ```
+
+## AWS Deep Learning Containers
+
+Instead of installing Ray and its dependencies yourself, you can start from a prebuilt image. AWS publishes [Deep Learning Containers](https://aws.github.io/deep-learning-containers/) for Ray that package a Ray component with CUDA and its framework dependencies. AWS builds them on Amazon Linux 2023 and patches them for security. All three share the [`public.ecr.aws/deep-learning-containers/ray`](https://gallery.ecr.aws/deep-learning-containers/ray) repository on the Amazon ECR Public Gallery and differ by tag prefix.
+
+```{list-table}
+:widths: 18 25 18 32
+:header-rows: 1
+
+* - Image
+  - Ray component
+  - Tag prefix
+  - Deployment targets
+* - [ray](https://aws.github.io/deep-learning-containers/ray/)
+  - Ray Serve
+  - `serve-ml-`
+  - Amazon EC2, Amazon SageMaker AI
+* - [ray-llm](https://aws.github.io/deep-learning-containers/ray-llm/)
+  - Ray Serve LLM
+  - `serve-llm-`
+  - Amazon EC2, Amazon EKS
+* - [ray-train](https://aws.github.io/deep-learning-containers/ray-train/)
+  - Ray Train
+  - `train-ml-`
+  - Amazon EC2, Amazon EKS, Amazon SageMaker HyperPod
+```
+
+Each image's page lists its available tags and the Ray version it ships.

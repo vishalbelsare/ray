@@ -1,10 +1,11 @@
-from collections import defaultdict, namedtuple
 import gc
 import os
 import re
 import time
 import tracemalloc
+from collections import defaultdict, namedtuple
 from typing import Callable, List, Optional
+
 from ray.util.annotations import DeveloperAPI
 
 _logged = set()
@@ -14,12 +15,22 @@ _last_logged = 0.0
 
 
 @DeveloperAPI
-def log_once(key):
+def log_once(key: str) -> bool:
     """Returns True if this is the "first" call for a given key.
 
     Various logging settings can adjust the definition of "first".
 
-    Example:
+    Args:
+        key: A unique identifier for the call site.
+
+    Returns:
+        True if this is the first call for ``key`` (subject to the current
+        ``log_once`` settings), False otherwise.
+
+    Examples:
+        >>> import logging
+        >>> from ray.util.debug import log_once
+        >>> logger = logging.getLogger(__name__)
         >>> if log_once("some_key"):
         ...     logger.info("Some verbose logging statement")
     """
@@ -57,10 +68,15 @@ def enable_periodic_logging():
 
 
 @DeveloperAPI
-def reset_log_once(key):
-    """Resets log_once for the provided key."""
+def reset_log_once(key: Optional[str] = None):
+    """Resets log_once for the provided key.
 
-    _logged.discard(key)
+    If you don't provide a key, resets log_once for all keys.
+    """
+    if key is None:
+        _logged.clear()
+    else:
+        _logged.discard(key)
 
 
 # A suspicious memory-allocating stack-trace that we should re-test
@@ -92,6 +108,7 @@ def _test_some_code_for_memory_leaks(
     code: Callable[[], None],
     repeats: int,
     max_num_trials: int = 1,
+    min_memory_increase: int = 0,
 ) -> List[Suspect]:
     """Runs given code (and init code) n times and checks for memory leaks.
 
@@ -104,6 +121,9 @@ def _test_some_code_for_memory_leaks(
             run, if the previous one produced a memory leak. For all non-1st trials,
             `repeats` calculates as: actual_repeats = `repeats` * (trial + 1), where
             the first trial is 0.
+        min_memory_increase: Minimum total memory increase in bytes for a suspect
+            to be reported. Use this to ignore small allocations from internal
+            caches and allocator artifacts that aren't real leaks.
 
     Returns:
         A list of Suspect objects, describing possible memory leaks. If list
@@ -150,6 +170,8 @@ def _test_some_code_for_memory_leaks(
         suspicious_stats.clear()
         # Suspicious memory allocation found?
         suspects = _find_memory_leaks_in_table(table)
+        if min_memory_increase > 0:
+            suspects = [s for s in suspects if s.memory_increase >= min_memory_increase]
         for suspect in sorted(suspects, key=lambda s: s.memory_increase, reverse=True):
             # Only print out the biggest offender:
             if len(suspicious) == 0:
@@ -198,8 +220,8 @@ def _take_snapshot(table, suspicious=None):
 
 
 def _find_memory_leaks_in_table(table):
-    import scipy.stats
     import numpy as np
+    import scipy.stats
 
     suspects = []
 

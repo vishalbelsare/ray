@@ -1,7 +1,7 @@
 from typing import Optional
 
-from ray_release.config import Test
 from ray_release.result import Result
+from ray_release.test import Test
 
 
 def handle_result(

@@ -1,3 +1,6 @@
+.. meta::
+   :description: Reference for tune.Stopper and Tune's built-in stoppers, which end trials or whole experiments on metric, time, or plateau criteria.
+
 .. _tune-stoppers:
 
 Tune Stopping Mechanisms (tune.stopper)
@@ -22,20 +25,27 @@ Stopper Interface (tune.Stopper)
 .. currentmodule:: ray.tune.stopper
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     Stopper
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     Stopper.__call__
+
+.. autosummary::
+    :nosignatures:
+
     Stopper.stop_all
 
 Tune Built-in Stoppers
 ----------------------
 
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     MaximumIterationStopper
@@ -43,3 +53,5 @@ Tune Built-in Stoppers
     TrialPlateauStopper
     TimeoutStopper
     CombinedStopper
+    ~function_stopper.FunctionStopper
+    ~noop.NoopStopper

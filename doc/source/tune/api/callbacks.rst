@@ -1,3 +1,6 @@
+.. meta::
+   :description: API reference for tune.Callback: the callback interface, initialization and setup, the available hooks, and stateful callbacks.
+
 .. _tune-callbacks-docs:
 
 Tune Callbacks (tune.Callback)
@@ -18,12 +21,13 @@ Callback Initialization and Setup
 
 .. currentmodule:: ray.tune
 .. autosummary::
+    :nosignatures:
     :toctree: doc/
 
     Callback
 
 .. autosummary::
-    :toctree: doc/
+    :nosignatures:
 
     Callback.setup
 
@@ -32,7 +36,7 @@ Callback Hooks
 ~~~~~~~~~~~~~~
 
 .. autosummary::
-    :toctree: doc/
+    :nosignatures:
 
     Callback.on_checkpoint
     Callback.on_experiment_end
@@ -49,11 +53,11 @@ Callback Hooks
 Stateful Callbacks
 ~~~~~~~~~~~~~~~~~~
 
-The following methods must be overriden for stateful callbacks to be saved/restored
+The following methods must be overridden for stateful callbacks to be saved/restored
 properly by Tune.
 
 .. autosummary::
-    :toctree: doc/
+    :nosignatures:
 
     Callback.get_state
     Callback.set_state

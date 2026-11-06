@@ -17,12 +17,13 @@
 # http://github.com/modin-project/modin/master/modin/pandas/test/test_general.py
 
 import sys
-import pytest
-import pandas
+
 import numpy as np
+import pandas
+import pytest
 from numpy.testing import assert_array_equal
-import ray
-from ray.tests.conftest import start_cluster  # noqa F401
+
+from ray.tests.conftest import ray_start_regular_shared  # noqa F401
 
 modin_installed = True
 
@@ -33,19 +34,17 @@ except ModuleNotFoundError:
 
 skip = not modin_installed
 
-# These tests are written for versions of Modin that require python 3.7+
+# These tests are written for versions of Modin that require python 3.8+
 pytestmark = pytest.mark.skipif(skip, reason="Outdated or missing Modin dependency")
 
 if not skip:
-    from ray.tests.modin.modin_test_utils import df_equals
     import modin.pandas as pd
 
+    from ray.tests.modin.modin_test_utils import df_equals
 
-# Module scoped fixture. Will first run all tests without ray
-# client, then rerun all tests with a single ray client session.
+
 @pytest.fixture(autouse=True)
-def run_ray_client(start_cluster):  # noqa F811
-    ray.init(start_cluster[1])
+def connect_to_ray_cluster(ray_start_regular_shared):  # noqa F811
     yield
 
 
@@ -71,7 +70,7 @@ test_data = {
         "col{}".format(int((i - NCOLS / 2) % NCOLS + 1)): [
             x
             if (j % 4 == 0 and i > NCOLS // 2) or (j != i and i <= NCOLS // 2)
-            else np.NaN
+            else np.nan
             for j, x in enumerate(
                 random_state.uniform(RAND_LOW, RAND_HIGH, size=(NROWS))
             )
@@ -87,7 +86,7 @@ test_data["int_data"]["index"] = test_data["int_data"].pop(
 for col in test_data["float_nan_data"]:
     for row in range(NROWS // 2):
         if row % 16 == 0:
-            test_data["float_nan_data"][col][row] = np.NaN
+            test_data["float_nan_data"][col][row] = np.nan
 
 test_data_values = list(test_data.values())
 test_data_keys = list(test_data.keys())

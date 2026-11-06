@@ -1,77 +1,17 @@
 import copy
-from collections import OrderedDict
-import os
-import pytest
 import sys
-import shutil
 import unittest
-from pathlib import Path
+from collections import OrderedDict
 from unittest.mock import patch
 
-import ray
-import ray._private.utils
-from ray.tune.utils.util import wait_for_gpu
-from ray.tune.utils.util import flatten_dict, unflatten_dict, unflatten_list_dict
-from ray.tune.trainable.util import TrainableUtil
+import pytest
 
-
-@pytest.mark.parametrize(
-    "checkpoint_path",
-    [
-        "~/tmp/exp/trial/checkpoint0",
-        "~/tmp/exp/trial/checkpoint0/",
-        "~/tmp/exp/trial/checkpoint0/checkpoint",
-        "~/tmp/exp/trial/checkpoint0/foo/bar/baz",
-    ],
+from ray.tune.utils.util import (
+    flatten_dict,
+    unflatten_dict,
+    unflatten_list_dict,
+    wait_for_gpu,
 )
-@pytest.mark.parametrize("logdir", ["~/tmp/exp/trial", "~/tmp/exp/trial/"])
-def test_find_rel_checkpoint_dir(checkpoint_path, logdir):
-    assert (
-        TrainableUtil.find_rel_checkpoint_dir(logdir, checkpoint_path) == "checkpoint0"
-    )
-
-
-class TrainableUtilTest(unittest.TestCase):
-    def setUp(self):
-        self.checkpoint_dir = os.path.join(
-            ray._private.utils.get_user_temp_dir(), "tune", "MyTrainable123"
-        )
-        self.checkpoint_dir = TrainableUtil.make_checkpoint_dir(
-            self.checkpoint_dir, "0"
-        )
-
-    def tearDown(self):
-        self.addCleanup(shutil.rmtree, self.checkpoint_dir)
-        ray.shutdown()
-
-    def testFindMetadata(self):
-        def tune_one(config=None, checkpoint_dir=None):
-            with ray.tune.checkpoint_dir(step=1):
-                pass
-            ray.tune.report(score=1)
-
-        name = "AnalysisTest"
-        ray.init(local_mode=True)
-        ray.tune.run(tune_one, storage_path=self.checkpoint_dir, name=name)
-
-        a = ray.tune.ExperimentAnalysis(
-            os.path.join(self.checkpoint_dir, name),
-            default_metric="score",
-            default_mode="max",
-        )
-        df = a.dataframe()
-        checkpoint_dir = a.get_best_checkpoint(df["logdir"].iloc[0])._local_path
-        assert Path(checkpoint_dir).stem == "checkpoint_000001"
-
-    def testFindCheckpointDir(self):
-        checkpoint_path = os.path.join(self.checkpoint_dir, "0/my/nested/chkpt")
-        os.makedirs(checkpoint_path)
-        found_dir = TrainableUtil.find_checkpoint_dir(checkpoint_path)
-        self.assertEqual(self.checkpoint_dir, found_dir)
-
-        with self.assertRaises(FileNotFoundError):
-            parent = os.path.dirname(found_dir)
-            TrainableUtil.find_checkpoint_dir(parent)
 
 
 class FlattenDictTest(unittest.TestCase):
@@ -112,6 +52,20 @@ class FlattenDictTest(unittest.TestCase):
         result = flatten_dict(in_)
         assert in_ == ori_in
         assert result == {"a/b/c/d": 1, "b/c/d": 2, "c/d": 3, "e": 4}
+
+    def test_flatten_list_with_prevent_delimiter(self):
+        # The list branch used to re-check `subkey`, a name only the dict branch
+        # binds, so a dict holding just a list raised UnboundLocalError.
+        ori_in = OrderedDict({"a": [1, 2]})
+        in_ = copy.deepcopy(ori_in)
+        result = flatten_dict(in_, prevent_delimiter=True, flatten_list=True)
+        assert in_ == ori_in
+        assert result == {"a/0": 1, "a/1": 2}
+
+    def test_prevent_delimiter_still_raises_with_flatten_list(self):
+        # Dropping the list-branch check must not weaken the dict-branch one.
+        with pytest.raises(ValueError):
+            flatten_dict({"a": {"b/c": 1}}, prevent_delimiter=True, flatten_list=True)
 
 
 class UnflattenDictTest(unittest.TestCase):
@@ -241,6 +195,4 @@ class GPUTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
-
     sys.exit(pytest.main(["-v", __file__]))

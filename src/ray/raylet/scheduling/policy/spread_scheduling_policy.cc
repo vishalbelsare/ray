@@ -17,16 +17,15 @@
 #include <functional>
 
 #include "ray/util/container_util.h"
-#include "ray/util/util.h"
 
 namespace ray {
 
 namespace raylet_scheduling_policy {
 
-scheduling::NodeID SpreadSchedulingPolicy::Schedule(
+NodeSchedulingResult SpreadSchedulingPolicy::Schedule(
     const ResourceRequest &resource_request, SchedulingOptions options) {
-  RAY_CHECK(options.spread_threshold == 0 &&
-            options.scheduling_type == SchedulingType::SPREAD)
+  RAY_CHECK(options.spread_threshold_ == 0 &&
+            options.scheduling_type_ == SchedulingType::SPREAD)
       << "SpreadPolicy policy requires spread_threshold = 0 and type = SPREAD";
   std::vector<scheduling::NodeID> round;
   round.reserve(nodes_.size());
@@ -37,14 +36,15 @@ scheduling::NodeID SpreadSchedulingPolicy::Schedule(
 
   // Spread among available nodes first.
   // If there is no available nodes, we spread among feasible nodes.
+  bool saw_feasible_but_unavailable = false;
   for (bool available_nodes_only :
-       (options.require_node_available ? std::vector<bool>{true}
-                                       : std::vector<bool>{true, false})) {
+       (options.require_node_available_ ? std::vector<bool>{true}
+                                        : std::vector<bool>{true, false})) {
     size_t round_index = spread_scheduling_next_index_;
     for (size_t i = 0; i < round.size(); ++i, ++round_index) {
       const auto &node_id = round[round_index % round.size()];
       const auto &node = map_find_or_die(nodes_, node_id);
-      if (node_id == local_node_id_ && options.avoid_local_node) {
+      if (node_id == local_node_id_ && options.avoid_local_node_) {
         continue;
       }
       if (!is_node_alive_(node_id) || !node.GetLocalView().IsFeasible(resource_request)) {
@@ -54,15 +54,19 @@ scheduling::NodeID SpreadSchedulingPolicy::Schedule(
       if (available_nodes_only &&
           !node.GetLocalView().IsAvailable(resource_request,
                                            /*ignore_pull_manager_at_capacity=*/false)) {
+        saw_feasible_but_unavailable = true;
         continue;
       }
 
       spread_scheduling_next_index_ = ((round_index + 1) % round.size());
-      return node_id;
+      return NodeSchedulingResult::Scheduled(node_id);
     }
   }
 
-  return scheduling::NodeID::Nil();
+  if (saw_feasible_but_unavailable) {
+    return NodeSchedulingResult::NoNodeAvailable();
+  }
+  return NodeSchedulingResult::Infeasible();
 }
 
 }  // namespace raylet_scheduling_policy

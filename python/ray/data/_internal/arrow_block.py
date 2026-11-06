@@ -1,5 +1,4 @@
-import collections
-import heapq
+import logging
 import random
 from typing import (
     TYPE_CHECKING,
@@ -8,6 +7,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Mapping,
     Optional,
     Tuple,
     TypeVar,
@@ -15,120 +15,176 @@ from typing import (
 )
 
 import numpy as np
+import pandas as pd
+import pyarrow
+from packaging.version import parse as parse_version
 
-from ray.air.constants import TENSOR_COLUMN_NAME
-from ray._private.utils import _get_pyarrow_version
+from ray._common.utils import env_integer
+from ray.data._internal.arrow_aggregation import is_boolean_arrow_type
 from ray.data._internal.arrow_ops import transform_polars, transform_pyarrow
-from ray.data._internal.numpy_support import (
-    convert_udf_returns_to_numpy,
-    is_valid_udf_return,
+from ray.data._internal.arrow_ops.transform_pyarrow import shuffle
+from ray.data._internal.row import row_repr, row_repr_pretty, row_str
+from ray.data._internal.table_block import TableBlockAccessor, TableBlockBuilder
+from ray.data._internal.tensor_extensions.arrow import (
+    convert_to_pyarrow_array,
+    native_tensor_array_to_numpy,
+    pyarrow_table_from_pydict,
 )
-from ray.data._internal.table_block import (
-    TableBlockAccessor,
-    TableBlockBuilder,
-)
-from ray.data._internal.util import _truncated_repr
-from ray.data.aggregate import AggregateFn
+from ray.data._internal.utils.arrow_utils import get_pyarrow_version
 from ray.data.block import (
     Block,
     BlockAccessor,
+    BlockColumn,
+    BlockColumnAccessor,
     BlockExecStats,
-    BlockMetadata,
-    KeyType,
+    BlockMetadataWithSchema,
+    BlockType,
     U,
 )
-from ray.data.context import DataContext
-from ray.data.row import TableRow
-
-try:
-    import pyarrow
-except ImportError:
-    pyarrow = None
-
+from ray.data.context import DEFAULT_TARGET_MAX_BLOCK_SIZE, DataContext
+from ray.data.expressions import Expr
 
 if TYPE_CHECKING:
     import pandas
 
-    from ray.data._internal.sort import SortKeyT
+    from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
+
+
+_MIN_PYARROW_VERSION_TO_NUMPY_ZERO_COPY_ONLY = parse_version("13.0.0")
+_BATCH_SIZE_PRESERVING_STUB_COL_NAME = "__bsp_stub"
+_INTERNAL_NUM_ROWS_COUNTER_COLUMN_NAME = "__rd_internal_num_rows"
+
+
+def _is_user_visible_column(name: str) -> bool:
+    return name != _BATCH_SIZE_PRESERVING_STUB_COL_NAME
+
+
+# Set the max chunk size in bytes for Arrow to Batches conversion in
+# ArrowBlockAccessor.iter_rows(). Default to 4MB, to optimize for image
+# datasets in parquet format.
+ARROW_MAX_CHUNK_SIZE_BYTES = env_integer(
+    "RAY_DATA_ARROW_MAX_CHUNK_SIZE_BYTES",
+    int(DEFAULT_TARGET_MAX_BLOCK_SIZE / 32),
+)
 
 
 # We offload some transformations to polars for performance.
 def get_sort_transform(context: DataContext) -> Callable:
-    if context.use_polars:
+    if context.use_polars or context.use_polars_sort:
         return transform_polars.sort
     else:
         return transform_pyarrow.sort
 
 
 def get_concat_and_sort_transform(context: DataContext) -> Callable:
-    if context.use_polars:
+    if context.use_polars or context.use_polars_sort:
         return transform_polars.concat_and_sort
     else:
         return transform_pyarrow.concat_and_sort
 
 
-class ArrowRow(TableRow):
-    """
-    Row of a tabular Dataset backed by a Arrow Table block.
-    """
+class ArrowRow(Mapping):
+    """Row of a tabular Dataset backed by a pyarrow RecordBatch or Table and a row index."""
 
-    def __getitem__(self, key: str) -> Any:
-        from ray.data.extensions.tensor_extension import (
-            ArrowTensorType,
-            ArrowVariableShapedTensorType,
-        )
+    def __init__(
+        self, batch: Union["pyarrow.Table", "pyarrow.RecordBatch"], row_idx: int
+    ):
+        self._batch = batch
+        self._row_idx = row_idx
 
-        schema = self._row.schema
-        if isinstance(
-            schema.field(key).type,
-            (ArrowTensorType, ArrowVariableShapedTensorType),
-        ):
-            # Build a tensor row.
-            return ArrowBlockAccessor._build_tensor_row(self._row, col_name=key)
+    def __getitem__(self, key: Union[str, List[str]]) -> Any:
+        from ray.data.extensions import get_arrow_extension_tensor_types
 
-        col = self._row[key]
-        if len(col) == 0:
-            return None
-        item = col[0]
-        try:
-            # Try to interpret this as a pyarrow.Scalar value.
-            return item.as_py()
-        except AttributeError:
-            # Assume that this row is an element of an extension array, and
-            # that it is bypassing pyarrow's scalar model for Arrow < 8.0.0.
-            return item
+        tensor_arrow_extension_types = get_arrow_extension_tensor_types()
+        schema = self._batch.schema
+
+        def get_item(keys: List[str]) -> Tuple[Any, ...]:
+            # Resolve every column up front so that a missing one raises, rather
+            # than depending on its position in ``keys``.
+            col_indices = []
+            for col_name in keys:
+                col_idx = schema.get_field_index(col_name)
+                if col_idx == -1:
+                    raise KeyError(col_name)
+                col_indices.append(col_idx)
+
+            if not col_indices:
+                return ()
+
+            # Check for tensor extension type on first key
+            if isinstance(
+                schema.field(col_indices[0]).type, tensor_arrow_extension_types
+            ):
+                # Build a tensor row.
+                return tuple(
+                    ArrowBlockAccessor._build_tensor_row(
+                        self._batch, col_name=key, row_idx=self._row_idx
+                    )
+                    for key in keys
+                )
+
+            # Pyarrow select internally creates a new table by slicing which is
+            # expensive. Instead, access the columns directly at row_idx.
+            items = [self._batch.column(i)[self._row_idx] for i in col_indices]
+
+            try:
+                # Try to interpret this as a pyarrow.Scalar value.
+                return tuple(item.as_py() for item in items)
+            except AttributeError:
+                # Assume that this row is an element of an extension array, and
+                # that it is bypassing pyarrow's scalar model for Arrow < 8.0.0.
+                return tuple(items)
+
+        is_single_item = isinstance(key, str)
+        keys = [key] if is_single_item else key
+        items = get_item(keys)
+
+        return items[0] if is_single_item else items
 
     def __iter__(self) -> Iterator:
-        for k in self._row.column_names:
-            yield k
+        yield from self._batch.schema.names
 
     def __len__(self):
-        return self._row.num_columns
+        return len(self._batch.schema)
+
+    def as_pydict(self) -> Dict[str, Any]:
+        return {k: self[k] for k in self}
+
+    def __str__(self):
+        return row_str(self)
+
+    def __repr__(self):
+        return row_repr(self)
+
+    def _repr_pretty_(self, p, cycle):
+        return row_repr_pretty(self, p, cycle)
 
 
 class ArrowBlockBuilder(TableBlockBuilder):
     def __init__(self):
-        if pyarrow is None:
-            raise ImportError("Run `pip install pyarrow` for Arrow support")
         super().__init__((pyarrow.Table, bytes))
 
     @staticmethod
     def _table_from_pydict(columns: Dict[str, List[Any]]) -> Block:
-        for col_name, col in columns.items():
-            if col_name == TENSOR_COLUMN_NAME or isinstance(
-                next(iter(col), None), np.ndarray
-            ):
-                from ray.data.extensions.tensor_extension import ArrowTensorArray
-
-                columns[col_name] = ArrowTensorArray.from_numpy(col)
-        return pyarrow.Table.from_pydict(columns)
+        return pyarrow_table_from_pydict(
+            {
+                column_name: convert_to_pyarrow_array(column_values, column_name)
+                for column_name, column_values in columns.items()
+            }
+        )
 
     @staticmethod
-    def _concat_tables(tables: List[Block]) -> Block:
-        return transform_pyarrow.concat(tables)
+    def _combine_tables(tables: List[Block]) -> Block:
+        if len(tables) > 1:
+            return transform_pyarrow.concat(
+                tables, promote_types=True, preserve_order=True
+            )
+        else:
+            return tables[0]
 
     @staticmethod
     def _concat_would_copy() -> bool:
@@ -136,19 +192,83 @@ class ArrowBlockBuilder(TableBlockBuilder):
 
     @staticmethod
     def _empty_table() -> "pyarrow.Table":
-        return pyarrow.Table.from_pydict({})
+        return pyarrow_table_from_pydict({})
+
+    def block_type(self) -> BlockType:
+        return BlockType.ARROW
+
+
+def _get_max_chunk_size(
+    table: "pyarrow.Table", max_chunk_size_bytes: int
+) -> Optional[int]:
+    """Calculate the max chunk size in rows for Arrow to Batches conversion in
+    ArrowBlockAccessor.iter_rows().
+    Args:
+        table: The pyarrow table to calculate the max chunk size for.
+        max_chunk_size_bytes: The max chunk size in bytes.
+    Returns:
+        The max chunk size in rows, or None if the table is empty.
+    """
+    if table.nbytes == 0:
+        return None
+    else:
+        avg_row_size = table.nbytes / table.num_rows
+        return max(1, int(max_chunk_size_bytes / avg_row_size))
+
+
+# Maps an Arrow type to the Arrow-backed pandas dtype it converts to, preserving
+# Arrow dtypes through the pandas round-trip:
+# - Standard Arrow types become pd.ArrowDtype, so pa.Table.from_pandas()
+#   can reconstruct them exactly without lossy numpy conversion.
+# - Extension types (Ray's ArrowTensorType / ArrowPythonObjectType and
+#   pyarrow's native FixedShapeTensorType) return None, falling back to
+#   their own to_pandas_dtype() hooks. Note: native FixedShapeTensorType
+#   subclasses BaseExtensionType but not ExtensionType, so we check the
+#   broader BaseExtensionType.
+# - Arrow's null type carries no type information, and pandas cannot box a
+#   non-null value into a null[pyarrow] column, so fillna and masked
+#   assignment raise ArrowInvalid (and can abort the worker from Arrow
+#   C++). Fall back to pandas' default conversion; PandasBlockAccessor
+#   .to_arrow() coerces all-null columns back to pa.null(), so the
+#   round-trip is unchanged. A column that is all-null in every block
+#   therefore stays null-typed rather than being promoted.
+def _arrow_backed_pandas_dtype(t: "pyarrow.DataType") -> Optional["pd.ArrowDtype"]:
+    if isinstance(t, pyarrow.BaseExtensionType) or pyarrow.types.is_dictionary(t):
+        return None
+    if pyarrow.types.is_null(t):
+        return None
+    return pd.ArrowDtype(t)
 
 
 class ArrowBlockAccessor(TableBlockAccessor):
     ROW_TYPE = ArrowRow
 
     def __init__(self, table: "pyarrow.Table"):
-        if pyarrow is None:
-            raise ImportError("Run `pip install pyarrow` for Arrow support")
         super().__init__(table)
+        self._max_chunk_size: Optional[int] = None
+
+    def _get_row(self, index: int) -> ArrowRow:
+        return self.ROW_TYPE(self._table, index)
 
     def column_names(self) -> List[str]:
         return self._table.column_names
+
+    def fill_column(self, name: str, value: Any) -> Block:
+        import pyarrow.compute as pc
+
+        # Check if value is array-like - if so, use upsert_column logic
+        if isinstance(value, (pyarrow.Array, pyarrow.ChunkedArray)):
+            return self.upsert_column(name, value)
+        else:
+            # Scalar value - use original fill_column logic
+            if isinstance(value, pyarrow.Scalar):
+                type = value.type
+            else:
+                type = pyarrow.infer_type([value])
+
+            array = pyarrow.nulls(len(self._table), type=type)
+            array = pc.fill_null(array, value)
+            return self.upsert_column(name, array)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "ArrowBlockAccessor":
@@ -156,138 +276,86 @@ class ArrowBlockAccessor(TableBlockAccessor):
         return cls(reader.read_all())
 
     @staticmethod
-    def numpy_to_block(
-        batch: Union[np.ndarray, Dict[str, np.ndarray], Dict[str, list]],
-        passthrough_arrow_not_implemented_errors: bool = False,
-    ) -> "pyarrow.Table":
-        import pyarrow as pa
+    def _build_tensor_row(row: ArrowRow, row_idx: int, col_name: str) -> np.ndarray:
 
-        from ray.data.extensions.tensor_extension import ArrowTensorArray
+        element = row[col_name][row_idx]
+        arr = element.as_py()
 
-        if isinstance(batch, np.ndarray):
-            batch = {TENSOR_COLUMN_NAME: batch}
-        elif not isinstance(batch, collections.abc.Mapping) or any(
-            not is_valid_udf_return(col) for col in batch.values()
-        ):
-            raise ValueError(
-                "Batch must be an ndarray or dictionary of ndarrays when converting "
-                f"a numpy batch to a block, got: {type(batch)} "
-                f"({_truncated_repr(batch)})"
-            )
-        new_batch = {}
-        for col_name, col in batch.items():
-            # Coerce to np.ndarray format if possible.
-            col = convert_udf_returns_to_numpy(col)
-            # Use Arrow's native *List types for 1-dimensional ndarrays.
-            if col.dtype.type is np.object_ or col.ndim > 1:
-                try:
-                    col = ArrowTensorArray.from_numpy(col)
-                except pa.ArrowNotImplementedError as e:
-                    if passthrough_arrow_not_implemented_errors:
-                        raise e
-                    raise ValueError(
-                        "Failed to convert multi-dimensional ndarray of dtype "
-                        f"{col.dtype} to our tensor extension since this dtype is not "
-                        "supported by Arrow. If encountering this due to string data, "
-                        'cast the ndarray to a string dtype, e.g. a.astype("U").'
-                    ) from e
-            new_batch[col_name] = col
-        return pa.Table.from_pydict(new_batch)
-
-    @staticmethod
-    def _build_tensor_row(
-        row: ArrowRow, col_name: str = TENSOR_COLUMN_NAME
-    ) -> np.ndarray:
-        from pkg_resources._vendor.packaging.version import parse as parse_version
-
-        element = row[col_name][0]
-        # TODO(Clark): Reduce this to np.asarray(element) once we only support Arrow
-        # 9.0.0+.
-        pyarrow_version = _get_pyarrow_version()
-        if pyarrow_version is not None:
-            pyarrow_version = parse_version(pyarrow_version)
-        if pyarrow_version is None or pyarrow_version >= parse_version("8.0.0"):
-            assert isinstance(element, pyarrow.ExtensionScalar)
-            if pyarrow_version is None or pyarrow_version >= parse_version("9.0.0"):
-                # For Arrow 9.0.0+, accessing an element in a chunked tensor array
-                # produces an ArrowTensorScalar, which we convert to an ndarray using
-                # .as_py().
-                element = element.as_py()
-            else:
-                # For Arrow 8.*, accessing an element in a chunked tensor array produces
-                # an ExtensionScalar, which we convert to an ndarray using our custom
-                # method.
-                element = element.type._extension_scalar_to_ndarray(element)
-        # For Arrow < 8.0.0, accessing an element in a chunked tensor array produces an
-        # ndarray, which we return directly.
-        assert isinstance(element, np.ndarray), type(element)
-        return element
+        assert isinstance(arr, np.ndarray), type(arr)
+        return arr
 
     def slice(self, start: int, end: int, copy: bool = False) -> "pyarrow.Table":
         view = self._table.slice(start, end - start)
         if copy:
-            view = _copy_table(view)
+            view = transform_pyarrow.combine_chunks(view, copy)
         return view
 
     def random_shuffle(self, random_seed: Optional[int]) -> "pyarrow.Table":
-        random = np.random.RandomState(random_seed)
-        return self.take(random.permutation(self.num_rows()))
+        return shuffle(self._table, random_seed)
 
     def schema(self) -> "pyarrow.lib.Schema":
         return self._table.schema
 
     def to_pandas(self) -> "pandas.DataFrame":
-        from ray.air.util.data_batch_conversion import _cast_tensor_columns_to_ndarrays
+        from ray.data.util.data_batch_conversion import _cast_tensor_columns_to_ndarrays
 
-        df = self._table.to_pandas()
+        # We specify ignore_metadata=True because pyarrow will use the metadata
+        # to build the Table. This is handled incorrectly for older pyarrow versions
         ctx = DataContext.get_current()
+
+        # Gated on enable_arrow_backed_pandas_conversion so callers can restore the
+        # pre-2.56 numpy conversion (standard Arrow types -> numpy dtypes). See
+        # https://github.com/ray-project/ray/issues/64765.
+        df = self._table.to_pandas(
+            ignore_metadata=ctx.pandas_block_ignore_metadata,
+            types_mapper=(
+                _arrow_backed_pandas_dtype
+                if ctx.enable_arrow_backed_pandas_conversion
+                else None
+            ),
+        )
         if ctx.enable_tensor_extension_casting:
-            df = _cast_tensor_columns_to_ndarrays(df)
+            df = _cast_tensor_columns_to_ndarrays(df, arrow_schema=self._table.schema)
         return df
 
     def to_numpy(
         self, columns: Optional[Union[str, List[str]]] = None
     ) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-        from ray.air.util.transform_pyarrow import (
-            _concatenate_extension_column,
-            _is_column_extension_type,
-        )
-
         if columns is None:
             columns = self._table.column_names
-            should_be_single_ndarray = self.is_tensor_wrapper()
+            should_be_single_ndarray = False
         elif isinstance(columns, list):
-            should_be_single_ndarray = (
-                columns == self._table_column_names and self.is_tensor_wrapper()
-            )
+            should_be_single_ndarray = False
         else:
             columns = [columns]
             should_be_single_ndarray = True
 
+        column_names_set = set(self._table.column_names)
         for column in columns:
-            if column not in self._table.column_names:
+            if column not in column_names_set:
                 raise ValueError(
                     f"Cannot find column {column}, available columns: "
-                    f"{self._table.column_names}"
+                    f"{column_names_set}"
                 )
 
-        arrays = []
-        for column in columns:
-            array = self._table[column]
-            if _is_column_extension_type(array):
-                array = _concatenate_extension_column(array)
-            elif array.num_chunks == 0:
-                array = pyarrow.array([], type=array.type)
-            else:
-                array = array.combine_chunks()
-            arrays.append(array.to_numpy(zero_copy_only=False))
+        column_values_ndarrays = []
+
+        for col_name in columns:
+            col = self._table[col_name]
+
+            # Combine columnar values arrays to make these contiguous
+            # (making them compatible with numpy format)
+            combined_array = transform_pyarrow.combine_chunked_array(col)
+
+            column_values_ndarrays.append(
+                transform_pyarrow.to_numpy(combined_array, zero_copy_only=False)
+            )
 
         if should_be_single_ndarray:
             assert len(columns) == 1
-            arrays = arrays[0]
+            return column_values_ndarrays[0]
         else:
-            arrays = dict(zip(columns, arrays))
-        return arrays
+            return dict(zip(columns, column_values_ndarrays))
 
     def to_arrow(self) -> "pyarrow.Table":
         return self._table
@@ -316,6 +384,19 @@ class ArrowBlockAccessor(TableBlockAccessor):
             r = r.append_column(col_name, col)
         return r
 
+    def upsert_column(
+        self, column_name: str, column_data: BlockColumn
+    ) -> "pyarrow.Table":
+        assert isinstance(
+            column_data, (pyarrow.Array, pyarrow.ChunkedArray)
+        ), f"Expected either a pyarrow.Array or pyarrow.ChunkedArray, got: {type(column_data)}"
+
+        column_idx = self._table.schema.get_field_index(column_name)
+        if column_idx == -1:
+            return self._table.append_column(column_name, column_data)
+        else:
+            return self._table.set_column(column_idx, column_name, column_data)
+
     @staticmethod
     def builder() -> ArrowBlockBuilder:
         return ArrowBlockBuilder()
@@ -326,7 +407,7 @@ class ArrowBlockAccessor(TableBlockAccessor):
 
     def take(
         self,
-        indices: Union[List[int], "pyarrow.Array", "pyarrow.ChunkedArray"],
+        indices: Union[List[int], np.ndarray, "pyarrow.Array", "pyarrow.ChunkedArray"],
     ) -> "pyarrow.Table":
         """Select rows from the underlying table.
 
@@ -335,335 +416,345 @@ class ArrowBlockAccessor(TableBlockAccessor):
         """
         return transform_pyarrow.take_table(self._table, indices)
 
+    def drop(self, columns: List[str]) -> Block:
+        return self._table.drop(columns)
+
     def select(self, columns: List[str]) -> "pyarrow.Table":
         if not all(isinstance(col, str) for col in columns):
             raise ValueError(
                 "Columns must be a list of column name strings when aggregating on "
                 f"Arrow blocks, but got: {columns}."
             )
+        if len(columns) == 0:
+            # Empty projection (e.g. count or ``select_columns([])``).
+            # Drop every existing column, then append the stub so row
+            # counts survive downstream ``pa.concat_tables`` calls (which
+            # collapse num_rows to 0 when all inputs have 0 columns).
+            # ``pa.Table`` tracks num_rows as metadata independent of
+            # columns, so ``select([])`` preserves it here. The stub is
+            # filtered out of the user-visible schema; it's a physical
+            # placeholder only.
+            narrowed = self._table.select([])
+            return ArrowBlockAccessor(narrowed).fill_column(
+                _BATCH_SIZE_PRESERVING_STUB_COL_NAME, None
+            )
         return self._table.select(columns)
 
-    def _sample(self, n_samples: int, key: "SortKeyT") -> "pyarrow.Table":
+    def rename_columns(self, columns_rename: Dict[str, str]) -> "pyarrow.Table":
+        return self._table.rename_columns(columns_rename)
+
+    def hstack(self, other_block: "pyarrow.Table") -> "pyarrow.Table":
+
+        result_table = self._table
+        for name, column in zip(other_block.column_names, other_block.columns):
+            result_table = result_table.append_column(name, column)
+
+        return result_table
+
+    def _sample(self, n_samples: int, sort_key: "SortKey") -> "pyarrow.Table":
         indices = random.sample(range(self._table.num_rows), n_samples)
-        table = self._table.select([k[0] for k in key])
+        table = self._table.select(sort_key.get_columns())
         return transform_pyarrow.take_table(table, indices)
 
-    def count(self, on: str) -> Optional[U]:
-        """Count the number of non-null values in the provided column."""
-        import pyarrow.compute as pac
-
-        if not isinstance(on, str):
-            raise ValueError(
-                "on must be a string when aggregating on Arrow blocks, but got:"
-                f"{type(on)}."
-            )
-
-        if self.num_rows() == 0:
-            return None
-
-        col = self._table[on]
-        return pac.count(col).as_py()
-
-    def _apply_arrow_compute(
-        self, compute_fn: Callable, on: str, ignore_nulls: bool
-    ) -> Optional[U]:
-        """Helper providing null handling around applying an aggregation to a column."""
-        import pyarrow as pa
-
-        if not isinstance(on, str):
-            raise ValueError(
-                "on must be a string when aggregating on Arrow blocks, but got:"
-                f"{type(on)}."
-            )
-
-        if self.num_rows() == 0:
-            return None
-
-        col = self._table[on]
-        if pa.types.is_null(col.type):
-            return None
-        else:
-            return compute_fn(col, skip_nulls=ignore_nulls).as_py()
-
-    def sum(self, on: str, ignore_nulls: bool) -> Optional[U]:
-        import pyarrow.compute as pac
-
-        return self._apply_arrow_compute(pac.sum, on, ignore_nulls)
-
-    def min(self, on: str, ignore_nulls: bool) -> Optional[U]:
-        import pyarrow.compute as pac
-
-        return self._apply_arrow_compute(pac.min, on, ignore_nulls)
-
-    def max(self, on: str, ignore_nulls: bool) -> Optional[U]:
-        import pyarrow.compute as pac
-
-        return self._apply_arrow_compute(pac.max, on, ignore_nulls)
-
-    def mean(self, on: str, ignore_nulls: bool) -> Optional[U]:
-        import pyarrow.compute as pac
-
-        return self._apply_arrow_compute(pac.mean, on, ignore_nulls)
-
-    def sum_of_squared_diffs_from_mean(
-        self,
-        on: str,
-        ignore_nulls: bool,
-        mean: Optional[U] = None,
-    ) -> Optional[U]:
-        import pyarrow.compute as pac
-
-        if mean is None:
-            # If precomputed mean not given, we compute it ourselves.
-            mean = self.mean(on, ignore_nulls)
-            if mean is None:
-                return None
-        return self._apply_arrow_compute(
-            lambda col, skip_nulls: pac.sum(
-                pac.power(pac.subtract(col, mean), 2),
-                skip_nulls=skip_nulls,
-            ),
-            on,
-            ignore_nulls,
-        )
-
-    def sort_and_partition(
-        self, boundaries: List[T], key: "SortKeyT", descending: bool
-    ) -> List["Block"]:
-        if len(key) > 1:
-            raise NotImplementedError(
-                "sorting by multiple columns is not supported yet"
-            )
+    def sort(self, sort_key: "SortKey") -> Block:
+        assert (
+            sort_key.get_columns()
+        ), f"Sorting columns couldn't be empty (got {sort_key.get_columns()})"
 
         if self._table.num_rows == 0:
             # If the pyarrow table is empty we may not have schema
             # so calling sort_indices() will raise an error.
-            return [self._empty_table() for _ in range(len(boundaries) + 1)]
+            return self._empty_table()
 
         context = DataContext.get_current()
         sort = get_sort_transform(context)
-        col, _ = key[0]
-        table = sort(self._table, key, descending)
-        if len(boundaries) == 0:
+
+        return sort(self._table, sort_key)
+
+    def sort_and_partition(
+        self, boundaries: List[T], sort_key: "SortKey"
+    ) -> List["Block"]:
+        table = self.sort(sort_key)
+
+        if table.num_rows == 0:
+            return [self._empty_table() for _ in range(len(boundaries) + 1)]
+        elif len(boundaries) == 0:
             return [table]
 
-        partitions = []
-        # For each boundary value, count the number of items that are less
-        # than it. Since the block is sorted, these counts partition the items
-        # such that boundaries[i] <= x < boundaries[i + 1] for each x in
-        # partition[i]. If `descending` is true, `boundaries` would also be
-        # in descending order and we only need to count the number of items
-        # *greater than* the boundary value instead.
-        if descending:
-            num_rows = len(table[col])
-            bounds = num_rows - np.searchsorted(
-                table[col], boundaries, sorter=np.arange(num_rows - 1, -1, -1)
-            )
-        else:
-            bounds = np.searchsorted(table[col], boundaries)
-        last_idx = 0
-        for idx in bounds:
-            partitions.append(table.slice(last_idx, idx - last_idx))
-            last_idx = idx
-        partitions.append(table.slice(last_idx))
-        return partitions
-
-    def combine(self, key: str, aggs: Tuple[AggregateFn]) -> Block:
-        """Combine rows with the same key into an accumulator.
-
-        This assumes the block is already sorted by key in ascending order.
-
-        Args:
-            key: The column name of key or None for global aggregation.
-            aggs: The aggregations to do.
-
-        Returns:
-            A sorted block of [k, v_1, ..., v_n] columns where k is the groupby
-            key and v_i is the partially combined accumulator for the ith given
-            aggregation.
-            If key is None then the k column is omitted.
-        """
-        if key is not None and not isinstance(key, str):
-            raise ValueError(
-                "key must be a string or None when aggregating on Arrow blocks, but "
-                f"got: {type(key)}."
-            )
-
-        def iter_groups() -> Iterator[Tuple[KeyType, Block]]:
-            """Creates an iterator over zero-copy group views."""
-            if key is None:
-                # Global aggregation consists of a single "group", so we short-circuit.
-                yield None, self.to_block()
-                return
-
-            start = end = 0
-            iter = self.iter_rows(public_row_format=False)
-            next_row = None
-            while True:
-                try:
-                    if next_row is None:
-                        next_row = next(iter)
-                    next_key = next_row[key]
-                    while next_row[key] == next_key:
-                        end += 1
-                        try:
-                            next_row = next(iter)
-                        except StopIteration:
-                            next_row = None
-                            break
-                    yield next_key, self.slice(start, end)
-                    start = end
-                except StopIteration:
-                    break
-
-        builder = ArrowBlockBuilder()
-        for group_key, group_view in iter_groups():
-            # Aggregate.
-            accumulators = [agg.init(group_key) for agg in aggs]
-            for i in range(len(aggs)):
-                accumulators[i] = aggs[i].accumulate_block(accumulators[i], group_view)
-
-            # Build the row.
-            row = {}
-            if key is not None:
-                row[key] = group_key
-
-            count = collections.defaultdict(int)
-            for agg, accumulator in zip(aggs, accumulators):
-                name = agg.name
-                # Check for conflicts with existing aggregation name.
-                if count[name] > 0:
-                    name = self._munge_conflict(name, count[name])
-                count[name] += 1
-                row[name] = accumulator
-
-            builder.add(row)
-
-        return builder.build()
-
-    @staticmethod
-    def _munge_conflict(name, count):
-        return f"{name}_{count+1}"
+        return BlockAccessor.for_block(table)._find_partitions_sorted(
+            boundaries, sort_key
+        )
 
     @staticmethod
     def merge_sorted_blocks(
-        blocks: List[Block], key: "SortKeyT", _descending: bool
-    ) -> Tuple[Block, BlockMetadata]:
+        blocks: List[Block], sort_key: "SortKey"
+    ) -> Tuple[Block, BlockMetadataWithSchema]:
         stats = BlockExecStats.builder()
         blocks = [b for b in blocks if b.num_rows > 0]
         if len(blocks) == 0:
             ret = ArrowBlockAccessor._empty_table()
         else:
+            # Handle blocks of different types.
+            blocks = TableBlockAccessor.normalize_block_types(blocks, BlockType.ARROW)
             concat_and_sort = get_concat_and_sort_transform(DataContext.get_current())
-            ret = concat_and_sort(blocks, key, _descending)
-        return ret, ArrowBlockAccessor(ret).get_metadata(None, exec_stats=stats.build())
+            ret = concat_and_sort(blocks, sort_key, promote_types=True)
+        return ret, BlockMetadataWithSchema.from_block(
+            ret, block_exec_stats=stats.build()
+        )
 
-    @staticmethod
-    def aggregate_combined_blocks(
-        blocks: List[Block],
-        key: str,
-        aggs: Tuple[AggregateFn],
-        finalize: bool,
-    ) -> Tuple[Block, BlockMetadata]:
-        """Aggregate sorted, partially combined blocks with the same key range.
+    def _get_group_boundaries_sorted(self, keys: List[str]) -> np.ndarray:
+        """Compute group boundaries natively in Arrow.
 
-        This assumes blocks are already sorted by key in ascending order,
-        so we can do merge sort to get all the rows with the same key.
+        Overrides the base implementation, which first converts the key columns
+        to NumPy. That conversion is free for fixed-width numeric columns, but
+        for string, binary and decimal columns it materializes one Python object
+        per row, and for any column holding nulls it copies the values and
+        promotes them to ``float64``.
 
-        Args:
-            blocks: A list of partially combined and sorted blocks.
-            key: The column name of key or None for global aggregation.
-            aggs: The aggregations to do.
-            finalize: Whether to finalize the aggregation. This is used as an
-                optimization for cases where we repeatedly combine partially
-                aggregated groups.
-
-        Returns:
-            A block of [k, v_1, ..., v_n] columns and its metadata where k is
-            the groupby key and v_i is the corresponding aggregation result for
-            the ith given aggregation.
-            If key is None then the k column is omitted.
+        NOTE: THIS METHOD ASSUMES THAT PROVIDED BLOCK IS ALREADY SORTED
         """
+        import pyarrow.compute as pac
 
-        stats = BlockExecStats.builder()
-        key_fn = (
-            (lambda r: r[r._row.schema.names[0]]) if key is not None else (lambda r: 0)
+        if self.num_rows() == 0:
+            return np.array([], dtype=np.int32)
+        elif not keys:
+            # If no keys are specified, whole block is considered a single group
+            return np.array([0, self.num_rows()])
+
+        # This method computes offsets for individual groups with a
+        # following algorithm:
+        #
+        #   - Column with single int value of 1 (for every row) is appended
+        ones = np.ones(self._table.num_rows, dtype=np.int32)
+
+        extended_table = self._table.append_column(
+            _INTERNAL_NUM_ROWS_COUNTER_COLUMN_NAME, pyarrow.array(ones)
         )
 
-        iter = heapq.merge(
-            *[
-                ArrowBlockAccessor(block).iter_rows(public_row_format=False)
-                for block in blocks
-            ],
-            key=key_fn,
+        #   - Block is aggregated based on the target group-key, where
+        #       newly added column is summed up (computing the size of the group)
+        aggregated_extended_table = (
+            extended_table.group_by(keys).aggregate(
+                [(_INTERNAL_NUM_ROWS_COUNTER_COLUMN_NAME, "sum")]
+            )
+            # NOTE: Arrow performs hash-based aggregations and hence returned
+            #       table could be out of order
+            .sort_by([(k, "ascending") for k in keys])
         )
-        next_row = None
-        builder = ArrowBlockBuilder()
-        while True:
-            try:
-                if next_row is None:
-                    next_row = next(iter)
-                next_key = key_fn(next_row)
-                next_key_name = (
-                    next_row._row.schema.names[0] if key is not None else None
+
+        group_size_column = aggregated_extended_table[
+            f"{_INTERNAL_NUM_ROWS_COUNTER_COLUMN_NAME}_sum"
+        ]
+
+        #   - Column with respective sizes of the group is transformed into
+        #       an array of offsets (by running cumulative sum on it)
+        offsets_col = pac.cumulative_sum(group_size_column)
+
+        return np.concatenate([[0], offsets_col.to_numpy()])
+
+    def block_type(self) -> BlockType:
+        return BlockType.ARROW
+
+    def iter_rows(
+        self, public_row_format: bool
+    ) -> Iterator[Union[Mapping, np.ndarray]]:
+        table = self._table
+        if public_row_format:
+            from ray.data._internal.utils.transform_pyarrow import (
+                _is_native_tensor_type,
+            )
+
+            if self._max_chunk_size is None:
+                # Calling _get_max_chunk_size in constructor makes it slow, so we
+                # are calling it here only when needed.
+                self._max_chunk_size = _get_max_chunk_size(
+                    table, ARROW_MAX_CHUNK_SIZE_BYTES
                 )
+            contains_native_tensor_columns = any(
+                _is_native_tensor_type(column.type) for column in table.columns
+            )
+            for batch in table.to_batches(max_chunksize=self._max_chunk_size):
+                if contains_native_tensor_columns:
+                    # HACK: For v1 and v2 tensors, we can control what is returned
+                    # by overriding ExtensionScalar.as_py (see ArrowTensorScalar).
+                    # For pyarrow native FixedShapeTensorArrays we cannot, so we
+                    # use _iter_rows_from_batch_with_tensors to handle conversion.
+                    yield from _iter_rows_from_batch_with_tensors(batch)
+                else:
+                    yield from batch.to_pylist()
+        else:
+            num_rows = self.num_rows()
+            for i in range(num_rows):
+                yield self._get_row(i)
 
-                def gen():
-                    nonlocal iter
-                    nonlocal next_row
-                    while key_fn(next_row) == next_key:
-                        yield next_row
-                        try:
-                            next_row = next(iter)
-                        except StopIteration:
-                            next_row = None
-                            break
+    def filter(self, predicate_expr: "Expr") -> "pyarrow.Table":
+        """Filter rows based on a predicate expression."""
+        if self._table.num_rows == 0:
+            return self._table
 
-                # Merge.
-                first = True
-                accumulators = [None] * len(aggs)
-                resolved_agg_names = [None] * len(aggs)
-                for r in gen():
-                    if first:
-                        count = collections.defaultdict(int)
-                        for i in range(len(aggs)):
-                            name = aggs[i].name
-                            # Check for conflicts with existing aggregation
-                            # name.
-                            if count[name] > 0:
-                                name = ArrowBlockAccessor._munge_conflict(
-                                    name, count[name]
-                                )
-                            count[name] += 1
-                            resolved_agg_names[i] = name
-                            accumulators[i] = r[name]
-                        first = False
-                    else:
-                        for i in range(len(aggs)):
-                            accumulators[i] = aggs[i].merge(
-                                accumulators[i], r[resolved_agg_names[i]]
-                            )
-                # Build the row.
-                row = {}
-                if key is not None:
-                    row[next_key_name] = next_key
+        from ray.data._internal.planner.plan_expression.expression_evaluator import (
+            eval_expr,
+        )
 
-                for agg, agg_name, accumulator in zip(
-                    aggs, resolved_agg_names, accumulators
-                ):
-                    if finalize:
-                        row[agg_name] = agg.finalize(accumulator)
-                    else:
-                        row[agg_name] = accumulator
+        # Evaluate the expression to get a boolean mask
+        mask = eval_expr(predicate_expr, self._table)
 
-                builder.add(row)
-            except StopIteration:
-                break
-
-        ret = builder.build()
-        return ret, ArrowBlockAccessor(ret).get_metadata(None, exec_stats=stats.build())
+        # Use PyArrow's built-in filter method
+        return self._table.filter(mask)
 
 
-def _copy_table(table: "pyarrow.Table") -> "pyarrow.Table":
-    """Copy the provided Arrow table."""
-    return transform_pyarrow.combine_chunks(table)
+def _iter_rows_from_batch_with_tensors(
+    batch: "pyarrow.RecordBatch",
+) -> Iterator[Dict[str, Any]]:
+    """Iterate over rows in a batch that may contain native tensor columns.
+
+    For pyarrow native FixedShapeTensorArrays, we must manually convert them
+    to ndarrays which preserve shape/ndim. Without this, FixedShapeTensorArrays
+    would be translated to contiguous 1d arrays.
+
+    See: https://arrow.apache.org/docs/python/generated/pyarrow.FixedShapeTensorArray.html
+
+    Args:
+        batch: A PyArrow RecordBatch that may contain tensor columns.
+
+    Yields:
+        Dict[str, Any]: Dictionaries mapping column names to values for each row.
+    """
+    from ray.data._internal.utils.transform_pyarrow import _is_native_tensor_type
+
+    col_values = []
+    for column in batch.columns:
+        if _is_native_tensor_type(column.type):
+            col_values.append(native_tensor_array_to_numpy(column))
+        else:
+            col_values.append(column.to_pylist())
+
+    for idx in range(batch.num_rows):
+        yield {name: col[idx] for name, col in zip(batch.column_names, col_values)}
+
+
+class ArrowBlockColumnAccessor(BlockColumnAccessor):
+    def __init__(self, col: Union["pyarrow.Array", "pyarrow.ChunkedArray"]):
+        super().__init__(col)
+
+    def count(self, *, ignore_nulls: bool, as_py: bool = True) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        res = pac.count(self._column, mode="only_valid" if ignore_nulls else "all")
+        return res.as_py() if as_py else res
+
+    def sum(self, *, ignore_nulls: bool, as_py: bool = True) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        res = pac.sum(self._column, skip_nulls=ignore_nulls)
+        return res.as_py() if as_py else res
+
+    def min(self, *, ignore_nulls: bool, as_py: bool = True) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        res = pac.min(self._column, skip_nulls=ignore_nulls)
+        return res.as_py() if as_py else res
+
+    def max(self, *, ignore_nulls: bool, as_py: bool = True) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        res = pac.max(self._column, skip_nulls=ignore_nulls)
+        return res.as_py() if as_py else res
+
+    def mean(self, *, ignore_nulls: bool, as_py: bool = True) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        res = pac.mean(self._column, skip_nulls=ignore_nulls)
+        return res.as_py() if as_py else res
+
+    def sum_of_squared_diffs_from_mean(
+        self, ignore_nulls: bool, mean: Optional[U] = None, as_py: bool = True
+    ) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        # Calculate mean if not provided
+        if mean is None:
+            mean = self.mean(ignore_nulls=ignore_nulls)
+
+        if mean is None:
+            return None
+
+        column = self._column
+        if is_boolean_arrow_type(column.type):
+            # Treat booleans as 0/1: `subtract` has no boolean kernel.
+            column = pac.cast(column, pyarrow.float64())
+
+        res = pac.sum(pac.power(pac.subtract(column, mean), 2), skip_nulls=ignore_nulls)
+        return res.as_py() if as_py else res
+
+    def quantile(
+        self, *, q: float, ignore_nulls: bool, as_py: bool = True
+    ) -> Optional[U]:
+        import pyarrow.compute as pac
+
+        array = pac.quantile(self._column, q=q, skip_nulls=ignore_nulls)
+        # NOTE: That quantile method still returns an array
+        res = array[0]
+        return res.as_py() if as_py else res
+
+    def unique(self) -> BlockColumn:
+        import pyarrow.compute as pac
+
+        if self.is_composed_of_lists():
+            # NOTE: Arrow doesn't provide unique kernels for `ListArray`s and
+            #       such, so we rely on Polars to encode and compute unique
+            #       values instead
+            import polars
+
+            return polars.from_arrow(self._column).unique().to_arrow()
+
+        return pac.unique(self._column)
+
+    def value_counts(self) -> Optional[Dict[str, List]]:
+        import pyarrow.compute as pac
+
+        value_counts: pyarrow.StructArray = pac.value_counts(self._column)
+        if len(value_counts) == 0:
+            return None
+        return {
+            "values": value_counts.field("values").to_pylist(),
+            "counts": value_counts.field("counts").to_pylist(),
+        }
+
+    def hash(self) -> BlockColumn:
+        import polars as pl
+
+        df = pl.DataFrame({"col": self._column})
+        hashes = df.hash_rows().cast(pl.Int64, wrap_numerical=True)
+        return hashes.to_arrow()
+
+    def flatten(self) -> BlockColumn:
+        import pyarrow.compute as pac
+
+        return pac.list_flatten(self._column)
+
+    def dropna(self) -> BlockColumn:
+        import pyarrow.compute as pac
+
+        return pac.drop_null(self._column)
+
+    def is_composed_of_lists(self) -> bool:
+        types = (pyarrow.lib.ListType, pyarrow.lib.LargeListType)
+        return isinstance(self._column.type, types)
+
+    def to_pylist(self) -> List[Any]:
+        return self._column.to_pylist()
+
+    def to_numpy(self, zero_copy_only: bool = False) -> np.ndarray:
+        if get_pyarrow_version() < _MIN_PYARROW_VERSION_TO_NUMPY_ZERO_COPY_ONLY:
+            if isinstance(
+                self._column, pyarrow.ChunkedArray
+            ):  # NOTE: ChunkedArray in Pyarrow < 13.0.0 does not support ``zero_copy_only``
+                return self._column.to_numpy()
+            else:
+                return self._column.to_numpy(zero_copy_only=zero_copy_only)
+
+        return self._column.to_numpy(zero_copy_only=zero_copy_only)
+
+    def _to_arrow_compatible_container(self) -> Union[List[Any], "pyarrow.Array"]:
+        return self._column

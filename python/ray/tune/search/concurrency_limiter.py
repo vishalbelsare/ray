@@ -1,11 +1,10 @@
 import copy
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional
 
 from ray.tune.search.searcher import Searcher
 from ray.tune.search.util import _set_search_properties_backwards_compatible
 from ray.util.annotations import PublicAPI
-
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ class ConcurrencyLimiter(Searcher):
     """
 
     def __init__(self, searcher: Searcher, max_concurrent: int, batch: bool = False):
-        assert type(max_concurrent) is int and max_concurrent > 0
+        assert isinstance(max_concurrent, int) and max_concurrent > 0
         self.searcher = searcher
         self.max_concurrent = max_concurrent
         self.batch = batch
@@ -171,7 +170,21 @@ class ConcurrencyLimiter(Searcher):
     # BOHB Specific.
     # TODO(team-ml): Refactor alongside HyperBandForBOHB
     def on_pause(self, trial_id: str):
+        """Passes a trial pause to the wrapped searcher.
+
+        ``HyperBandForBOHB`` calls this when it pauses a trial.
+
+        Args:
+            trial_id: The ID of the paused trial.
+        """
         self.searcher.on_pause(trial_id)
 
     def on_unpause(self, trial_id: str):
+        """Passes a trial unpause to the wrapped searcher.
+
+        ``HyperBandForBOHB`` calls this when it unpauses a trial.
+
+        Args:
+            trial_id: The ID of the unpaused trial.
+        """
         self.searcher.on_unpause(trial_id)

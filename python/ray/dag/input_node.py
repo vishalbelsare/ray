@@ -1,9 +1,8 @@
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from ray.dag import DAGNode
 from ray.dag.format_utils import get_dag_node_str
 from ray.experimental.gradio_utils import type_to_string
-from ray.dag.constants import DAGNODE_TYPE_KEY
 from ray.util.annotations import DeveloperAPI
 
 IN_CONTEXT_MANAGER = "__in_context_manager__"
@@ -17,59 +16,67 @@ class InputNode(DAGNode):
     entrypoints, but only one instance of InputNode exists per DAG, shared
     among all DAGNodes.
 
-    >>> Example:
-    >>>            m1.forward
-    >>>            /       \
-    >>>    dag_input     ensemble -> dag_output
-    >>>            \       /
-    >>>            m2.forward
+    Example:
+
+    .. code-block::
+
+                m1.forward
+                /       \
+        dag_input     ensemble -> dag_output
+                \       /
+                m2.forward
 
     In this pipeline, each user input is broadcasted to both m1.forward and
     m2.forward as first stop of the DAG, and authored like
 
-    >>> @ray.remote
-    >>> class Model:
-    ...     def __init__(self, val):
-    ...         self.val = val
-    ...     def forward(self, input):
-    ...         return self.val * input
+    .. code-block:: python
 
-    >>> @ray.remote
-    >>> def combine(a, b):
-    ...     return a + b
+        import ray
 
-    >>> with InputNode() as dag_input:
-    >>>     m1 = Model.bind(1)
-    >>>     m2 = Model.bind(2)
-    >>>     m1_output = m1.forward.bind(dag_input[0])
-    >>>     m2_output = m2.forward.bind(dag_input.x)
-    >>>     ray_dag = combine.bind(m1_output, m2_output)
+        @ray.remote
+        class Model:
+            def __init__(self, val):
+                self.val = val
+            def forward(self, input):
+                return self.val * input
 
-    >>> # Pass mix of args and kwargs as input.
-    >>> ray_dag.execute(1, x=2) # 1 sent to m1, 2 sent to m2
+        @ray.remote
+        def combine(a, b):
+            return a + b
 
-    >>> # Alternatively user can also pass single data object, list or dict
-    >>> # and access them via list index, object attribute or dict key str.
-    >>> ray_dag.execute(UserDataObject(m1=1, m2=2))
-    ...     # dag_input.m1, dag_input.m2
-    >>> ray_dag.execute([1, 2]))
-    ...     # dag_input[0], dag_input[1]
-    >>> ray_dag.execute({"m1": 1, "m2": 2})
-    ...     # dag_input["m1"], dag_input["m2"]
+        with InputNode() as dag_input:
+            m1 = Model.bind(1)
+            m2 = Model.bind(2)
+            m1_output = m1.forward.bind(dag_input[0])
+            m2_output = m2.forward.bind(dag_input.x)
+            ray_dag = combine.bind(m1_output, m2_output)
+
+        # Pass mix of args and kwargs as input.
+        ray_dag.execute(1, x=2) # 1 sent to m1, 2 sent to m2
+
+        # Alternatively user can also pass single data object, list or dict
+        # and access them via list index, object attribute or dict key str.
+        ray_dag.execute(UserDataObject(m1=1, m2=2))
+        # dag_input.m1, dag_input.m2
+        ray_dag.execute([1, 2])
+        # dag_input[0], dag_input[1]
+        ray_dag.execute({"m1": 1, "m2": 2})
+        # dag_input["m1"], dag_input["m2"]
     """
 
     def __init__(
         self,
-        *args,
+        *args: Any,
         input_type: Optional[Union[type, Dict[Union[int, str], type]]] = None,
-        _other_args_to_resolve=None,
-        **kwargs,
+        _other_args_to_resolve: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ):
         """InputNode should only take attributes of validating and converting
         input data rather than the input data itself. User input should be
         provided via `ray_dag.execute(user_input)`.
 
         Args:
+            *args: Reserved; passing any positional argument raises ``ValueError``.
             input_type: Describes the data type of inputs user will be giving.
                 - if given through singular InputNode: type of InputNode
                 - if given through InputAttributeNodes: map of key -> type
@@ -77,6 +84,7 @@ class InputNode(DAGNode):
             _other_args_to_resolve: Internal only to keep InputNode's execution
                 context throughput pickling, replacement and serialization.
                 User should not use or pass this field.
+            **kwargs: Reserved; passing any keyword argument raises ``ValueError``.
         """
         if len(args) != 0 or len(kwargs) != 0:
             raise ValueError("InputNode should not take any args or kwargs.")
@@ -166,20 +174,6 @@ class InputNode(DAGNode):
     def __exit__(self, *args):
         pass
 
-    def to_json(self) -> Dict[str, Any]:
-        return {
-            DAGNODE_TYPE_KEY: InputNode.__name__,
-            "other_args_to_resolve": self.get_other_args_to_resolve(),
-            "uuid": self.get_stable_uuid(),
-        }
-
-    @classmethod
-    def from_json(cls, input_json):
-        assert input_json[DAGNODE_TYPE_KEY] == InputNode.__name__
-        node = cls(_other_args_to_resolve=input_json["other_args_to_resolve"])
-        node._stable_uuid = input_json["uuid"]
-        return node
-
     def get_result_type(self) -> str:
         """Get type of the output of this DAGNode.
 
@@ -195,35 +189,51 @@ class InputAttributeNode(DAGNode):
      object attribute or dict key (str).
 
     Examples:
-        >>> with InputNode() as dag_input:
-        >>>     a = dag_input[0]
-        >>>     b = dag_input.x
-        >>>     ray_dag = add.bind(a, b)
 
-        >>> # This makes a = 1 and b = 2
-        >>> ray_dag.execute(1, x=2)
+        .. code-block:: python
 
-        >>> with InputNode() as dag_input:
-        >>>     a = dag_input[0]
-        >>>     b = dag_input[1]
-        >>>     ray_dag = add.bind(a, b)
+            with InputNode() as dag_input:
+                a = dag_input[0]
+                b = dag_input.x
+                ray_dag = add.bind(a, b)
 
-        >>> # This makes a = 2 and b = 3
-        >>> ray_dag.execute(2, 3)
+            # This makes a = 1 and b = 2
+            ray_dag.execute(1, x=2)
 
-        >>> # Alternatively, you can input a single object
-        >>> # and the inputs are automatically indexed from the object:
-        >>> # This makes a = 2 and b = 3
-        >>> ray_dag.execute([2, 3])
+            with InputNode() as dag_input:
+                a = dag_input[0]
+                b = dag_input[1]
+                ray_dag = add.bind(a, b)
+
+            # This makes a = 2 and b = 3
+            ray_dag.execute(2, 3)
+
+            # Alternatively, you can input a single object
+            # and the inputs are automatically indexed from the object:
+            # This makes a = 2 and b = 3
+            ray_dag.execute([2, 3])
     """
 
     def __init__(
         self,
         dag_input_node: InputNode,
-        key: str,
+        key: Union[int, str],
         accessor_method: str,
         input_type: str = None,
     ):
+        """Initialize an InputAttributeNode.
+
+        Args:
+            dag_input_node: The parent ``InputNode`` this attribute access
+                derives from.
+            key: The index, attribute name, or dict key used to access a
+                value of the user input.
+            accessor_method: The accessor method used to extract the value
+                from the user input (e.g., ``"__getitem__"`` or
+                ``"__getattr__"``).
+            input_type: Type hint for the extracted value, used by the
+                Gradio visualizer to pick a UI component.
+        """
         self._dag_input_node = dag_input_node
         self._key = key
         self._accessor_method = accessor_method
@@ -288,25 +298,6 @@ class InputAttributeNode(DAGNode):
     def __str__(self) -> str:
         return get_dag_node_str(self, f'["{self._key}"]')
 
-    def to_json(self) -> Dict[str, Any]:
-        return {
-            DAGNODE_TYPE_KEY: InputAttributeNode.__name__,
-            "other_args_to_resolve": self.get_other_args_to_resolve(),
-            "uuid": self.get_stable_uuid(),
-        }
-
-    @classmethod
-    def from_json(cls, input_json):
-        assert input_json[DAGNODE_TYPE_KEY] == InputAttributeNode.__name__
-        node = cls(
-            input_json["other_args_to_resolve"]["dag_input_node"],
-            input_json["other_args_to_resolve"]["key"],
-            input_json["other_args_to_resolve"]["accessor_method"],
-            input_json["other_args_to_resolve"]["result_type_string"],
-        )
-        node._stable_uuid = input_json["uuid"]
-        return node
-
     def get_result_type(self) -> str:
         """Get type of the output of this DAGNode.
 
@@ -314,6 +305,10 @@ class InputAttributeNode(DAGNode):
         """
         if "result_type_string" in self._bound_other_args_to_resolve:
             return self._bound_other_args_to_resolve["result_type_string"]
+
+    @property
+    def key(self) -> Union[int, str]:
+        return self._key
 
 
 @DeveloperAPI

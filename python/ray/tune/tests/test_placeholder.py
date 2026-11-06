@@ -1,12 +1,14 @@
 import unittest
 
+import numpy as np
+
 from ray import tune
 from ray.tune.impl.placeholder import (
-    inject_placeholders,
-    resolve_placeholders,
-    create_resolvers_map,
     _FunctionResolver,
     _RefResolver,
+    create_resolvers_map,
+    inject_placeholders,
+    resolve_placeholders,
 )
 from ray.tune.search.sample import Float, Integer
 
@@ -47,15 +49,15 @@ class PlaceholderTest(unittest.TestCase):
 
         self.assertEqual(
             config["param2"][1]["grid_search"],
-            ["ok", (_RefResolver.TOKEN, "e1eaa08f")],
+            ["ok", (_RefResolver.TOKEN, "1870fa9b")],
         )
         self.assertEqual(
             config["param3"]["param4"]["grid_search"],
-            [(_RefResolver.TOKEN, "35397f1a"), "not ok"],
+            [(_RefResolver.TOKEN, "8515e998"), "not ok"],
         )
 
         # Pretend we picked a choice from the grid searches.
-        config["param2"][1] = (_RefResolver.TOKEN, "e1eaa08f")
+        config["param2"][1] = (_RefResolver.TOKEN, "1870fa9b")
         config["param3"]["param4"] = "not ok"
 
         resolve_placeholders(config, replaced)
@@ -77,21 +79,43 @@ class PlaceholderTest(unittest.TestCase):
 
         self.assertEqual(
             config["param2"][1].categories,
-            [(_RefResolver.TOKEN, "e6a5a3d5"), "not ok"],
+            [(_RefResolver.TOKEN, "ec0e030c"), "not ok"],
         )
         self.assertEqual(
             config["param3"]["param4"].categories,
-            [(_RefResolver.TOKEN, "35397f1a"), "not ok"],
+            [(_RefResolver.TOKEN, "8515e998"), "not ok"],
         )
 
-        # Pretend we picked a choice from the grid searches.
-        config["param2"][1] = (_RefResolver.TOKEN, "e6a5a3d5")
+        # Pretend we picked a choice from the categoricals.
+        config["param2"][1] = (_RefResolver.TOKEN, "ec0e030c")
         config["param3"]["param4"] = "not ok"
 
         resolve_placeholders(config, replaced)
 
         self.assertEqual(config["param2"][1].value, "ok")
         self.assertEqual(config["param3"]["param4"], "not ok")
+
+    def _testNonSearchSpaceRef(self, value):
+        """Tests that non-primitives (numpy, lambda fn) get replaced by a reference."""
+        config = {"param": tune.choice([value, "other", value])}
+
+        replaced = create_resolvers_map()
+        config = inject_placeholders(config, replaced)
+
+        self.assertEqual(
+            config["param"].categories,
+            [
+                (_RefResolver.TOKEN, "ec15c422"),
+                "other",
+                (_RefResolver.TOKEN, "3c7edff5"),
+            ],
+        )
+
+    def testNumpyToRef(self):
+        self._testNonSearchSpaceRef(np.arange(10))
+
+    def testLambdaToRef(self):
+        self._testNonSearchSpaceRef(lambda x: x)
 
     def testFunction(self):
         config = {
@@ -174,10 +198,6 @@ class PlaceholderTest(unittest.TestCase):
         self.assertEqual(config["param3"]["param4"][1][1].value, "not ok")
 
     def testOtherDomains(self):
-        class Dummy:
-            def __init__(self, value):
-                self.value = value
-
         config = {
             "param1": tune.uniform(0, 1),
             "param2": tune.randint(2, 3),
@@ -207,10 +227,10 @@ class PlaceholderTest(unittest.TestCase):
         # Normal params are not replaced.
         self.assertEqual(
             config["param2"][1].categories,
-            [(_RefResolver.TOKEN, "e6a5a3d5"), "not ok"],
+            [(_RefResolver.TOKEN, "ec0e030c"), "not ok"],
         )
         self.assertEqual(
-            config["param3"]["param4"], (_FunctionResolver.TOKEN, "843363f5")
+            config["param3"]["param4"], (_FunctionResolver.TOKEN, "134aff3a")
         )
 
         # Now, say we manually resolved the placeholders based on
@@ -239,7 +259,7 @@ class PlaceholderTest(unittest.TestCase):
         config = inject_placeholders(config, replaced)
 
         # Manually resolve. Select the Dummy value.
-        config["param2"] = (_RefResolver.TOKEN, "41821403")
+        config["param2"] = (_RefResolver.TOKEN, "6f33af83")
 
         resolve_placeholders(config, replaced)
 
@@ -261,7 +281,7 @@ class PlaceholderTest(unittest.TestCase):
         config = inject_placeholders(config, replaced)
 
         # Manually resolve. Select the Dummy value.
-        config["param2"] = (None, None, (_RefResolver.TOKEN, "49964529"))
+        config["param2"] = (None, None, (_RefResolver.TOKEN, "a1433750"))
 
         resolve_placeholders(config, replaced)
 
@@ -280,7 +300,7 @@ class PlaceholderTest(unittest.TestCase):
         config = inject_placeholders(config, replaced)
 
         # Manually resolve param2.
-        config["param2"] = (_RefResolver.TOKEN, "60238385")
+        config["param2"] = (_RefResolver.TOKEN, "07cb6238")
 
         resolve_placeholders(config, replaced)
 
@@ -289,7 +309,8 @@ class PlaceholderTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    import pytest
     import sys
+
+    import pytest
 
     sys.exit(pytest.main(["-v", __file__]))

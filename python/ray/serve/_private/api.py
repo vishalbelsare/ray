@@ -1,100 +1,56 @@
+import asyncio
 import inspect
 import logging
-import os
-from types import FunctionType
-from typing import Any, Dict, Optional, Tuple, Union
 
-from pydantic.main import ModelMetaclass
+# Exists on all supported versions; pyrefly mis-resolves it at python-version 3.9.
+from types import FunctionType  # pyrefly: ignore[missing-module-attribute]
+from typing import Any, Dict, List, Tuple, Union
+
+from pydantic import BaseModel
 
 import ray
-from ray._private.usage import usage_lib
-from ray.serve.deployment import Application, Deployment
-from ray.serve.exceptions import RayServeException
-from ray.serve.config import HTTPOptions
-from ray.serve._private.constants import (
-    CONTROLLER_MAX_CONCURRENCY,
-    HTTP_PROXY_TIMEOUT,
-    SERVE_CONTROLLER_NAME,
-    SERVE_EXPERIMENTAL_DISABLE_HTTP_PROXY,
-    SERVE_NAMESPACE,
-    RAY_INTERNAL_SERVE_CONTROLLER_PIN_ON_NODE,
-)
+from ray import ObjectRef
+from ray._common.usage import usage_lib
+from ray.actor import ActorHandle
 from ray.serve._private.client import ServeControllerClient
-
-from ray.serve._private.utils import (
-    format_actor_name,
-    get_random_letters,
+from ray.serve._private.constants import (
+    HTTP_PROXY_TIMEOUT,
+    SERVE_LOGGER_NAME,
+    SERVE_NAMESPACE,
 )
-from ray.serve.controller import ServeController
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from ray.serve._private.default_impl import get_controller_impl
+from ray.serve.config import (
+    ControllerOptions,
+    HTTPOptions,
+    ProxyLocation,
+    gRPCOptions,
+)
 from ray.serve.context import (
-    get_global_client,
+    _check_cached_client_alive,
+    _get_global_client,
     _set_global_client,
 )
-from ray.actor import ActorHandle
+from ray.serve.deployment import Application
+from ray.serve.exceptions import RayServeException
+from ray.serve.schema import LoggingConfig, TracingConfig
+
+logger = logging.getLogger(SERVE_LOGGER_NAME)
 
 
-logger = logging.getLogger(__file__)
-
-FLAG_DISABLE_HTTP_PROXY = (
-    os.environ.get(SERVE_EXPERIMENTAL_DISABLE_HTTP_PROXY, "0") == "1"
-)
-
-
-def get_deployment(name: str):
-    """Dynamically fetch a handle to a Deployment object.
-
-    Args:
-        name: name of the deployment. This must have already been
-        deployed.
-
-    Returns:
-        Deployment
-    """
-    try:
-        (
-            deployment_info,
-            route_prefix,
-        ) = get_global_client().get_deployment_info(name)
-    except KeyError:
-        raise KeyError(
-            f"Deployment {name} was not found. Did you call Deployment.deploy()?"
-        )
-    return Deployment(
-        deployment_info.replica_config.deployment_def,
-        name,
-        deployment_info.deployment_config,
-        version=deployment_info.version,
-        init_args=deployment_info.replica_config.init_args,
-        init_kwargs=deployment_info.replica_config.init_kwargs,
-        route_prefix=route_prefix,
-        ray_actor_options=deployment_info.replica_config.ray_actor_options,
-        _internal=True,
+def _coerce_controller_options(
+    controller_options: Union[None, dict, ControllerOptions],
+) -> ControllerOptions:
+    """Normalize an optional dict / model into a validated ControllerOptions."""
+    if controller_options is None:
+        return ControllerOptions()
+    if isinstance(controller_options, ControllerOptions):
+        return controller_options
+    if isinstance(controller_options, dict):
+        return ControllerOptions.model_validate(controller_options)
+    raise TypeError(
+        "controller_options must be a dict, ControllerOptions, or None; got "
+        f"{type(controller_options).__name__}."
     )
-
-
-def list_deployments() -> Dict[str, Deployment]:
-    """Returns a dictionary of all active deployments.
-
-    Dictionary maps deployment name to Deployment objects.
-    """
-    infos = get_global_client().list_deployments()
-
-    deployments = {}
-    for name, (deployment_info, route_prefix) in infos.items():
-        deployments[name] = Deployment(
-            deployment_info.replica_config.deployment_def,
-            name,
-            deployment_info.deployment_config,
-            version=deployment_info.version,
-            init_args=deployment_info.replica_config.init_args,
-            init_kwargs=deployment_info.replica_config.init_kwargs,
-            route_prefix=route_prefix,
-            ray_actor_options=deployment_info.replica_config.ray_actor_options,
-            _internal=True,
-        )
-
-    return deployments
 
 
 def _check_http_options(
@@ -105,7 +61,7 @@ def _check_http_options(
         new_http_options = (
             http_options
             if isinstance(http_options, HTTPOptions)
-            else HTTPOptions.parse_obj(http_options)
+            else HTTPOptions.model_validate(http_options)
         )
         different_fields = []
         all_http_option_fields = new_http_options.__dict__
@@ -121,20 +77,31 @@ def _check_http_options(
             )
 
 
-def _start_controller(
-    detached: bool = False,
-    http_options: Optional[Union[dict, HTTPOptions]] = None,
-    dedicated_cpu: bool = False,
+def _create_controller_and_proxy_refs(
+    http_options: Union[None, dict, HTTPOptions],
+    grpc_options: Union[None, dict, gRPCOptions],
+    global_logging_config: Union[None, dict, LoggingConfig],
+    global_tracing_config: Union[None, dict, TracingConfig],
+    controller_options: ControllerOptions,
+    proxy_location: Union[None, str, ProxyLocation] = None,
     **kwargs,
-) -> Tuple[ActorHandle, str]:
-    """Start Ray Serve controller.
+) -> Tuple[ActorHandle, List[ObjectRef]]:
+    """Create the detached ServeController actor in the caller process.
 
-    The function makes sure controller is ready to start deploying apps
-    after it returns.
+    Runs everything the old ``_start_controller`` remote task did, but inline:
+    ray.init if needed, arg validation, controller actor creation, and resolving
+    ``get_proxies``. Returns the controller handle (owned locally by the caller,
+    following normal ref-counting — no cross-process transfer) plus the list of
+    proxy-readiness ObjectRefs the caller must still wait on.
 
-    Parameters are same as ray.serve._private.api.serve_start().
+    Caller resolves ``proxy_ready_refs`` synchronously (``ray.get``) or
+    asynchronously (``await asyncio.gather``). Splitting the wait out of this
+    helper is what lets sync and async share one creation path without
+    duplication (per @edoakes's suggestion on #63597).
 
-    Returns: A tuple with controller actor handle and controller name.
+    Parameters are same as ray.serve._private.api.serve_start(), except
+    ``controller_options`` must already be a validated ``ControllerOptions``
+    (callers coerce eagerly so a bad value raises locally, not from a task).
     """
 
     # Initialize ray if needed.
@@ -142,78 +109,58 @@ def _start_controller(
     if not ray.is_initialized():
         ray.init(namespace=SERVE_NAMESPACE)
 
-    if detached:
-        controller_name = SERVE_CONTROLLER_NAME
-    else:
-        controller_name = format_actor_name(get_random_letters(), SERVE_CONTROLLER_NAME)
+    # Legacy http proxy actor check
+    http_deprecated_args = ["http_host", "http_port", "http_middlewares"]
+    for key in http_deprecated_args:
+        if key in kwargs:
+            raise ValueError(
+                f"{key} is deprecated, please use serve.start(http_options="
+                f'{{"{key}": {kwargs[key]}}}) instead.'
+            )
 
-    # Used for scheduling things to the head node explicitly.
-    # Assumes that `serve.start` runs on the head node.
-    head_node_id = ray.get_runtime_context().get_node_id()
-    controller_actor_options = {
-        "num_cpus": 1 if dedicated_cpu else 0,
-        "name": controller_name,
-        "lifetime": "detached" if detached else None,
-        "max_restarts": -1,
-        "max_task_retries": -1,
-        # Schedule the controller on the head node with a soft constraint. This
-        # prefers it to run on the head node in most cases, but allows it to be
-        # restarted on other nodes in an HA cluster.
-        "scheduling_strategy": NodeAffinitySchedulingStrategy(head_node_id, soft=True)
-        if RAY_INTERNAL_SERVE_CONTROLLER_PIN_ON_NODE
-        else None,
-        "namespace": SERVE_NAMESPACE,
-        "max_concurrency": CONTROLLER_MAX_CONCURRENCY,
-    }
+    if isinstance(http_options, dict):
+        http_options = HTTPOptions.model_validate(http_options)
+    if http_options is None:
+        http_options = HTTPOptions()
 
-    if FLAG_DISABLE_HTTP_PROXY:
-        controller = ServeController.options(**controller_actor_options).remote(
-            controller_name,
-            http_config=http_options,
-            head_node_id=head_node_id,
-            detached=detached,
-            _disable_http_proxy=True,
-        )
-    else:
-        # Legacy http proxy actor check
-        http_deprecated_args = ["http_host", "http_port", "http_middlewares"]
-        for key in http_deprecated_args:
-            if key in kwargs:
-                raise ValueError(
-                    f"{key} is deprecated, please use serve.start(http_options="
-                    f'{{"{key}": {kwargs[key]}}}) instead.'
-                )
+    proxy_location = ProxyLocation._normalize(proxy_location)
 
-        if isinstance(http_options, dict):
-            http_options = HTTPOptions.parse_obj(http_options)
-        if http_options is None:
-            http_options = HTTPOptions()
+    if isinstance(grpc_options, dict):
+        grpc_options = gRPCOptions(**grpc_options)
 
-        controller = ServeController.options(**controller_actor_options).remote(
-            controller_name,
-            http_config=http_options,
-            head_node_id=head_node_id,
-            detached=detached,
-        )
+    if global_logging_config is None:
+        global_logging_config = LoggingConfig()
+    elif isinstance(global_logging_config, dict):
+        global_logging_config = LoggingConfig(**global_logging_config)
 
-        proxy_handles = ray.get(controller.get_http_proxies.remote())
-        if len(proxy_handles) > 0:
-            try:
-                ray.get(
-                    [handle.ready.remote() for handle in proxy_handles.values()],
-                    timeout=HTTP_PROXY_TIMEOUT,
-                )
-            except ray.exceptions.GetTimeoutError:
-                raise TimeoutError(
-                    f"HTTP proxies not available after {HTTP_PROXY_TIMEOUT}s."
-                )
-    return controller, controller_name
+    if isinstance(global_tracing_config, dict):
+        global_tracing_config = TracingConfig(**global_tracing_config)
+
+    controller_impl = get_controller_impl(controller_options=controller_options)
+    controller = controller_impl.remote(
+        http_options=http_options,
+        grpc_options=grpc_options,
+        global_logging_config=global_logging_config,
+        proxy_location=proxy_location,
+        global_tracing_config=global_tracing_config,
+    )
+
+    proxy_handles: Any = ray.get(controller.get_proxies.remote())
+    proxy_ready_refs = (
+        [handle.ready.remote() for handle in proxy_handles.values()]
+        if len(proxy_handles) > 0
+        else []
+    )
+    return controller, proxy_ready_refs
 
 
 async def serve_start_async(
-    detached: bool = False,
-    http_options: Optional[Union[dict, HTTPOptions]] = None,
-    dedicated_cpu: bool = False,
+    http_options: Union[None, dict, HTTPOptions] = None,
+    grpc_options: Union[None, dict, gRPCOptions] = None,
+    global_logging_config: Union[None, dict, LoggingConfig] = None,
+    global_tracing_config: Union[None, dict, TracingConfig] = None,
+    controller_options: Union[None, dict, ControllerOptions] = None,
+    proxy_location: Union[None, str, ProxyLocation] = None,
     **kwargs,
 ) -> ServeControllerClient:
     """Initialize a serve instance asynchronously.
@@ -228,123 +175,184 @@ async def serve_start_async(
 
     usage_lib.record_library_usage("serve")
 
-    try:
-        client = get_global_client(_health_check_controller=True)
+    # Validate eagerly in the caller so a bad ``controller_options`` raises
+    # here, at the call site, rather than after a round-trip into the helper.
+    controller_options = _coerce_controller_options(controller_options)
+
+    client, _ = _check_cached_client_alive()
+    if client is None:
+        try:
+            client = _get_global_client()
+        except RayServeException:
+            client = None
+    if client is not None:
         logger.info(
             f'Connecting to existing Serve app in namespace "{SERVE_NAMESPACE}".'
-            " New http options will not be applied."
+            " New http_options/controller_options will not be applied."
         )
         if http_options:
             _check_http_options(client, http_options)
         return client
-    except RayServeException:
-        pass
 
-    controller, controller_name = (
-        await ray.remote(_start_controller)
-        .options(num_cpus=0)
-        .remote(detached, http_options, dedicated_cpu, **kwargs)
+    # Run the blocking controller-creation helper in a worker thread so its
+    # ray.get(controller.get_proxies.remote()) does not stall this event loop.
+    # serve_start_async exists (vs serve_start) precisely to keep long-lived
+    # callers like the Dashboard Agent responsive while Serve starts up.
+    # Safe because the helper only touches ray.init/ray.get/actor.remote, all
+    # thread-safe via the CoreWorker C++ API, and the Dashboard Agent uses sync
+    # ray.init (so the helper's ray.init branch is skipped). If the dashboard
+    # ever switched to async-mode ray.init this would need revisiting.
+    controller, proxy_ready_refs = await asyncio.to_thread(
+        _create_controller_and_proxy_refs,
+        http_options,
+        grpc_options,
+        global_logging_config,
+        global_tracing_config,
+        controller_options,
+        proxy_location,
+        **kwargs,
     )
 
-    client = ServeControllerClient(
-        controller,
-        controller_name,
-        detached=detached,
-    )
+    if proxy_ready_refs:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*proxy_ready_refs),
+                timeout=HTTP_PROXY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"HTTP proxies not available after {HTTP_PROXY_TIMEOUT}s."
+            )
+
+    client = ServeControllerClient(controller)
     _set_global_client(client)
-    logger.info(
-        f"Started{' detached ' if detached else ' '}Serve instance in "
-        f'namespace "{SERVE_NAMESPACE}".'
-    )
+    logger.info(f'Started Serve in namespace "{SERVE_NAMESPACE}".')
     return client
 
 
 def serve_start(
-    detached: bool = False,
-    http_options: Optional[Union[dict, HTTPOptions]] = None,
-    dedicated_cpu: bool = False,
+    http_options: Union[None, dict, HTTPOptions] = None,
+    grpc_options: Union[None, dict, gRPCOptions] = None,
+    global_logging_config: Union[None, dict, LoggingConfig] = None,
+    global_tracing_config: Union[None, dict, TracingConfig] = None,
+    controller_options: Union[None, dict, ControllerOptions] = None,
+    proxy_location: Union[None, str, ProxyLocation] = None,
     **kwargs,
 ) -> ServeControllerClient:
     """Initialize a serve instance.
 
     By default, the instance will be scoped to the lifetime of the returned
-    Client object (or when the script exits). If detached is set to True, the
-    instance will instead persist until serve.shutdown() is called. This is
+    Client object (or when the script exits). This is
     only relevant if connecting to a long-running Ray cluster (e.g., with
     ray.init(address="auto") or ray.init("ray://<remote_addr>")).
 
     Args:
-        detached: Whether not the instance should be detached from this
-          script. If set, the instance will live on the Ray cluster until it is
-          explicitly stopped with serve.shutdown().
-        http_options (Optional[Dict, serve.HTTPOptions]): Configuration options
-          for HTTP proxy. You can pass in a dictionary or HTTPOptions object
-          with fields:
+        http_options: Configuration options for HTTP proxy. You can pass in a
+          dictionary or HTTPOptions object with fields:
 
             - host(str, None): Host for HTTP servers to listen on. Defaults to
-              "127.0.0.1". To expose Serve publicly, you probably want to set
-              this to "0.0.0.0".
+              localhost. To expose Serve publicly, you probably want to set
+              this to "0.0.0.0" for IPv4 or "::" for IPv6.
             - port(int): Port for HTTP server. Defaults to 8000.
-            - root_path(str): Root path to mount the serve application
-              (for example, "/serve"). All deployment routes will be prefixed
-              with this path. Defaults to "".
+            - root_path(str): ASGI root path that the serve application is
+              mounted at (for example, "/serve"), for when Serve runs behind
+              a proxy that strips this prefix before forwarding. Requests
+              reach Serve without the prefix. Defaults to "".
             - middlewares(list): A list of Starlette middlewares that will be
               applied to the HTTP servers in the cluster. Defaults to [].
-            - location(str, serve.config.DeploymentMode): The deployment
+            - location(str, serve.config.ProxyLocation): The deployment
               location of HTTP servers:
 
                 - "HeadOnly": start one HTTP server on the head node. Serve
                   assumes the head node is the node you executed serve.start
                   on. This is the default.
                 - "EveryNode": start one HTTP server per node.
-                - "NoServer" or None: disable HTTP server.
+                - "Disabled" (or legacy "NoServer") or None: disable HTTP server.
             - num_cpus (int): The number of CPU cores to reserve for each
               internal Serve HTTP proxy actor.  Defaults to 0.
-        dedicated_cpu: Whether to reserve a CPU core for the internal
-          Serve controller actor.  Defaults to False.
+        grpc_options: Configuration options for gRPC proxy.
+          You can pass in a gRPCOptions object with fields:
+
+            - port(int): Port for gRPC server. Defaults to 9000.
+            - grpc_servicer_functions(list): List of import paths for gRPC
+                `add_servicer_to_server` functions to add to Serve's gRPC proxy.
+                Default empty list, meaning not to start the gRPC server.
+        global_logging_config: Optional ``LoggingConfig`` (or dict) applied as
+            the default logging configuration for the Serve controller and all
+            proxies/replicas in this Serve instance.
+        global_tracing_config: Optional ``TracingConfig`` (or dict) applied as
+            the default tracing configuration for the Serve controller and all
+            proxies/replicas in this Serve instance.
+        controller_options: Optional ``ControllerOptions`` (or dict) for the
+            Serve controller actor. Currently only ``runtime_env.env_vars``
+            is honored; see ``ray.serve.config.ControllerOptions``. Only
+            applied on first controller creation -- ignored if the controller
+            is already running in this Ray cluster (a log line is emitted).
+        proxy_location: Where to run proxies that handle ingress traffic to
+            the cluster. See ``ProxyLocation`` for supported options. Defaults
+            to ``EveryNode`` when unspecified. An explicit (deprecated)
+            ``HTTPOptions.location`` overrides this.
+        **kwargs: Reserved for forwarding to internal controller-start hooks;
+            no public keys are currently supported and unknown keys may raise.
+
+    Returns:
+        A ``ServeControllerClient`` connected to the Serve controller (either
+        newly started or an already-running one in this Ray cluster).
     """
 
     usage_lib.record_library_usage("serve")
 
-    try:
-        client = get_global_client(_health_check_controller=True)
+    controller_options = _coerce_controller_options(controller_options)
+
+    client, _ = _check_cached_client_alive()
+    if client is None:
+        try:
+            client = _get_global_client()
+        except RayServeException:
+            client = None
+    if client is not None:
         logger.info(
             f'Connecting to existing Serve app in namespace "{SERVE_NAMESPACE}".'
-            " New http options will not be applied."
+            " New http_options/controller_options will not be applied."
         )
         if http_options:
             _check_http_options(client, http_options)
         return client
-    except RayServeException:
-        pass
 
-    controller, controller_name = _start_controller(
-        detached, http_options, dedicated_cpu, **kwargs
+    controller, proxy_ready_refs = _create_controller_and_proxy_refs(
+        http_options,
+        grpc_options,
+        global_logging_config,
+        global_tracing_config,
+        controller_options,
+        proxy_location,
+        **kwargs,
     )
 
-    client = ServeControllerClient(
-        controller,
-        controller_name,
-        detached=detached,
-    )
+    if proxy_ready_refs:
+        try:
+            ray.get(proxy_ready_refs, timeout=HTTP_PROXY_TIMEOUT)
+        except ray.exceptions.GetTimeoutError:
+            raise TimeoutError(
+                f"HTTP proxies not available after {HTTP_PROXY_TIMEOUT}s."
+            )
+
+    client = ServeControllerClient(controller)
     _set_global_client(client)
-    logger.info(
-        f"Started{' detached ' if detached else ' '}Serve instance in "
-        f'namespace "{SERVE_NAMESPACE}".'
-    )
+    logger.info(f'Started Serve in namespace "{SERVE_NAMESPACE}".')
     return client
 
 
-def call_app_builder_with_args_if_necessary(
+def call_user_app_builder_with_args_if_necessary(
     builder: Union[Application, FunctionType],
     args: Dict[str, Any],
 ) -> Application:
-    """Builds a Serve application from an application builder function.
+    """Calls a user-provided function that returns Serve application.
 
-    If a pre-built application is passed, this is a no-op.
+    If an Application object is passed, this is a no-op.
 
-    Else, we validate the signature of the builder, convert the args dictionary to
-    the user-annotated Pydantic model if provided, and call the builder function.
+    Else, we validate the signature of the function, convert the args dictionary to
+    the user-annotated Pydantic model if provided, and call the function.
 
     The output of the function is returned (must be an Application).
     """
@@ -374,8 +382,8 @@ def call_app_builder_with_args_if_necessary(
     # that model. This will perform standard pydantic validation (e.g., raise an
     # exception if required fields are missing).
     param = signature.parameters[list(signature.parameters.keys())[0]]
-    if issubclass(type(param.annotation), ModelMetaclass):
-        args = param.annotation.parse_obj(args)
+    if inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
+        args = param.annotation.model_validate(args)
 
     app = builder(args)
     if not isinstance(app, Application):

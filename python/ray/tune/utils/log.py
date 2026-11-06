@@ -1,5 +1,6 @@
+import time
 from enum import Enum
-from typing import Union
+from typing import Dict, Tuple, Union
 
 from ray.util import PublicAPI
 from ray.util.annotations import DeveloperAPI
@@ -7,6 +8,20 @@ from ray.util.annotations import DeveloperAPI
 
 @PublicAPI
 class Verbosity(Enum):
+    """Verbosity levels of Tune's console output.
+
+    The legacy console output, used when the ``RAY_AIR_NEW_OUTPUT``
+    environment variable is ``0``, distinguishes all four levels:
+
+    - ``V0_MINIMAL``: Silent.
+    - ``V1_EXPERIMENT``: Only status updates.
+    - ``V2_TRIAL_NORM``: Status and brief results.
+    - ``V3_TRIAL_DETAILS``: Status and detailed results.
+
+    The default console output treats ``V2_TRIAL_NORM`` and
+    ``V3_TRIAL_DETAILS`` the same.
+    """
+
     V0_MINIMAL = 0
     V1_EXPERIMENT = 1
     V2_TRIAL_NORM = 2
@@ -49,3 +64,15 @@ def disable_ipython():
         InteractiveShell.clear_instance()
     except Exception:
         pass
+
+
+_log_cache_count: Dict[str, Tuple[str, float]] = {}
+
+
+def _dedup_logs(domain: str, value: str, repeat_after_s: int = 5) -> bool:
+    cur_val, ts = _log_cache_count.get(domain, (None, None))
+    if value == cur_val and time.monotonic() - repeat_after_s < ts:
+        return False
+    else:
+        _log_cache_count[domain] = value, time.monotonic()
+        return True

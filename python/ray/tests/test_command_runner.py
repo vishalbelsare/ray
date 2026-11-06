@@ -1,15 +1,18 @@
+import hashlib
+import sys
+from getpass import getuser
+from unittest.mock import patch
+
 import pytest
 
-from ray.tests.test_autoscaler import MockProvider, MockProcessRunner
-from ray.autoscaler.command_runner import CommandRunnerInterface
 from ray.autoscaler._private.command_runner import (
-    SSHCommandRunner,
     DockerCommandRunner,
+    SSHCommandRunner,
     _with_environment_variables,
 )
+from ray.autoscaler.command_runner import CommandRunnerInterface
 from ray.autoscaler.sdk import get_docker_host_mount_location
-from getpass import getuser
-import hashlib
+from ray.tests.test_autoscaler import MockProcessRunner, MockProvider
 
 auth_config = {
     "ssh_user": "ray",
@@ -60,14 +63,14 @@ def test_ssh_command_runner():
     provider = MockProvider()
     provider.create_node({}, {}, 1)
     cluster_name = "cluster"
-    ssh_control_hash = hashlib.md5(cluster_name.encode()).hexdigest()
-    ssh_user_hash = hashlib.md5(getuser().encode()).hexdigest()
+    ssh_control_hash = hashlib.sha256(cluster_name.encode()).hexdigest()
+    ssh_user_hash = hashlib.sha256(getuser().encode()).hexdigest()
     ssh_control_path = "/tmp/ray_ssh_{}/{}".format(
         ssh_user_hash[:10], ssh_control_hash[:10]
     )
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -122,20 +125,113 @@ def test_ssh_command_runner():
     process_runner.assert_has_call("1.2.3.4", exact=expected)
 
 
+def test_ssh_command_runner_uses_node_id_as_proxy_target():
+    process_runner = MockProcessRunner()
+    provider = MockProvider()
+
+    node_id = "i-0123456789abcdef0"
+    proxy_command = (
+        "aws ssm start-session --target %h "
+        "--document-name AWS-StartSSHSession "
+        "--parameters portNumber=%p"
+    )
+
+    def fail_if_ip_is_requested(_):
+        pytest.fail("SSH through a node-ID proxy should not request an external IP.")
+
+    provider.external_ip = fail_if_ip_is_requested
+
+    cmd_runner = SSHCommandRunner(
+        log_prefix="prefix",
+        node_id=node_id,
+        provider=provider,
+        auth_config={
+            **auth_config,
+            "ssh_proxy_command": proxy_command,
+            "ssh_proxy_use_node_id": True,
+        },
+        cluster_name="cluster",
+        process_runner=process_runner,
+        use_internal_ip=False,
+    )
+
+    with patch(
+        "ray.autoscaler._private.command_runner.os.makedirs"
+    ) as make_control_path:
+        cmd_runner.run("true")
+
+    make_control_path.assert_called_once_with(
+        cmd_runner.ssh_control_path,
+        mode=0o700,
+        exist_ok=True,
+    )
+
+    command = process_runner.calls[0]
+
+    assert f"ProxyCommand={proxy_command}" in command
+    assert f"ray@{node_id}" in command
+    assert cmd_runner.remote_shell_command_str() == (
+        f"ssh -o IdentitiesOnly=yes -i 8265.pem ray@{node_id}\n"
+    )
+
+
+def test_rsync_uses_node_id_as_proxy_target():
+    process_runner = MockProcessRunner()
+    provider = MockProvider()
+
+    node_id = "i-0123456789abcdef0"
+    proxy_command = (
+        "aws ssm start-session --target %h "
+        "--document-name AWS-StartSSHSession "
+        "--parameters portNumber=%p"
+    )
+
+    def fail_if_ip_is_requested(_):
+        pytest.fail("Rsync through a node-ID proxy should not request an external IP.")
+
+    provider.external_ip = fail_if_ip_is_requested
+
+    cmd_runner = SSHCommandRunner(
+        log_prefix="prefix",
+        node_id=node_id,
+        provider=provider,
+        auth_config={
+            **auth_config,
+            "ssh_proxy_command": proxy_command,
+            "ssh_proxy_use_node_id": True,
+        },
+        cluster_name="cluster",
+        process_runner=process_runner,
+        use_internal_ip=False,
+    )
+
+    cmd_runner.run_rsync_up("/local/source", "/remote/target", options={})
+
+    upload_command = process_runner.calls[0]
+    assert f"ray@{node_id}:/remote/target" in upload_command
+
+    process_runner.clear_history()
+
+    cmd_runner.run_rsync_down("/remote/source", "/local/target")
+
+    download_command = process_runner.calls[0]
+    assert f"ray@{node_id}:/remote/source" in download_command
+
+
 def test_docker_command_runner():
     process_runner = MockProcessRunner()
     provider = MockProvider()
     provider.create_node({}, {}, 1)
     cluster_name = "cluster"
-    ssh_control_hash = hashlib.md5(cluster_name.encode()).hexdigest()
-    ssh_user_hash = hashlib.md5(getuser().encode()).hexdigest()
+    ssh_control_hash = hashlib.sha256(cluster_name.encode()).hexdigest()
+    ssh_user_hash = hashlib.sha256(getuser().encode()).hexdigest()
     ssh_control_path = "/tmp/ray_ssh_{}/{}".format(
         ssh_user_hash[:10], ssh_control_hash[:10]
     )
     docker_config = {"container_name": "container"}
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -202,7 +298,7 @@ def test_docker_rsync():
     docker_config = {"container_name": "container"}
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -292,7 +388,7 @@ def test_rsync_exclude_and_filter():
     cluster_name = "cluster"
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -327,7 +423,7 @@ def test_rsync_without_exclude_and_filter():
     cluster_name = "cluster"
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -368,7 +464,7 @@ def test_docker_shm_override(run_option_type):
     }
     args = {
         "log_prefix": "prefix",
-        "node_id": 0,
+        "node_id": "0",
         "provider": provider,
         "auth_config": auth_config,
         "cluster_name": cluster_name,
@@ -389,10 +485,4 @@ def test_docker_shm_override(run_option_type):
 
 
 if __name__ == "__main__":
-    import os
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

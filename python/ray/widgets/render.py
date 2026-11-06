@@ -1,5 +1,5 @@
 import pathlib
-from typing import List
+from typing import List, Union
 
 from ray.util.annotations import DeveloperAPI
 
@@ -12,14 +12,19 @@ class Template:
         with open(pathlib.Path(__file__).parent / "templates" / file, "r") as f:
             self.template = f.read()
 
-    def render(self, **kwargs) -> str:
+    def render(self, **kwargs: Union[str, List]) -> str:
         """Render an HTML template with the given data.
 
         This is done by replacing instances of `{{ key }}` with `value`
         from the keyword arguments.
 
+        Args:
+            **kwargs: Mapping of template variable names to their substitution
+                values. Each value is either a string or a list of strings;
+                lists are joined together before substitution.
+
         Returns:
-            str: HTML template with the keys of the kwargs replaced with corresponding
+            HTML template with the keys of the kwargs replaced with corresponding
                 values.
         """
         rendered = self.template
@@ -34,7 +39,6 @@ class Template:
         """List the available HTML templates.
 
         Returns:
-            List[pathlib.Path]: A list of files with .html.j2 extensions inside
-                ./templates/
+            A list of files with .html.j2 extensions inside ../templates/
         """
         return (pathlib.Path(__file__).parent / "templates").glob("*.html.j2")

@@ -1,73 +1,18 @@
 import json
 import logging
-import numpy as np
-import os
-
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, TextIO
 
 import ray.cloudpickle as cloudpickle
-
-from ray.tune.logger.logger import _LOGGER_DEPRECATION_WARNING, Logger, LoggerCallback
+from ray.air.constants import EXPR_PARAM_FILE, EXPR_PARAM_PICKLE_FILE, EXPR_RESULT_FILE
+from ray.tune.logger.logger import LoggerCallback
 from ray.tune.utils.util import SafeFallbackEncoder
-from ray.tune.result import (
-    EXPR_PARAM_FILE,
-    EXPR_PARAM_PICKLE_FILE,
-    EXPR_RESULT_FILE,
-)
-from ray.util.annotations import Deprecated, PublicAPI
+from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
     from ray.tune.experiment.trial import Trial  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-tf = None
-VALID_SUMMARY_TYPES = [int, float, np.float32, np.float64, np.int32, np.int64]
-
-
-@Deprecated(
-    message=_LOGGER_DEPRECATION_WARNING.format(
-        old="JsonLogger", new="ray.tune.json.JsonLoggerCallback"
-    ),
-    warning=True,
-)
-@PublicAPI
-class JsonLogger(Logger):
-    """Logs trial results in json format.
-
-    Also writes to a results file and param.json file when results or
-    configurations are updated. Experiments must be executed with the
-    JsonLogger to be compatible with the ExperimentAnalysis tool.
-    """
-
-    def _init(self):
-        self.update_config(self.config)
-        local_file = os.path.join(self.logdir, EXPR_RESULT_FILE)
-        self.local_out = open(local_file, "a")
-
-    def on_result(self, result: Dict):
-        json.dump(result, self, cls=SafeFallbackEncoder)
-        self.write("\n")
-        self.local_out.flush()
-
-    def write(self, b):
-        self.local_out.write(b)
-
-    def flush(self):
-        if not self.local_out.closed:
-            self.local_out.flush()
-
-    def close(self):
-        self.local_out.close()
-
-    def update_config(self, config: Dict):
-        self.config = config
-        config_out = os.path.join(self.logdir, EXPR_PARAM_FILE)
-        with open(config_out, "w") as f:
-            json.dump(self.config, f, indent=2, sort_keys=True, cls=SafeFallbackEncoder)
-        config_pkl = os.path.join(self.logdir, EXPR_PARAM_PICKLE_FILE)
-        with open(config_pkl, "wb") as f:
-            cloudpickle.dump(self.config, f)
 
 
 @PublicAPI
@@ -94,8 +39,12 @@ class JsonLoggerCallback(LoggerCallback):
 
         # Make sure logdir exists
         trial.init_local_path()
-        local_file = os.path.join(trial.local_path, EXPR_RESULT_FILE)
-        self._trial_files[trial] = open(local_file, "at")
+        local_file = Path(trial.local_path, EXPR_RESULT_FILE)
+
+        # Resume the file from remote storage.
+        self._restore_from_remote(EXPR_RESULT_FILE, trial)
+
+        self._trial_files[trial] = local_file.open("at")
 
     def log_trial_result(self, iteration: int, trial: "Trial", result: Dict):
         if trial not in self._trial_files:
@@ -112,10 +61,18 @@ class JsonLoggerCallback(LoggerCallback):
         del self._trial_files[trial]
 
     def update_config(self, trial: "Trial", config: Dict):
+        """Writes a trial's config to ``params.json`` and ``params.pkl``.
+
+        Both files go in the trial's directory.
+
+        Args:
+            trial: The trial the config belongs to.
+            config: The trial's config.
+        """
         self._trial_configs[trial] = config
 
-        config_out = os.path.join(trial.local_path, EXPR_PARAM_FILE)
-        with open(config_out, "w") as f:
+        config_out = Path(trial.local_path, EXPR_PARAM_FILE)
+        with config_out.open("w") as f:
             json.dump(
                 self._trial_configs[trial],
                 f,
@@ -124,6 +81,6 @@ class JsonLoggerCallback(LoggerCallback):
                 cls=SafeFallbackEncoder,
             )
 
-        config_pkl = os.path.join(trial.local_path, EXPR_PARAM_PICKLE_FILE)
-        with open(config_pkl, "wb") as f:
+        config_pkl = Path(trial.local_path, EXPR_PARAM_PICKLE_FILE)
+        with config_pkl.open("wb") as f:
             cloudpickle.dump(self._trial_configs[trial], f)

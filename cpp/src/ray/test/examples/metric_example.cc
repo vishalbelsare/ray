@@ -17,17 +17,19 @@
 #include <ray/api.h>
 #include <ray/api/metric.h>
 
+#include <cstdlib>
+
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 
 ABSL_FLAG(int32_t, metric_time, 10, "The total time in seconds for recording metrics");
 
 void test_metric(const std::string &exec_type, int total_time) {
-  ray::Gauge gauge("ray.test.gauge", "test gauge", "unit", {"tag1", "tag2"});
-  ray::Counter counter("ray.test.counter", "test counter", "unit", {"tag1", "tag2"});
+  ray::Gauge gauge("ray_test_gauge", "test gauge", "unit", {"tag1", "tag2"});
+  ray::Counter counter("ray_test_counter", "test counter", "unit", {"tag1", "tag2"});
   ray::Histogram histogram(
-      "ray.test.hitogram", "test hitogram", "unit", {1, 10}, {"tag1", "tag2"});
-  ray::Sum sum("ray.test.sum", "test sum", "unit", {"tag1", "tag2"});
+      "ray_test_histogram", "test histogram", "unit", {1, 10}, {"tag1", "tag2"});
+  ray::Sum sum("ray_test_sum", "test sum", "unit", {"tag1", "tag2"});
 
   std::unordered_map<std::string, std::string> tag_1 = {{"tag1", "increasing"},
                                                         {"tag2", exec_type}};
@@ -59,6 +61,11 @@ RAY_REMOTE(RAY_FUNC(MetricActor::FactoryCreate), &MetricActor::record_metric);
 int main(int argc, char **argv) {
   absl::ParseCommandLine(argc, argv);
   int total_time = absl::GetFlag(FLAGS_metric_time);
+  // Bazel's test runner assigns HOME but doesn't export it, so the token loader
+  // would fall back to the account's real home and its ~/.ray/auth_token.
+  if (const char *test_tmpdir = std::getenv("TEST_TMPDIR")) {
+    setenv("HOME", test_tmpdir, /*overwrite=*/1);
+  }
   // Start ray cluster and ray runtime.
   ray::RayConfig config;
   ray::Init(config, argc, argv);

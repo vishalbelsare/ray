@@ -3,35 +3,36 @@ import os
 import pickle
 import urllib
 import warnings
+from numbers import Number
+from types import ModuleType
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from numbers import Number
-
-from types import ModuleType
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import pyarrow.fs
 
 import ray
 from ray import logger
-from ray.air import session
+from ray._common.utils import load_class
+from ray.air._internal import usage as air_usage
+from ray.air.constants import TRAINING_ITERATION
 from ray.air.util.node import _force_on_current_node
-
+from ray.train._internal.session import get_session
+from ray.train._internal.syncer import DEFAULT_SYNC_TIMEOUT
+from ray.tune.experiment import Trial
 from ray.tune.logger import LoggerCallback
 from ray.tune.utils import flatten_dict
-from ray.tune.experiment import Trial
-from ray.tune.syncer import DEFAULT_SYNC_TIMEOUT
-
-from ray._private.storage import _load_class
 from ray.util import PublicAPI
 from ray.util.queue import Queue
 
 try:
     import wandb
+    from wandb.sdk.data_types.base_types.wb_value import WBValue
+    from wandb.sdk.data_types.image import Image
+    from wandb.sdk.data_types.video import Video
     from wandb.util import json_dumps_safer
     from wandb.wandb_run import Run
-    from wandb.sdk.lib.disabled import RunDisabled
-    from wandb.sdk.data_types.base_types.wb_value import WBValue
 except ImportError:
-    wandb = json_dumps_safer = Run = RunDisabled = WBValue = None
+    wandb = json_dumps_safer = Run = WBValue = None
 
 
 WANDB_ENV_VAR = "WANDB_API_KEY"
@@ -64,7 +65,7 @@ def setup_wandb(
     api_key_file: Optional[str] = None,
     rank_zero_only: bool = True,
     **kwargs,
-) -> Union[Run, RunDisabled]:
+) -> Run:
     """Set up a Weights & Biases session.
 
     This function can be used to initialize a Weights & Biases session in a
@@ -98,39 +99,46 @@ def setup_wandb(
         rank_zero_only: If True, will return an initialized session only for the
             rank 0 worker in distributed training. If False, will initialize a
             session for all workers.
-        kwargs: Passed to ``wandb.init()``.
+        **kwargs: Passed to ``wandb.init()``.
 
     Example:
 
-        .. code-block: python
+        .. code-block:: python
 
-            from ray.air.integrations.wandb import wandb_setup
+            from ray.air.integrations.wandb import setup_wandb
 
             def training_loop(config):
-                wandb = wandb_setup(config)
+                wandb = setup_wandb(config)
                 # ...
                 wandb.log({"loss": 0.123})
 
+    Returns:
+        The initialized wandb run, or a disabled run for non-rank-zero workers
+        when ``rank_zero_only`` is True.
     """
     if not wandb:
         raise RuntimeError(
             "Wandb was not found - please install with `pip install wandb`"
         )
 
-    try:
-        # Do a try-catch here if we are not in a train session
-        _session = session._get_session(warn=False)
-        if _session and rank_zero_only and session.get_world_rank() != 0:
-            return RunDisabled()
+    default_trial_id = None
+    default_trial_name = None
+    default_experiment_name = None
 
-        default_trial_id = session.get_trial_id()
-        default_trial_name = session.get_trial_name()
-        default_experiment_name = session.get_experiment_name()
+    # Do a try-catch here if we are not in a train session
+    session = get_session()
 
-    except RuntimeError:
-        default_trial_id = None
-        default_trial_name = None
-        default_experiment_name = None
+    if rank_zero_only:
+        # Check if we are in a train session and if we are not the rank 0 worker
+        if session and session.world_rank is not None and session.world_rank != 0:
+            # Return a disabled, no-op run for non-rank-zero workers.
+            _wandb = kwargs.get("_wandb") or wandb
+            return _wandb.init(mode="disabled")
+
+    if session:
+        default_trial_id = session.trial_id
+        default_trial_name = session.trial_name
+        default_experiment_name = session.experiment_name
 
     # Default init kwargs
     wandb_init_kwargs = {
@@ -154,47 +162,32 @@ def _setup_wandb(
     api_key_file: Optional[str] = None,
     _wandb: Optional[ModuleType] = None,
     **kwargs,
-) -> Union[Run, RunDisabled]:
+) -> Run:
     _config = config.copy() if config else {}
 
-    wandb_config = _config.pop("wandb", {}).copy()
-
-    # Deprecate: 2.4
-    if wandb_config:
-        warnings.warn(
-            "Passing a `wandb` key in the config dict is deprecated and will raise an "
-            "error in the future. Please pass the actual arguments to `setup_wandb()` "
-            "instead.",
-            DeprecationWarning,
-        )
-
     # If key file is specified, set
-    api_key_file = api_key_file or wandb_config.pop("api_key_file", None)
     if api_key_file:
         api_key_file = os.path.expanduser(api_key_file)
 
-    _set_api_key(api_key_file, api_key or wandb_config.pop("api_key", None))
-    wandb_config["project"] = _get_wandb_project(wandb_config.get("project"))
-    wandb_config["group"] = (
-        os.environ.get(WANDB_GROUP_ENV_VAR)
-        if (not wandb_config.get("group") and os.environ.get(WANDB_GROUP_ENV_VAR))
-        else wandb_config.get("group")
-    )
+    _set_api_key(api_key_file, api_key)
+    project = _get_wandb_project(kwargs.pop("project", None))
+    group = kwargs.pop("group", os.environ.get(WANDB_GROUP_ENV_VAR))
 
-    # remove unpickleable items
+    # Remove unpickleable items.
     _config = _clean_log(_config)
 
     wandb_init_kwargs = dict(
         id=trial_id,
         name=trial_name,
         resume=True,
-        reinit=True,
+        reinit="finish_previous",
         allow_val_change=True,
         config=_config,
+        project=project,
+        group=group,
     )
 
-    # Update config (e.g.g set group, project, override other settings)
-    wandb_init_kwargs.update(wandb_config)
+    # Update config (e.g. set any other parameters in the call to wandb.init)
     wandb_init_kwargs.update(**kwargs)
 
     # On windows, we can't fork
@@ -207,6 +200,10 @@ def _setup_wandb(
 
     run = _wandb.init(**wandb_init_kwargs)
     _run_wandb_process_run_info_hook(run)
+
+    # Record `setup_wandb` usage when everything has setup successfully.
+    air_usage.tag_setup_wandb()
+
     return run
 
 
@@ -215,18 +212,61 @@ def _is_allowed_type(obj):
     if isinstance(obj, np.ndarray) and obj.size == 1:
         return isinstance(obj.item(), Number)
     if isinstance(obj, Sequence) and len(obj) > 0:
-        return isinstance(obj[0], WBValue)
+        return isinstance(obj[0], (Image, Video, WBValue))
     return isinstance(obj, (Number, WBValue))
 
 
-def _clean_log(obj: Any):
+def _clean_log(
+    obj: Any,
+    *,
+    video_kwargs: Optional[Dict[str, Any]] = None,
+    image_kwargs: Optional[Dict[str, Any]] = None,
+):
     # Fixes https://github.com/ray-project/ray/issues/10631
+    if video_kwargs is None:
+        video_kwargs = {}
+    if image_kwargs is None:
+        image_kwargs = {}
     if isinstance(obj, dict):
-        return {k: _clean_log(v) for k, v in obj.items()}
+        return {
+            k: _clean_log(v, video_kwargs=video_kwargs, image_kwargs=image_kwargs)
+            for k, v in obj.items()
+        }
     elif isinstance(obj, (list, set)):
-        return [_clean_log(v) for v in obj]
+        return [
+            _clean_log(v, video_kwargs=video_kwargs, image_kwargs=image_kwargs)
+            for v in obj
+        ]
     elif isinstance(obj, tuple):
-        return tuple(_clean_log(v) for v in obj)
+        return tuple(
+            _clean_log(v, video_kwargs=video_kwargs, image_kwargs=image_kwargs)
+            for v in obj
+        )
+    elif isinstance(obj, np.ndarray) and obj.ndim == 3:
+        # Must be single image (H, W, C).
+        return Image(obj, **image_kwargs)
+    elif isinstance(obj, np.ndarray) and obj.ndim == 4:
+        # Must be batch of images (N >= 1, H, W, C).
+        return (
+            _clean_log(
+                [Image(v, **image_kwargs) for v in obj],
+                video_kwargs=video_kwargs,
+                image_kwargs=image_kwargs,
+            )
+            if obj.shape[0] > 1
+            else Image(obj[0], **image_kwargs)
+        )
+    elif isinstance(obj, np.ndarray) and obj.ndim == 5:
+        # Must be batch of videos (N >= 1, T, C, W, H).
+        return (
+            _clean_log(
+                [Video(v, **video_kwargs) for v in obj],
+                video_kwargs=video_kwargs,
+                image_kwargs=image_kwargs,
+            )
+            if obj.shape[0] > 1
+            else Video(obj[0], **video_kwargs)
+        )
     elif _is_allowed_type(obj):
         return obj
 
@@ -274,7 +314,7 @@ def _get_wandb_project(project: Optional[str] = None) -> Optional[str]:
         # Try to populate WANDB_PROJECT_ENV_VAR and WANDB_GROUP_ENV_VAR
         # from external hook
         try:
-            _load_class(os.environ[WANDB_POPULATE_RUN_LOCATION_HOOK])()
+            load_class(os.environ[WANDB_POPULATE_RUN_LOCATION_HOOK])()
         except Exception as e:
             logger.exception(
                 f"Error executing {WANDB_POPULATE_RUN_LOCATION_HOOK} to "
@@ -319,7 +359,7 @@ def _set_api_key(api_key_file: Optional[str] = None, api_key: Optional[str] = No
         # Try to get API key from external hook
         if WANDB_SETUP_API_KEY_HOOK in os.environ:
             try:
-                api_key = _load_class(os.environ[WANDB_SETUP_API_KEY_HOOK])()
+                api_key = load_class(os.environ[WANDB_SETUP_API_KEY_HOOK])()
             except Exception as e:
                 logger.exception(
                     f"Error executing {WANDB_SETUP_API_KEY_HOOK} to setup API key: {e}",
@@ -340,7 +380,7 @@ def _run_wandb_process_run_info_hook(run: Any) -> None:
     """Run external hook to process information about wandb run"""
     if WANDB_PROCESS_RUN_INFO_HOOK in os.environ:
         try:
-            _load_class(os.environ[WANDB_PROCESS_RUN_INFO_HOOK])(run)
+            load_class(os.environ[WANDB_PROCESS_RUN_INFO_HOOK])(run)
         except Exception as e:
             logger.exception(
                 f"Error calling {WANDB_PROCESS_RUN_INFO_HOOK}: {e}", exc_info=e
@@ -354,8 +394,7 @@ class _QueueItem(enum.Enum):
 
 
 class _WandbLoggingActor:
-    """
-    Wandb assumes that each trial's information should be logged from a
+    """Wandb assumes that each trial's information should be logged from a
     separate process. We use Ray actors as forking multiprocessing
     processes is not supported by Ray and spawn processes run into pickling
     problems.
@@ -412,11 +451,18 @@ class _WandbLoggingActor:
             log, config_update = self._handle_result(item_content)
             try:
                 self._wandb.config.update(config_update, allow_val_change=True)
-                self._wandb.log(log)
+                self._wandb.log(log, step=log.get(TRAINING_ITERATION))
             except urllib.error.HTTPError as e:
                 # Ignore HTTPError. Missing a few data points is not a
                 # big issue, as long as things eventually recover.
-                logger.warn("Failed to log result to w&b: {}".format(str(e)))
+                logger.warning("Failed to log result to w&b: {}".format(str(e)))
+            except FileNotFoundError as e:
+                logger.error(
+                    "FileNotFoundError: Did not log result to Weights & Biases. "
+                    "Possible cause: relative file path used instead of absolute path. "
+                    "Error: %s",
+                    e,
+                )
         self._wandb.finish()
 
     def _handle_checkpoint(self, checkpoint_path: str):
@@ -445,6 +491,7 @@ class _WandbLoggingActor:
         return log, config_update
 
 
+@PublicAPI(stability="alpha")
 class WandbLoggerCallback(LoggerCallback):
     """WandbLoggerCallback
 
@@ -453,42 +500,27 @@ class WandbLoggerCallback(LoggerCallback):
     ``LoggerCallback`` sends metrics to Wandb for automatic tracking and
     visualization.
 
-    Example:
-
-        .. testcode::
-
-            import random
-
-            from ray import tune
-            from ray.air import session, RunConfig
-            from ray.air.integrations.wandb import WandbLoggerCallback
-
-
-            def train_func(config):
-                offset = random.random() / 5
-                for epoch in range(2, config["epochs"]):
-                    acc = 1 - (2 + config["lr"]) ** -epoch - random.random() / epoch - offset
-                    loss = (2 + config["lr"]) ** -epoch + random.random() / epoch + offset
-                    session.report({"acc": acc, "loss": loss})
-
-
-            tuner = tune.Tuner(
-                train_func,
-                param_space={
-                    "lr": tune.grid_search([0.001, 0.01, 0.1, 1.0]),
-                    "epochs": 10,
-                },
-                run_config=RunConfig(
-                    callbacks=[WandbLoggerCallback(project="Optimization_Project")]
-                ),
-            )
-            results = tuner.fit()
-
-        .. testoutput::
-            :hide:
-            :options: +ELLIPSIS
-
-            ...
+    Examples:
+        >>> import random  # doctest: +SKIP_EXAMPLE
+        >>> from ray import tune
+        >>> from ray.air.integrations.wandb import WandbLoggerCallback
+        >>> def train_func(config):
+        ...     offset = random.random() / 5
+        ...     for epoch in range(2, config["epochs"]):
+        ...         acc = 1 - (2 + config["lr"]) ** -epoch - random.random() / epoch - offset
+        ...         loss = (2 + config["lr"]) ** -epoch + random.random() / epoch + offset
+        ...         tune.report({"acc": acc, "loss": loss})
+        >>> tuner = tune.Tuner(
+        ...     train_func,
+        ...     param_space={
+        ...         "lr": tune.grid_search([0.001, 0.01, 0.1, 1.0]),
+        ...         "epochs": 10,
+        ...     },
+        ...     run_config=tune.RunConfig(
+        ...         callbacks=[WandbLoggerCallback(project="Optimization_Project")]
+        ...     ),
+        ... )
+        >>> results = tuner.fit()
 
     Args:
         project: Name of the Wandb project. Mandatory.
@@ -506,14 +538,27 @@ class WandbLoggerCallback(LoggerCallback):
             PopulationBasedTraining. Defaults to False.
         upload_checkpoints: If ``True``, model checkpoints will be uploaded to
             Wandb as artifacts. Defaults to ``False``.
-        **kwargs: The keyword arguments will be pased to ``wandb.init()``.
+        save_checkpoints: Deprecated alias of ``upload_checkpoints``. Defaults to
+            ``False``.
+        upload_timeout: Maximum time in seconds to wait for pending uploads to
+            wandb when the experiment ends. Defaults to the Ray Train default
+            sync timeout.
+        video_kwargs: Dictionary of keyword arguments passed to wandb.Video()
+            when logging videos. Videos have to be logged as 5D numpy arrays
+            to be affected by this parameter. For valid keyword arguments, see
+            https://docs.wandb.ai/ref/python/data-types/video/. Defaults to ``None``.
+        image_kwargs: Dictionary of keyword arguments passed to wandb.Image()
+            when logging images. Images have to be logged as 3D or 4D numpy arrays
+            to be affected by this parameter. For valid keyword arguments, see
+            https://docs.wandb.ai/ref/python/data-types/image/. Defaults to ``None``.
+        **kwargs: The keyword arguments will be passed to ``wandb.init()``.
 
     Wandb's ``group``, ``run_id`` and ``run_name`` are automatically selected
     by Tune, but can be overwritten by filling out the respective configuration
     values.
 
     Please see here for all other valid configuration settings:
-    https://docs.wandb.ai/library/init
+    https://docs.wandb.ai/ref/python/init/
     """  # noqa: E501
 
     # Do not log these result keys
@@ -543,6 +588,8 @@ class WandbLoggerCallback(LoggerCallback):
         upload_checkpoints: bool = False,
         save_checkpoints: bool = False,
         upload_timeout: int = DEFAULT_SYNC_TIMEOUT,
+        video_kwargs: Optional[dict] = None,
+        image_kwargs: Optional[dict] = None,
         **kwargs,
     ):
         if not wandb:
@@ -565,6 +612,8 @@ class WandbLoggerCallback(LoggerCallback):
         self.log_config = log_config
         self.upload_checkpoints = upload_checkpoints
         self._upload_timeout = upload_timeout
+        self.video_kwargs = video_kwargs or {}
+        self.image_kwargs = image_kwargs or {}
         self.kwargs = kwargs
 
         self._remote_logger_class = None
@@ -625,7 +674,7 @@ class WandbLoggerCallback(LoggerCallback):
             id=trial_id,
             name=trial_name,
             resume=False,
-            reinit=True,
+            reinit="finish_previous",
             allow_val_change=True,
             group=wandb_group,
             project=wandb_project,
@@ -638,6 +687,11 @@ class WandbLoggerCallback(LoggerCallback):
     def _start_logging_actor(
         self, trial: "Trial", exclude_results: List[str], **wandb_init_kwargs
     ):
+        # Reuse actor if one already exists.
+        # This can happen if the trial is restarted.
+        if trial in self._trial_logging_futures:
+            return
+
         if not self._remote_logger_class:
             env_vars = {}
             # API key env variable is not set if authenticating through `wandb login`
@@ -647,10 +701,17 @@ class WandbLoggerCallback(LoggerCallback):
                 num_cpus=0,
                 **_force_on_current_node(),
                 runtime_env={"env_vars": env_vars},
+                max_restarts=-1,
+                max_task_retries=-1,
             )(self._logger_actor_cls)
 
         self._trial_queues[trial] = Queue(
-            actor_options={"num_cpus": 0, **_force_on_current_node()}
+            actor_options={
+                "num_cpus": 0,
+                **_force_on_current_node(),
+                "max_restarts": -1,
+                "max_task_retries": -1,
+            }
         )
         self._trial_logging_actors[trial] = self._remote_logger_class.remote(
             logdir=trial.local_path,
@@ -670,14 +731,19 @@ class WandbLoggerCallback(LoggerCallback):
         if trial not in self._trial_logging_actors:
             self.log_trial_start(trial)
 
-        result = _clean_log(result)
+        result = _clean_log(
+            result, video_kwargs=self.video_kwargs, image_kwargs=self.image_kwargs
+        )
         self._trial_queues[trial].put((_QueueItem.RESULT, result))
 
     def log_trial_save(self, trial: "Trial"):
         if self.upload_checkpoints and trial.checkpoint:
-            self._trial_queues[trial].put(
-                (_QueueItem.CHECKPOINT, trial.checkpoint.dir_or_data)
-            )
+            checkpoint_root = None
+            if isinstance(trial.checkpoint.filesystem, pyarrow.fs.LocalFileSystem):
+                checkpoint_root = trial.checkpoint.path
+
+            if checkpoint_root:
+                self._trial_queues[trial].put((_QueueItem.CHECKPOINT, checkpoint_root))
 
     def log_trial_end(self, trial: "Trial", failed: bool = False):
         self._signal_logging_actor_stop(trial=trial)
@@ -713,9 +779,15 @@ class WandbLoggerCallback(LoggerCallback):
                 trial = self._logging_future_to_trial.pop(remaining_future)
                 self._cleanup_logging_actor(trial)
 
-    def on_experiment_end(self, trials: List["Trial"], **info):
+    def on_experiment_end(self, trials: List["Trial"], **info: Any):
         """Wait for the actors to finish their call to `wandb.finish`.
-        This includes uploading all logs + artifacts to wandb."""
+
+        This includes uploading all logs + artifacts to wandb.
+
+        Args:
+            trials: The experiment's trials. Unused.
+            **info: Kwargs dict for forward compatibility. Unused.
+        """
         self._cleanup_logging_actors(timeout=self._upload_timeout, kill_on_timeout=True)
 
     def __del__(self):

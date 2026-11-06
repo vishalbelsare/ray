@@ -1,39 +1,26 @@
-from copy import copy, deepcopy
-import inspect
-import logging
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Optional,
-    Tuple,
-    Union,
-)
-from ray._private.usage.usage_lib import TagKey, record_extra_usage_tag
+from copy import deepcopy
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from ray.serve.context import get_global_client
-from ray.dag.dag_node import DAGNodeBase
-from ray.dag.class_node import ClassNode
-from ray.dag.function_node import FunctionNode
+from ray.serve._private.config import (
+    DeploymentConfig,
+    ReplicaConfig,
+    RequestRouterConfig,
+    handle_num_replicas_auto,
+)
+from ray.serve._private.usage import ServeUsageTag
+from ray.serve._private.utils import DEFAULT, Default
 from ray.serve.config import (
     AutoscalingConfig,
-    DeploymentConfig,
+    BackpressureConfig,
+    DeploymentActorConfig,
+    GangSchedulingConfig,
 )
-from ray.serve._private.constants import SERVE_LOGGER_NAME, MIGRATION_MESSAGE
-from ray.serve.handle import RayServeHandle, RayServeSyncHandle
-from ray.serve._private.utils import DEFAULT, Default, guarded_deprecation_warning
-from ray.util.annotations import Deprecated, PublicAPI
-from ray.serve.schema import (
-    RayActorOptionsSchema,
-    DeploymentSchema,
-)
+from ray.serve.schema import DeploymentSchema, LoggingConfig, RayActorOptionsSchema
+from ray.util.annotations import PublicAPI
 
 
-logger = logging.getLogger(SERVE_LOGGER_NAME)
-
-
-@PublicAPI(stability="beta")
-class Application(DAGNodeBase):
+@PublicAPI(stability="stable")
+class Application:
     """One or more deployments bound with arguments that can be deployed together.
 
     Can be passed into another `Deployment.bind()` to compose multiple deployments in a
@@ -67,33 +54,28 @@ class Application(DAGNodeBase):
                 my_app:
                     import_path: python_file:app
 
+    Args:
+        bound_deployment: The deployment, with its arguments bound. Use
+            ``Deployment.bind()`` to create an application rather than
+            constructing one directly.
     """
 
-    def __init__(
-        self, *, _internal_dag_node: Optional[Union[ClassNode, FunctionNode]] = None
-    ):
-        if _internal_dag_node is None:
-            raise RuntimeError("This class should not be constructed directly.")
+    def __init__(self, bound_deployment: "Deployment"):
+        # This is used by `build_app`, but made private so users don't use it.
+        self._bound_deployment = bound_deployment
+        # Optional peer ingress request router for ingress bypass mode.
+        self._ingress_request_router: Optional["Application"] = None
 
-        self._internal_dag_node = _internal_dag_node
-
-    def _get_internal_dag_node(self) -> Union[ClassNode, FunctionNode]:
-        if self._internal_dag_node is None:
-            raise RuntimeError("Application object should not be constructed directly.")
-
-        return self._internal_dag_node
-
-    @classmethod
-    def _from_internal_dag_node(cls, dag_node: Union[ClassNode, FunctionNode]):
-        return cls(_internal_dag_node=dag_node)
-
-    # Proxy all method calls to the underlying DAG node. This allows this class to be
-    # passed in place of the ClassNode or FunctionNode in the DAG building code.
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._get_internal_dag_node(), name)
+    def _with_ingress_request_router(
+        self, ingress_request_router: "Application"
+    ) -> "Application":
+        # Internal-only, unstable hook for the Serve LLM direct-ingress stack.
+        # This is not a stable public Serve API.
+        self._ingress_request_router = ingress_request_router
+        return self
 
 
-@PublicAPI
+@PublicAPI(stability="stable")
 class Deployment:
     """Class (or function) decorated with the `@serve.deployment` decorator.
 
@@ -115,84 +97,58 @@ class Deployment:
             def __call__(self, request):
                 return "Hello world!"
 
-            app = MyDeployment.bind()
-            # Run via `serve.run` or the `serve run` CLI command.
-            serve.run(app)
+        app = MyDeployment.bind()
+        # Run via `serve.run` or the `serve run` CLI command.
+        serve.run(app)
 
     """
 
     def __init__(
         self,
-        func_or_class: Union[Callable, str],
         name: str,
-        config: DeploymentConfig,
+        deployment_config: DeploymentConfig,
+        replica_config: ReplicaConfig,
         version: Optional[str] = None,
-        init_args: Optional[Tuple[Any]] = None,
-        init_kwargs: Optional[Tuple[Any]] = None,
-        route_prefix: Union[str, None, DEFAULT] = DEFAULT.VALUE,
-        ray_actor_options: Optional[Dict] = None,
-        is_driver_deployment: Optional[bool] = False,
-        _internal=False,
+        _internal: bool = False,
     ) -> None:
+        """Construct a Deployment. Should only be called by Serve internals.
+
+        Args:
+            name: Unique name of this deployment.
+            deployment_config: Serve-level configuration (number of replicas,
+                user config, autoscaling, etc.).
+            replica_config: Replica-level configuration (actor options, init
+                args/kwargs, etc.).
+            version: Optional opaque deployment version used to determine
+                whether replicas need to be restarted on update.
+            _internal: Internal flag; ``Deployment`` instances must be created
+                via the ``@serve.deployment`` decorator, which sets this to
+                ``True``.
+        """
         if not _internal:
             raise RuntimeError(
                 "The Deployment constructor should not be called "
                 "directly. Use `@serve.deployment` instead."
             )
-        if not callable(func_or_class) and not isinstance(func_or_class, str):
-            raise TypeError("@serve.deployment must be called on a class or function.")
-        if not isinstance(name, str):
-            raise TypeError("name must be a string.")
+        self._validate_name(name)
         if not (version is None or isinstance(version, str)):
             raise TypeError("version must be a string.")
-        if not (init_args is None or isinstance(init_args, (tuple, list))):
-            raise TypeError("init_args must be a tuple.")
-        if not (init_kwargs is None or isinstance(init_kwargs, dict)):
-            raise TypeError("init_kwargs must be a dict.")
-        if route_prefix is not DEFAULT.VALUE and route_prefix is not None:
-            if not isinstance(route_prefix, str):
-                raise TypeError("route_prefix must be a string.")
-            if not route_prefix.startswith("/"):
-                raise ValueError("route_prefix must start with '/'.")
-            if route_prefix != "/" and route_prefix.endswith("/"):
-                raise ValueError(
-                    "route_prefix must not end with '/' unless it's the root."
-                )
-            if "{" in route_prefix or "}" in route_prefix:
-                raise ValueError("route_prefix may not contain wildcards.")
-        if not (ray_actor_options is None or isinstance(ray_actor_options, dict)):
-            raise TypeError("ray_actor_options must be a dict.")
 
-        if is_driver_deployment is True:
-            if config.num_replicas != 1:
-                raise ValueError("num_replicas should not be set for driver deployment")
-            if config.autoscaling_config:
-                raise ValueError("autoscaling should not be set for driver deployment")
-
-        if init_args is None:
-            init_args = ()
-        if init_kwargs is None:
-            init_kwargs = {}
-
-        docs_path = None
-        if (
-            inspect.isclass(func_or_class)
-            and hasattr(func_or_class, "__module__")
-            and func_or_class.__module__ == "ray.serve.api"
-            and hasattr(func_or_class, "__fastapi_docs_path__")
-        ):
-            docs_path = func_or_class.__fastapi_docs_path__
-
-        self._func_or_class = func_or_class
         self._name = name
         self._version = version
-        self._config = config
-        self._init_args = init_args
-        self._init_kwargs = init_kwargs
-        self._route_prefix = route_prefix
-        self._ray_actor_options = ray_actor_options
-        self._is_driver_deployment = is_driver_deployment
-        self._docs_path = docs_path
+        self._deployment_config = deployment_config
+        self._replica_config = replica_config
+
+    def _validate_name(self, name: str):
+        if not isinstance(name, str):
+            raise TypeError("name must be a string.")
+
+        # '#' is the replica ID delimiter, so it cannot appear in a name.
+        if "#" in name:
+            raise ValueError(
+                f"Deployment names must not contain the '#' character. "
+                f"Current name: {name}."
+            )
 
     @property
     def name(self) -> str:
@@ -201,208 +157,112 @@ class Deployment:
 
     @property
     def version(self) -> Optional[str]:
+        """Opaque version that determines whether replicas restart on update."""
         return self._version
 
     @property
     def func_or_class(self) -> Union[Callable, str]:
         """Underlying class or function that this deployment wraps."""
-        return self._func_or_class
+        return self._replica_config.deployment_def
 
     @property
     def num_replicas(self) -> int:
-        """Current target number of replicas."""
-        return self._config.num_replicas
+        """Target number of replicas."""
+        return self._deployment_config.num_replicas
 
     @property
     def user_config(self) -> Any:
-        """Current dynamic user-provided config options."""
-        return self._config.user_config
+        """Dynamic user-provided config options."""
+        return self._deployment_config.user_config
 
     @property
-    def max_concurrent_queries(self) -> int:
-        """Current max outstanding queries from each handle."""
-        return self._config.max_concurrent_queries
+    def max_ongoing_requests(self) -> int:
+        """Max number of requests a replica can handle at once."""
+        return self._deployment_config.max_ongoing_requests
 
     @property
-    def route_prefix(self) -> Optional[str]:
-        """HTTP route prefix that this deployment is exposed under."""
-        if self._route_prefix is DEFAULT.VALUE:
-            return f"/{self._name}"
-        return self._route_prefix
+    def max_queued_requests(self) -> int:
+        """Max number of requests that can be queued in each deployment handle."""
+        return self._deployment_config.max_queued_requests
+
+    @property
+    def backpressure_config(self) -> BackpressureConfig:
+        """Config of the HTTP response for requests rejected due to backpressure."""
+        return self._deployment_config.backpressure_config
 
     @property
     def ray_actor_options(self) -> Optional[Dict]:
         """Actor options such as resources required for each replica."""
-        return self._ray_actor_options
+        return self._replica_config.ray_actor_options
 
     @property
     def init_args(self) -> Tuple[Any]:
-        return self._init_args
+        """Positional arguments passed to the deployment's constructor."""
+        return self._replica_config.init_args
 
     @property
     def init_kwargs(self) -> Tuple[Any]:
-        return self._init_kwargs
+        """Keyword arguments passed to the deployment's constructor."""
+        return self._replica_config.init_kwargs
 
     @property
-    def url(self) -> Optional[str]:
-        if self._route_prefix is None or self._is_driver_deployment:
-            # this deployment is not exposed over HTTP
-            return None
+    def logging_config(self) -> Dict:
+        """Logging configuration of the deployment."""
+        return self._deployment_config.logging_config
 
-        return get_global_client().root_url + self.route_prefix
+    def set_logging_config(self, logging_config: Dict):
+        """Set the logging configuration of the deployment.
+
+        Args:
+            logging_config: The logging configuration.
+        """
+        self._deployment_config.logging_config = logging_config
 
     def __call__(self):
+        """Not supported. Deployments can't be called or constructed directly.
+
+        Raises:
+            RuntimeError: Always.
+        """
         raise RuntimeError(
             "Deployments cannot be constructed directly. "
             "Use `deployment.deploy() instead.`"
         )
 
-    @PublicAPI(stability="beta")
-    def bind(self, *args, **kwargs) -> Application:
+    def bind(self, *args: Any, **kwargs: Any) -> Application:
         """Bind the arguments to the deployment and return an Application.
 
         The returned Application can be deployed using `serve.run` (or via
         config file) or bound to another deployment for composition.
-        """
-
-        copied_self = copy(self)
-        copied_self._func_or_class = "dummpy.module"
-        schema_shell = deployment_to_schema(copied_self)
-
-        if inspect.isfunction(self._func_or_class):
-            dag_node = FunctionNode(
-                self._func_or_class,
-                args,  # Used to bind and resolve DAG only, can take user input
-                kwargs,  # Used to bind and resolve DAG only, can take user input
-                self._ray_actor_options or dict(),
-                other_args_to_resolve={
-                    "deployment_schema": schema_shell,
-                    "is_from_serve_deployment": True,
-                },
-            )
-        else:
-            dag_node = ClassNode(
-                self._func_or_class,
-                args,
-                kwargs,
-                cls_options=self._ray_actor_options or dict(),
-                other_args_to_resolve={
-                    "deployment_schema": schema_shell,
-                    "is_from_serve_deployment": True,
-                },
-            )
-
-        return Application._from_internal_dag_node(dag_node)
-
-    @guarded_deprecation_warning(instructions=MIGRATION_MESSAGE)
-    @Deprecated(message=MIGRATION_MESSAGE)
-    def deploy(self, *init_args, _blocking=True, **init_kwargs):
-        """Deploy or update this deployment.
 
         Args:
-            init_args: args to pass to the class __init__
-                method. Not valid if this deployment wraps a function.
-            init_kwargs: kwargs to pass to the class __init__
-                method. Not valid if this deployment wraps a function.
-        """
-        record_extra_usage_tag(TagKey.SERVE_API_VERSION, "v1")
-        self._deploy(*init_args, _blocking=_blocking, **init_kwargs)
-
-    # TODO(Sihan) Promote the _deploy to deploy after we fully deprecate the API
-    def _deploy(self, *init_args, _blocking=True, **init_kwargs):
-        """Deploy or update this deployment.
-
-        Args:
-            init_args: args to pass to the class __init__
-                method. Not valid if this deployment wraps a function.
-            init_kwargs: kwargs to pass to the class __init__
-                method. Not valid if this deployment wraps a function.
-        """
-        if len(init_args) == 0 and self._init_args is not None:
-            init_args = self._init_args
-        if len(init_kwargs) == 0 and self._init_kwargs is not None:
-            init_kwargs = self._init_kwargs
-
-        return get_global_client().deploy(
-            self._name,
-            self._func_or_class,
-            init_args,
-            init_kwargs,
-            ray_actor_options=self._ray_actor_options,
-            config=self._config,
-            version=self._version,
-            route_prefix=self.route_prefix,
-            url=self.url,
-            _blocking=_blocking,
-        )
-
-    @guarded_deprecation_warning(instructions=MIGRATION_MESSAGE)
-    @Deprecated(message=MIGRATION_MESSAGE)
-    def delete(self):
-        """Delete this deployment."""
-
-        return self._delete()
-
-    # TODO(Sihan) Promote the _delete to delete after we fully deprecate the API
-    def _delete(self):
-        """Delete this deployment."""
-
-        return get_global_client().delete_deployments([self._name])
-
-    @guarded_deprecation_warning(instructions=MIGRATION_MESSAGE)
-    @Deprecated(message=MIGRATION_MESSAGE)
-    def get_handle(
-        self, sync: Optional[bool] = True
-    ) -> Union[RayServeHandle, RayServeSyncHandle]:
-        """Get a ServeHandle to this deployment to invoke it from Python.
-
-        Args:
-            sync: If true, then Serve will return a ServeHandle that
-                works everywhere. Otherwise, Serve will return an
-                asyncio-optimized ServeHandle that's only usable in an asyncio
-                loop.
+            *args: Positional arguments to pass to the deployment's constructor.
+            **kwargs: Keyword arguments to pass to the deployment's constructor.
 
         Returns:
-            ServeHandle
+            An application that contains this deployment with the given arguments.
         """
-        return self._get_handle(sync)
+        return Application(self.options(_init_args=args, _init_kwargs=kwargs))
 
-    # TODO(Sihan) Promote the _get_handle to get_handle after we fully deprecate the API
-    def _get_handle(
-        self,
-        sync: Optional[bool] = True,
-    ) -> Union[RayServeHandle, RayServeSyncHandle]:
-        """Get a ServeHandle to this deployment to invoke it from Python.
-
-        Args:
-            sync: If true, then Serve will return a ServeHandle that
-                works everywhere. Otherwise, Serve will return an
-                asyncio-optimized ServeHandle that's only usable in an asyncio
-                loop.
-
-        Returns:
-            ServeHandle
-        """
-
-        return get_global_client().get_handle(
-            self._name,
-            missing_ok=True,
-            sync=sync,
-        )
-
-    @PublicAPI
     def options(
         self,
         func_or_class: Optional[Callable] = None,
         name: Default[str] = DEFAULT.VALUE,
         version: Default[str] = DEFAULT.VALUE,
-        num_replicas: Default[Optional[int]] = DEFAULT.VALUE,
-        init_args: Default[Tuple[Any]] = DEFAULT.VALUE,
-        init_kwargs: Default[Dict[Any, Any]] = DEFAULT.VALUE,
-        route_prefix: Default[Union[str, None]] = DEFAULT.VALUE,
+        num_replicas: Default[Optional[Union[int, str]]] = DEFAULT.VALUE,
         ray_actor_options: Default[Optional[Dict]] = DEFAULT.VALUE,
+        placement_group_bundles: Default[List[Dict[str, float]]] = DEFAULT.VALUE,
+        placement_group_strategy: Default[str] = DEFAULT.VALUE,
+        placement_group_bundle_label_selector: Default[
+            List[Dict[str, str]]
+        ] = DEFAULT.VALUE,
+        max_replicas_per_node: Default[int] = DEFAULT.VALUE,
         user_config: Default[Optional[Any]] = DEFAULT.VALUE,
-        max_concurrent_queries: Default[int] = DEFAULT.VALUE,
+        max_ongoing_requests: Default[int] = DEFAULT.VALUE,
+        max_queued_requests: Default[int] = DEFAULT.VALUE,
+        backpressure_config: Default[
+            Union[Dict, BackpressureConfig, None]
+        ] = DEFAULT.VALUE,
         autoscaling_config: Default[
             Union[Dict, AutoscalingConfig, None]
         ] = DEFAULT.VALUE,
@@ -410,16 +270,104 @@ class Deployment:
         graceful_shutdown_timeout_s: Default[float] = DEFAULT.VALUE,
         health_check_period_s: Default[float] = DEFAULT.VALUE,
         health_check_timeout_s: Default[float] = DEFAULT.VALUE,
-        is_driver_deployment: bool = DEFAULT.VALUE,
+        logging_config: Default[Union[Dict, LoggingConfig, None]] = DEFAULT.VALUE,
+        request_router_config: Default[
+            Union[Dict, RequestRouterConfig, None]
+        ] = DEFAULT.VALUE,
+        _init_args: Default[Tuple[Any]] = DEFAULT.VALUE,
+        _init_kwargs: Default[Dict[Any, Any]] = DEFAULT.VALUE,
         _internal: bool = False,
+        max_constructor_retry_count: Default[int] = DEFAULT.VALUE,
+        gang_scheduling_config: Default[
+            Union[Dict, GangSchedulingConfig, None]
+        ] = DEFAULT.VALUE,
+        deployment_actors: Default[
+            Optional[List[Union[Dict, DeploymentActorConfig]]]
+        ] = DEFAULT.VALUE,
+        max_surge_percent: Default[int] = DEFAULT.VALUE,
     ) -> "Deployment":
         """Return a copy of this deployment with updated options.
 
         Only those options passed in will be updated, all others will remain
         unchanged from the existing deployment.
 
-        Refer to the `@serve.deployment` decorator docs for available arguments.
+        See the `@serve.deployment` decorator docs for details on each option.
+
+        Args:
+            func_or_class: The class or function to run as this deployment.
+            name: Unique name for this deployment within the application.
+            version: Removed. Specifying this argument raises a ValueError.
+            num_replicas: Number of replicas handling requests, or "auto" to
+                autoscale.
+            ray_actor_options: Options for the replica actor, such as resources and
+                runtime environment.
+            placement_group_bundles: Placement group bundles scheduled for each
+                replica. Cannot be combined with `max_replicas_per_node`.
+            placement_group_strategy: Scheduling strategy for those bundles.
+            placement_group_bundle_label_selector: Label selectors applied to the
+                placement group, either one for all bundles or one per bundle.
+            max_replicas_per_node: Maximum replicas of this deployment on one node.
+                Cannot be combined with `placement_group_bundles`.
+            user_config: Config passed to the replica's `reconfigure` method without
+                restarting replicas.
+            max_ongoing_requests: Maximum number of requests a replica can handle
+                at once.
+            max_queued_requests: Maximum number of requests queued at each caller.
+                Additional requests are rejected when the queue is full.
+            backpressure_config: HTTP response settings for requests rejected
+                because the queue is full.
+            autoscaling_config: Autoscaling parameters. Set `num_replicas` to "auto"
+                or leave it unset when using this.
+            graceful_shutdown_wait_loop_s: Seconds between checks for unfinished
+                requests during shutdown.
+            graceful_shutdown_timeout_s: Seconds allowed for a graceful shutdown
+                before the replica is forcibly stopped.
+            health_check_period_s: Seconds between health checks on a replica.
+            health_check_timeout_s: Seconds allowed for a health check to finish
+                before it is considered failed.
+            logging_config: Logging options for this deployment's replicas.
+            request_router_config: Request routing options for this deployment.
+            _init_args: Internal. Positional arguments for the deployment
+                constructor; use `.bind()` instead.
+            _init_kwargs: Internal. Keyword arguments for the deployment
+                constructor; use `.bind()` instead.
+            _internal: Internal. Set by Serve when it calls this method.
+            max_constructor_retry_count: Maximum retries of the deployment
+                constructor before the deployment is marked failed.
+            gang_scheduling_config: Options for scheduling replicas together in
+                groups called gangs.
+            deployment_actors: Actors shared by all replicas of this deployment.
+            max_surge_percent: Extra replicas allowed during a rolling restart,
+                as a percentage of the target count. Must be in ``[0, 100]``.
+                The allowance rounds up to whole replicas or gangs. When positive,
+                replacements start before old replicas stop. If the cluster lacks
+                capacity, old replicas keep serving while replacements wait.
+                Stopping replicas do not count toward the limit, so live actors
+                can exceed the target plus surge while old replicas drain.
+                Lightweight configuration changes to replicas on the new code
+                wait until restarts finish. Setting this to ``0`` stops old
+                replicas before starting replacements.
+
+        Returns:
+            A copy of this deployment with the given options applied.
         """
+        if not _internal and version is not DEFAULT.VALUE:
+            raise ValueError(
+                "`version` in `Deployment.options()` has been removed. "
+                "Serve manages deployment versions internally."
+            )
+
+        # Modify max_ongoing_requests and autoscaling_config if
+        # `num_replicas="auto"`
+        if max_ongoing_requests is None:
+            raise ValueError("`max_ongoing_requests` must be non-null, got None.")
+
+        if num_replicas == "auto":
+            max_ongoing_requests, autoscaling_config = handle_num_replicas_auto(
+                max_ongoing_requests, autoscaling_config
+            )
+
+            ServeUsageTag.AUTO_NUM_REPLICAS_USED.record("1")
 
         # NOTE: The user_configured_option_names should be the first thing that's
         # defined in this method. It depends on the locals() dictionary storing
@@ -432,11 +380,17 @@ class Deployment:
             and value is not DEFAULT.VALUE
         ]
 
-        new_config = deepcopy(self._config)
+        new_deployment_config = deepcopy(self._deployment_config)
         if not _internal:
-            new_config.user_configured_option_names.update(user_configured_option_names)
+            new_deployment_config.user_configured_option_names.update(
+                user_configured_option_names
+            )
 
-        if num_replicas not in [DEFAULT.VALUE, None] and autoscaling_config not in [
+        if num_replicas not in [
+            DEFAULT.VALUE,
+            None,
+            "auto",
+        ] and autoscaling_config not in [
             DEFAULT.VALUE,
             None,
         ]:
@@ -448,22 +402,31 @@ class Deployment:
         if num_replicas == 0:
             raise ValueError("num_replicas is expected to larger than 0")
 
-        if not _internal and version is not DEFAULT.VALUE:
-            logger.warning(
-                "DeprecationWarning: `version` in `Deployment.options()` has been "
-                "deprecated. Explicitly specifying version will raise an error in the "
-                "future!"
+        if num_replicas not in [DEFAULT.VALUE, None, "auto"]:
+            new_deployment_config.num_replicas = num_replicas
+
+        if user_config is not DEFAULT.VALUE:
+            new_deployment_config.user_config = user_config
+
+        if max_ongoing_requests is not DEFAULT.VALUE:
+            new_deployment_config.max_ongoing_requests = max_ongoing_requests
+
+        if max_queued_requests is not DEFAULT.VALUE:
+            new_deployment_config.max_queued_requests = max_queued_requests
+
+        if backpressure_config is not DEFAULT.VALUE:
+            new_deployment_config.backpressure_config = backpressure_config
+
+        if max_constructor_retry_count is not DEFAULT.VALUE:
+            new_deployment_config.max_constructor_retry_count = (
+                max_constructor_retry_count
             )
 
-        if num_replicas not in [DEFAULT.VALUE, None]:
-            new_config.num_replicas = num_replicas
-        if user_config is not DEFAULT.VALUE:
-            new_config.user_config = user_config
-        if max_concurrent_queries is not DEFAULT.VALUE:
-            new_config.max_concurrent_queries = max_concurrent_queries
+        if max_surge_percent is not DEFAULT.VALUE:
+            new_deployment_config.max_surge_percent = max_surge_percent
 
         if func_or_class is None:
-            func_or_class = self._func_or_class
+            func_or_class = self._replica_config.deployment_def
 
         if name is DEFAULT.VALUE:
             name = self._name
@@ -471,177 +434,186 @@ class Deployment:
         if version is DEFAULT.VALUE:
             version = self._version
 
-        if init_args is DEFAULT.VALUE:
-            init_args = self._init_args
+        if _init_args is DEFAULT.VALUE:
+            _init_args = self._replica_config.init_args
 
-        if init_kwargs is DEFAULT.VALUE:
-            init_kwargs = self._init_kwargs
-
-        if route_prefix is DEFAULT.VALUE:
-            # Default is to keep the previous value
-            route_prefix = self._route_prefix
+        if _init_kwargs is DEFAULT.VALUE:
+            _init_kwargs = self._replica_config.init_kwargs
 
         if ray_actor_options is DEFAULT.VALUE:
-            ray_actor_options = self._ray_actor_options
+            ray_actor_options = self._replica_config.ray_actor_options
+
+        if placement_group_bundles is DEFAULT.VALUE:
+            placement_group_bundles = self._replica_config.placement_group_bundles
+
+        if placement_group_strategy is DEFAULT.VALUE:
+            placement_group_strategy = self._replica_config.placement_group_strategy
+
+        if placement_group_bundle_label_selector is DEFAULT.VALUE:
+            placement_group_bundle_label_selector = (
+                self._replica_config.placement_group_bundle_label_selector
+            )
+
+        # TODO(ryanaoleary@): Add conditional check once fallback_strategy is
+        # added to placement group options.
+        placement_group_fallback_strategy = (
+            self._replica_config.placement_group_fallback_strategy
+        )
+
+        if max_replicas_per_node is DEFAULT.VALUE:
+            max_replicas_per_node = self._replica_config.max_replicas_per_node
 
         if autoscaling_config is not DEFAULT.VALUE:
-            new_config.autoscaling_config = autoscaling_config
+            new_deployment_config.autoscaling_config = autoscaling_config
+
+        if request_router_config is not DEFAULT.VALUE:
+            new_deployment_config.request_router_config = request_router_config
 
         if graceful_shutdown_wait_loop_s is not DEFAULT.VALUE:
-            new_config.graceful_shutdown_wait_loop_s = graceful_shutdown_wait_loop_s
+            new_deployment_config.graceful_shutdown_wait_loop_s = (
+                graceful_shutdown_wait_loop_s
+            )
 
         if graceful_shutdown_timeout_s is not DEFAULT.VALUE:
-            new_config.graceful_shutdown_timeout_s = graceful_shutdown_timeout_s
+            new_deployment_config.graceful_shutdown_timeout_s = (
+                graceful_shutdown_timeout_s
+            )
 
         if health_check_period_s is not DEFAULT.VALUE:
-            new_config.health_check_period_s = health_check_period_s
+            new_deployment_config.health_check_period_s = health_check_period_s
 
         if health_check_timeout_s is not DEFAULT.VALUE:
-            new_config.health_check_timeout_s = health_check_timeout_s
+            new_deployment_config.health_check_timeout_s = health_check_timeout_s
 
-        if is_driver_deployment is DEFAULT.VALUE:
-            is_driver_deployment = self._is_driver_deployment
+        if logging_config is not DEFAULT.VALUE:
+            if isinstance(logging_config, LoggingConfig):
+                logging_config = logging_config.model_dump()
+            new_deployment_config.logging_config = logging_config
+
+        if gang_scheduling_config is not DEFAULT.VALUE:
+            new_deployment_config.gang_scheduling_config = gang_scheduling_config
+
+        if deployment_actors is not DEFAULT.VALUE:
+            new_deployment_config.deployment_actors = deployment_actors
+
+        gc = new_deployment_config.gang_scheduling_config
+        if (
+            gc is not None
+            and isinstance(new_deployment_config.num_replicas, int)
+            and new_deployment_config.autoscaling_config is None
+        ):
+            # When autoscaling is enabled, num_replicas defaults to 1
+            if new_deployment_config.num_replicas % gc.gang_size != 0:
+                raise ValueError(
+                    f"num_replicas ({new_deployment_config.num_replicas}) must "
+                    f"be a multiple of gang_size ({gc.gang_size})."
+                )
+
+        if gc is not None and max_replicas_per_node is not None:
+            raise ValueError(
+                "Setting max_replicas_per_node is not allowed when "
+                "gang_scheduling_config is provided."
+            )
+
+        if gc is not None and placement_group_strategy is not None:
+            raise ValueError(
+                "Setting placement_group_strategy is not allowed when "
+                "gang_scheduling_config is provided. Use "
+                "gang_scheduling_config.gang_placement_strategy instead."
+            )
+
+        new_replica_config = ReplicaConfig.create(
+            func_or_class,
+            init_args=_init_args,
+            init_kwargs=_init_kwargs,
+            ray_actor_options=ray_actor_options,
+            placement_group_bundles=placement_group_bundles,
+            placement_group_strategy=placement_group_strategy,
+            placement_group_bundle_label_selector=placement_group_bundle_label_selector,
+            placement_group_fallback_strategy=placement_group_fallback_strategy,
+            max_replicas_per_node=max_replicas_per_node,
+        )
 
         return Deployment(
-            func_or_class,
             name,
-            new_config,
+            new_deployment_config,
+            new_replica_config,
             version=version,
-            init_args=init_args,
-            init_kwargs=init_kwargs,
-            route_prefix=route_prefix,
-            ray_actor_options=ray_actor_options,
             _internal=True,
-            is_driver_deployment=is_driver_deployment,
         )
-
-    @PublicAPI(stability="alpha")
-    def set_options(
-        self,
-        func_or_class: Optional[Callable] = None,
-        name: Default[str] = DEFAULT.VALUE,
-        version: Default[str] = DEFAULT.VALUE,
-        num_replicas: Default[Optional[int]] = DEFAULT.VALUE,
-        init_args: Default[Tuple[Any]] = DEFAULT.VALUE,
-        init_kwargs: Default[Dict[Any, Any]] = DEFAULT.VALUE,
-        route_prefix: Default[Union[str, None]] = DEFAULT.VALUE,
-        ray_actor_options: Default[Optional[Dict]] = DEFAULT.VALUE,
-        user_config: Default[Optional[Any]] = DEFAULT.VALUE,
-        max_concurrent_queries: Default[int] = DEFAULT.VALUE,
-        autoscaling_config: Default[
-            Union[Dict, AutoscalingConfig, None]
-        ] = DEFAULT.VALUE,
-        graceful_shutdown_wait_loop_s: Default[float] = DEFAULT.VALUE,
-        graceful_shutdown_timeout_s: Default[float] = DEFAULT.VALUE,
-        health_check_period_s: Default[float] = DEFAULT.VALUE,
-        health_check_timeout_s: Default[float] = DEFAULT.VALUE,
-        is_driver_deployment: bool = DEFAULT.VALUE,
-        _internal: bool = False,
-    ) -> None:
-        """Overwrite this deployment's options in-place.
-
-        Only those options passed in will be updated, all others will remain
-        unchanged.
-
-        Refer to the @serve.deployment decorator docstring for all non-private
-        arguments.
-        """
-
-        validated = self.options(
-            func_or_class=func_or_class,
-            name=name,
-            version=version,
-            init_args=init_args,
-            init_kwargs=init_kwargs,
-            route_prefix=route_prefix,
-            num_replicas=num_replicas,
-            ray_actor_options=ray_actor_options,
-            user_config=user_config,
-            max_concurrent_queries=max_concurrent_queries,
-            autoscaling_config=autoscaling_config,
-            graceful_shutdown_wait_loop_s=graceful_shutdown_wait_loop_s,
-            graceful_shutdown_timeout_s=graceful_shutdown_timeout_s,
-            health_check_period_s=health_check_period_s,
-            health_check_timeout_s=health_check_timeout_s,
-            _internal=_internal,
-            is_driver_deployment=is_driver_deployment,
-        )
-
-        self._func_or_class = validated._func_or_class
-        self._name = validated._name
-        self._version = validated._version
-        self._init_args = validated._init_args
-        self._init_kwargs = validated._init_kwargs
-        self._route_prefix = validated._route_prefix
-        self._ray_actor_options = validated._ray_actor_options
-        self._config = validated._config
 
     def __eq__(self, other):
         return all(
             [
                 self._name == other._name,
                 self._version == other._version,
-                self._config == other._config,
-                self._init_args == other._init_args,
-                self._init_kwargs == other._init_kwargs,
-                # compare route prefix with default value resolved
-                self.route_prefix == other.route_prefix,
-                self._ray_actor_options == self._ray_actor_options,
+                self._deployment_config == other._deployment_config,
+                self._replica_config.init_args == other._replica_config.init_args,
+                self._replica_config.init_kwargs == other._replica_config.init_kwargs,
+                self._replica_config.ray_actor_options
+                == other._replica_config.ray_actor_options,
             ]
         )
 
     def __str__(self):
-        return (
-            f"Deployment(name={self._name},"
-            f"version={self._version},"
-            f"route_prefix={self.route_prefix})"
-        )
+        return f"Deployment(name={self._name})"
 
     def __repr__(self):
         return str(self)
 
 
-def deployment_to_schema(
-    d: Deployment, include_route_prefix: bool = True
-) -> DeploymentSchema:
+def deployment_to_schema(d: Deployment) -> DeploymentSchema:
     """Converts a live deployment object to a corresponding structured schema.
 
     Args:
         d: Deployment object to convert
-        include_route_prefix: Whether to include the route_prefix in the returned
-            schema. This should be set to False if the schema will be included in a
-            higher-level object describing an application, and you want to place
-            route_prefix at the application level.
+
+    Returns:
+        The structured ``DeploymentSchema`` representing ``d``.
     """
 
     if d.ray_actor_options is not None:
-        ray_actor_options_schema = RayActorOptionsSchema.parse_obj(d.ray_actor_options)
+        ray_actor_options_schema = RayActorOptionsSchema.model_validate(
+            d.ray_actor_options
+        )
     else:
         ray_actor_options_schema = None
 
     deployment_options = {
         "name": d.name,
-        "num_replicas": None if d._config.autoscaling_config else d.num_replicas,
-        "max_concurrent_queries": d.max_concurrent_queries,
+        "num_replicas": None
+        if d._deployment_config.autoscaling_config
+        else d.num_replicas,
+        "max_ongoing_requests": d.max_ongoing_requests,
+        "max_queued_requests": d.max_queued_requests,
+        "backpressure_config": d.backpressure_config,
         "user_config": d.user_config,
-        "autoscaling_config": d._config.autoscaling_config,
-        "graceful_shutdown_wait_loop_s": d._config.graceful_shutdown_wait_loop_s,
-        "graceful_shutdown_timeout_s": d._config.graceful_shutdown_timeout_s,
-        "health_check_period_s": d._config.health_check_period_s,
-        "health_check_timeout_s": d._config.health_check_timeout_s,
+        "autoscaling_config": d._deployment_config.autoscaling_config,
+        "graceful_shutdown_wait_loop_s": d._deployment_config.graceful_shutdown_wait_loop_s,  # noqa: E501
+        "graceful_shutdown_timeout_s": d._deployment_config.graceful_shutdown_timeout_s,
+        "health_check_period_s": d._deployment_config.health_check_period_s,
+        "health_check_timeout_s": d._deployment_config.health_check_timeout_s,
         "ray_actor_options": ray_actor_options_schema,
-        "is_driver_deployment": d._is_driver_deployment,
+        "placement_group_strategy": d._replica_config.placement_group_strategy,
+        "placement_group_bundles": d._replica_config.placement_group_bundles,
+        "max_replicas_per_node": d._replica_config.max_replicas_per_node,
+        "logging_config": d._deployment_config.logging_config,
+        "request_router_config": d._deployment_config.request_router_config,
+        "gang_scheduling_config": d._deployment_config.gang_scheduling_config,
+        "deployment_actors": d._deployment_config.deployment_actors,
+        "rolling_update_percentage": d._deployment_config.rolling_update_percentage,
+        "max_surge_percent": d._deployment_config.max_surge_percent,
     }
-
-    if include_route_prefix:
-        deployment_options["route_prefix"] = d.route_prefix
 
     # Let non-user-configured options be set to defaults. If the schema
     # is converted back to a deployment, this lets Serve continue tracking
     # which options were set by the user. Name is a required field in the
     # schema, so it should be passed in explicitly.
     for option in list(deployment_options.keys()):
-        if option != "name" and option not in d._config.user_configured_option_names:
+        if (
+            option != "name"
+            and option not in d._deployment_config.user_configured_option_names
+        ):
             del deployment_options[option]
 
     # TODO(Sihan) DeploymentConfig num_replicas and auto_config can be set together
@@ -663,33 +635,58 @@ def schema_to_deployment(s: DeploymentSchema) -> Deployment:
     if s.ray_actor_options is DEFAULT.VALUE:
         ray_actor_options = None
     else:
-        ray_actor_options = s.ray_actor_options.dict(exclude_unset=True)
+        ray_actor_options = s.ray_actor_options.model_dump(exclude_unset=True)
 
-    if s.is_driver_deployment is DEFAULT.VALUE:
-        is_driver_deployment = False
+    if s.placement_group_bundles is DEFAULT.VALUE:
+        placement_group_bundles = None
     else:
-        is_driver_deployment = s.is_driver_deployment
+        placement_group_bundles = s.placement_group_bundles
 
-    config = DeploymentConfig.from_default(
+    if s.placement_group_strategy is DEFAULT.VALUE:
+        placement_group_strategy = None
+    else:
+        placement_group_strategy = s.placement_group_strategy
+
+    if s.max_replicas_per_node is DEFAULT.VALUE:
+        max_replicas_per_node = None
+    else:
+        max_replicas_per_node = s.max_replicas_per_node
+
+    deployment_config = DeploymentConfig.from_default(
         num_replicas=s.num_replicas,
         user_config=s.user_config,
-        max_concurrent_queries=s.max_concurrent_queries,
+        max_ongoing_requests=s.max_ongoing_requests,
+        max_queued_requests=s.max_queued_requests,
+        backpressure_config=s.backpressure_config,
         autoscaling_config=s.autoscaling_config,
         graceful_shutdown_wait_loop_s=s.graceful_shutdown_wait_loop_s,
         graceful_shutdown_timeout_s=s.graceful_shutdown_timeout_s,
         health_check_period_s=s.health_check_period_s,
         health_check_timeout_s=s.health_check_timeout_s,
+        logging_config=s.logging_config,
+        request_router_config=s.request_router_config,
+        gang_scheduling_config=s.gang_scheduling_config,
+        deployment_actors=s.deployment_actors,
+        rolling_update_percentage=s.rolling_update_percentage,
+        max_surge_percent=s.max_surge_percent,
     )
-    config.user_configured_option_names = s.get_user_configured_option_names()
+    deployment_config.user_configured_option_names = (
+        s._get_user_configured_option_names()
+    )
 
-    return Deployment(
-        func_or_class="",
-        name=s.name,
-        config=config,
+    replica_config = ReplicaConfig.create(
+        deployment_def="",
         init_args=(),
         init_kwargs={},
-        route_prefix=s.route_prefix,
         ray_actor_options=ray_actor_options,
+        placement_group_bundles=placement_group_bundles,
+        placement_group_strategy=placement_group_strategy,
+        max_replicas_per_node=max_replicas_per_node,
+    )
+
+    return Deployment(
+        name=s.name,
+        deployment_config=deployment_config,
+        replica_config=replica_config,
         _internal=True,
-        is_driver_deployment=is_driver_deployment,
     )
